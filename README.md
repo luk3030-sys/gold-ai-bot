@@ -51,3 +51,15 @@ ENABLE_SCHEDULER=true
 ## Ważne
 
 To narzędzie edukacyjne. Nie jest poradą inwestycyjną i nie gwarantuje zysków. Przed użyciem na realnym kapitale testuj na demo i stosuj kontrolę ryzyka.
+
+
+## v2.1 — dodane funkcje
+
+- NO TRADE pokazuje teraz plan obserwacji: wsparcie, opór, warunkowy BUY i warunkowy SELL.
+- Sygnały BUY/SELL są blokowane, jeśli score jest poniżej `MIN_SCORE`.
+- Dodano raport poranny `/daily-report` i automatyczny raport o 7:00 czasu PL.
+- Nowe zmienne opcjonalne:
+  - `MIN_SCORE=70`
+  - `ENABLE_DAILY_REPORT=true`
+  - `DAILY_REPORT_HOUR=7`
+  - `SEND_NO_TRADE=false`

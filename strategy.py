@@ -23,7 +23,7 @@ def trend_from_emas(candles):
     return 'NEUTRAL'
 
 
-def recent_structure(candles, lookback=12):
+def recent_structure(candles, lookback=24):
     recent = candles[-lookback:]
     highs = [c['high'] for c in recent]
     lows = [c['low'] for c in recent]
@@ -42,6 +42,47 @@ def rr(entry, sl, tp):
 
 def round_price(x):
     return round(float(x), 2) if x is not None else None
+
+
+def build_watch_plan(price, h1_atr, struct, h1_trend, h4_trend, d1_trend):
+    """Warunkowy plan obserwacji, także przy NO TRADE."""
+    if not h1_atr:
+        h1_atr = max(price * 0.004, 10)
+
+    resistance = struct['local_high']
+    support = struct['local_low']
+    buffer = max(0.15 * h1_atr, 3)
+
+    buy_trigger = resistance + buffer
+    sell_trigger = support - buffer
+
+    buy_sl = max(support - 0.35 * h1_atr, buy_trigger - 1.5 * h1_atr)
+    sell_sl = min(resistance + 0.35 * h1_atr, sell_trigger + 1.5 * h1_atr)
+
+    buy_risk = buy_trigger - buy_sl
+    sell_risk = sell_sl - sell_trigger
+
+    return {
+        'support': round_price(support),
+        'resistance': round_price(resistance),
+        'buy_above': round_price(buy_trigger),
+        'buy_sl': round_price(buy_sl),
+        'buy_tp1': round_price(buy_trigger + 2 * buy_risk),
+        'buy_tp2': round_price(buy_trigger + 3 * buy_risk),
+        'sell_below': round_price(sell_trigger),
+        'sell_sl': round_price(sell_sl),
+        'sell_tp1': round_price(sell_trigger - 2 * sell_risk),
+        'sell_tp2': round_price(sell_trigger - 3 * sell_risk),
+        'comment': _watch_comment(h1_trend, h4_trend, d1_trend),
+    }
+
+
+def _watch_comment(h1_trend, h4_trend, d1_trend):
+    if d1_trend == 'DOWN' and h4_trend != 'UP':
+        return 'Preferowany jest SELL po wybiciu wsparcia albo retest oporu. BUY tylko po wyraźnym wybiciu oporu.'
+    if d1_trend == 'UP' and h4_trend != 'DOWN':
+        return 'Preferowany jest BUY po wybiciu oporu albo obronie wsparcia. SELL tylko po utracie wsparcia.'
+    return 'Brak zgodności trendów. Czekaj na wybicie wsparcia/oporu i retest.'
 
 
 def analyze(snapshot):
@@ -114,10 +155,13 @@ def analyze(snapshot):
         tp1 = entry - 2 * risk
         tp2 = entry - 3 * risk
 
+    watch_plan = build_watch_plan(price, h1_atr, struct, h1_trend, h4_trend, d1_trend)
+
     return {
         'symbol': symbol,
         'signal': signal,
         'score': int(score),
+        'min_score': min_score,
         'price': round_price(price),
         'entry': round_price(entry),
         'sl': round_price(sl),
@@ -131,4 +175,5 @@ def analyze(snapshot):
         'rsi_h1': round(h1_rsi, 1) if h1_rsi else None,
         'atr_h1': round(h1_atr, 2) if h1_atr else None,
         'reasons': reasons,
+        'watch_plan': watch_plan,
     }
