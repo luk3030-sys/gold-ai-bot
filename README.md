@@ -1,65 +1,66 @@
-# Gold AI Bot v2
+# Gold AI Bot v3
 
-Automatyczny bot do analizy XAU/USD i wysyłania sygnałów na Telegram.
+Wersja v3 dodaje bardziej profesjonalny silnik analityczny:
 
-## Funkcje
+- M15 / H1 / H4 / D1
+- EMA 20/50/200
+- RSI, MACD, ATR, ADX
+- Bollinger Bands
+- Price Action: engulfing, pin bar, inside bar
+- opcjonalny filtr DXY
+- ręczna blokada makro `MACRO_BLOCK=true`
+- TP1/TP2/TP3, SL i RR
+- Telegram
+- raport dzienny `/daily-report`
 
-- analiza H1/H4/D1,
-- EMA 50/200,
-- RSI 14,
-- MACD,
-- ATR,
-- sygnały BUY / SELL / NO TRADE,
-- Entry, SL, TP1, TP2, RR,
-- Telegram,
-- endpointy testowe na Render.
+## Endpointy
 
-## Pliki
+- `/health`
+- `/analyze`
+- `/run-now`
+- `/telegram-test`
+- `/daily-report`
 
-- `app.py` — aplikacja Flask,
-- `data_provider.py` — pobieranie danych z TwelveData,
-- `indicators.py` — wskaźniki,
-- `strategy.py` — logika sygnałów,
-- `notifier.py` — Telegram,
-- `scheduler.py` — automatyczna analiza,
-- `requirements.txt` — biblioteki,
-- `render.yaml` — konfiguracja Render.
+## Render — zmienne środowiskowe
 
-## Zmienne Render
-
-Dodaj w Render → Environment:
+W Render ustaw:
 
 ```text
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 TWELVEDATA_API_KEY=...
 SYMBOL=XAU/USD
+DXY_SYMBOL=DXY
+ENABLE_DXY=true
+MIN_SCORE=80
 CHECK_INTERVAL_MINUTES=15
-MIN_SCORE=70
 SEND_NO_TRADE=false
+ENABLE_DAILY_REPORT=true
+DAILY_REPORT_HOUR=7
+MACRO_BLOCK=false
 ENABLE_SCHEDULER=true
 ```
 
-## Endpointy
+Jeżeli DXY nie działa w Twoim planie TwelveData, ustaw:
 
-- `/` — panel startowy,
-- `/health` — test działania,
-- `/analyze` — analiza bez wysyłki,
-- `/run-now` — analiza + Telegram,
-- `/telegram-test` — test wiadomości Telegram.
+```text
+ENABLE_DXY=false
+```
 
-## Ważne
+## Komendy Render
 
-To narzędzie edukacyjne. Nie jest poradą inwestycyjną i nie gwarantuje zysków. Przed użyciem na realnym kapitale testuj na demo i stosuj kontrolę ryzyka.
+Build Command:
 
+```bash
+pip install -r requirements.txt
+```
 
-## v2.1 — dodane funkcje
+Start Command:
 
-- NO TRADE pokazuje teraz plan obserwacji: wsparcie, opór, warunkowy BUY i warunkowy SELL.
-- Sygnały BUY/SELL są blokowane, jeśli score jest poniżej `MIN_SCORE`.
-- Dodano raport poranny `/daily-report` i automatyczny raport o 7:00 czasu PL.
-- Nowe zmienne opcjonalne:
-  - `MIN_SCORE=70`
-  - `ENABLE_DAILY_REPORT=true`
-  - `DAILY_REPORT_HOUR=7`
-  - `SEND_NO_TRADE=false`
+```bash
+gunicorn app:app
+```
+
+## Uwaga
+
+To narzędzie edukacyjne i analityczne. Nie jest poradą inwestycyjną i nie gwarantuje zysków.

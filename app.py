@@ -12,9 +12,11 @@ scheduler = None
 
 HTML = """
 <!doctype html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>Gold AI Bot v2.1</title>
-<style>body{font-family:Arial;margin:24px;max-width:760px} .card{border:1px solid #ddd;border-radius:14px;padding:18px;margin:12px 0;box-shadow:0 2px 10px #eee}.buy{color:green}.sell{color:#b00020}.no{color:#555}button{font-size:18px;padding:12px 18px;border-radius:10px;border:0;background:#111;color:white} pre{white-space:pre-wrap}</style>
-</head><body><h1>Gold AI Bot v2.1</h1><div class='card'><b>Status:</b> działa ✅<br><b>Symbol:</b> {{symbol}}<br><b>Interwał:</b> co {{interval}} min</div><p>Endpointy: <code>/health</code>, <code>/analyze</code>, <code>/run-now</code>, <code>/telegram-test</code>, <code>/daily-report</code></p><button onclick="location.href='/run-now'">Analizuj teraz i wyślij Telegram</button><div class='card'><p>Uwaga: bot edukacyjny, nie gwarantuje zysków.</p></div></body></html>
+<title>Gold AI Bot v3</title>
+<style>body{font-family:Arial;margin:24px;max-width:860px;background:#fafafa}.card{background:white;border:1px solid #ddd;border-radius:14px;padding:18px;margin:12px 0;box-shadow:0 2px 10px #eee}button{font-size:18px;padding:12px 18px;border-radius:10px;border:0;background:#111;color:white;margin:4px}code{background:#eee;padding:2px 6px;border-radius:4px}a{color:#111}</style>
+</head><body><h1>Gold AI Bot v3</h1><div class='card'><b>Status:</b> działa ✅<br><b>Symbol:</b> {{symbol}}<br><b>Interwał:</b> co {{interval}} min<br><b>MIN_SCORE:</b> {{min_score}}</div>
+<div class='card'><button onclick="location.href='/analyze'">Analizuj</button><button onclick="location.href='/run-now'">Analizuj i wyślij Telegram</button><button onclick="location.href='/daily-report'">Raport dzienny</button></div>
+<div class='card'><p>Endpointy: <code>/health</code>, <code>/analyze</code>, <code>/run-now</code>, <code>/telegram-test</code>, <code>/daily-report</code></p><p>v3: M15/H1/H4/D1, EMA, RSI, MACD, ATR, ADX, Bollinger, Price Action, DXY, blokada makro.</p><p>Uwaga: bot edukacyjny, nie gwarantuje zysków.</p></div></body></html>
 """
 
 @app.before_request
@@ -25,11 +27,11 @@ def ensure_scheduler():
 
 @app.get('/')
 def home():
-    return render_template_string(HTML, symbol=os.getenv('SYMBOL','XAU/USD'), interval=os.getenv('CHECK_INTERVAL_MINUTES','15'))
+    return render_template_string(HTML, symbol=os.getenv('SYMBOL','XAU/USD'), interval=os.getenv('CHECK_INTERVAL_MINUTES','15'), min_score=os.getenv('MIN_SCORE','80'))
 
 @app.get('/health')
 def health():
-    return jsonify({'status': 'ok', 'app': 'Gold AI Bot v2'})
+    return jsonify({'status': 'ok', 'app': 'Gold AI Bot v3'})
 
 @app.get('/analyze')
 def analyze_now():
@@ -48,7 +50,7 @@ def daily_report():
 
 @app.get('/telegram-test')
 def telegram_test():
-    send_telegram('✅ Gold AI Bot v2.1: test Telegram działa')
+    send_telegram('✅ Gold AI Bot v3: test Telegram działa')
     return jsonify({'status': 'sent'})
 
 if __name__ == '__main__':
