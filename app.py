@@ -1,118 +1,50 @@
 import os
-import threading
-import time
-from datetime import datetime, timezone
+from flask import Flask, jsonify, render_template_string
+from dotenv import load_dotenv
+from data_provider import fetch_market_snapshot
+from strategy import analyze
+from notifier import send_telegram, format_signal
+from scheduler import start_scheduler, run_analysis
 
-from flask import Flask, jsonify
-
-from data_provider import get_multi_timeframe_data
-from notifier import send_telegram
-from strategy import analyze_gold
-
+load_dotenv()
 app = Flask(__name__)
+scheduler = None
 
-CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "60"))
-SEND_NO_TRADE = os.getenv("SEND_NO_TRADE", "false").lower() == "true"
-AUTO_RUN = os.getenv("AUTO_RUN", "true").lower() == "true"
-
-_last_signal_key = None
-_last_run = None
-_last_result = None
-_worker_started = False
-
-
-def run_analysis(send_message: bool = True):
-    global _last_signal_key, _last_run, _last_result
-
-    symbol = os.getenv("SYMBOL", "XAU/USD")
-    data = get_multi_timeframe_data(symbol)
-    result = analyze_gold(symbol, data)
-
-    _last_run = datetime.now(timezone.utc).isoformat()
-    _last_result = result
-
-    signal_key = f"{result.get('signal')}:{result.get('entry')}:{result.get('sl')}:{result.get('tp1')}:{result.get('score')}"
-
-    should_send = send_message and (result.get("signal") != "NO TRADE" or SEND_NO_TRADE)
-    if should_send and signal_key != _last_signal_key:
-        send_telegram(format_signal_message(result))
-        _last_signal_key = signal_key
-
-    return result
-
-
-def format_signal_message(result: dict) -> str:
-    lines = [
-        f"📊 GOLD AI ANALYST v1",
-        f"Sygnał: {result.get('signal')}",
-        f"Score: {result.get('score')}/100",
-        f"Symbol: {result.get('symbol')}",
-        f"Cena: {result.get('price')}",
-        "",
-        f"Entry: {result.get('entry')}",
-        f"SL: {result.get('sl')}",
-        f"TP1: {result.get('tp1')}",
-        f"TP2: {result.get('tp2')}",
-        f"RR TP1: {result.get('rr1')}",
-        f"RR TP2: {result.get('rr2')}",
-        "",
-        "Powody:",
-    ]
-    for r in result.get("reasons", []):
-        lines.append(f"- {r}")
-    lines += ["", "Pamiętaj: to alert analityczny, nie gwarancja wyniku. Ryzykuj maks. 1–2% kapitału."]
-    return "\n".join(lines)
-
-
-def worker_loop():
-    while True:
-        try:
-            run_analysis(send_message=True)
-        except Exception as e:
-            try:
-                send_telegram(f"⚠️ Gold AI Bot error: {e}")
-            except Exception:
-                pass
-        time.sleep(CHECK_INTERVAL_MINUTES * 60)
-
-
-def start_worker_once():
-    global _worker_started
-    if AUTO_RUN and not _worker_started:
-        t = threading.Thread(target=worker_loop, daemon=True)
-        t.start()
-        _worker_started = True
-
+HTML = """
+<!doctype html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Gold AI Bot v2</title>
+<style>body{font-family:Arial;margin:24px;max-width:760px} .card{border:1px solid #ddd;border-radius:14px;padding:18px;margin:12px 0;box-shadow:0 2px 10px #eee}.buy{color:green}.sell{color:#b00020}.no{color:#555}button{font-size:18px;padding:12px 18px;border-radius:10px;border:0;background:#111;color:white} pre{white-space:pre-wrap}</style>
+</head><body><h1>Gold AI Bot v2</h1><div class='card'><b>Status:</b> działa ✅<br><b>Symbol:</b> {{symbol}}<br><b>Interwał:</b> co {{interval}} min</div><p>Endpointy: <code>/health</code>, <code>/analyze</code>, <code>/run-now</code>, <code>/telegram-test</code></p><button onclick="location.href='/run-now'">Analizuj teraz i wyślij Telegram</button><div class='card'><p>Uwaga: bot edukacyjny, nie gwarantuje zysków.</p></div></body></html>
+"""
 
 @app.before_request
-def before_request():
-    start_worker_once()
+def ensure_scheduler():
+    global scheduler
+    if scheduler is None and os.getenv('ENABLE_SCHEDULER', 'true').lower() == 'true':
+        scheduler = start_scheduler()
 
-
-@app.get("/")
+@app.get('/')
 def home():
-    return "Gold AI Bot v1 działa. Użyj /health albo /run-now"
+    return render_template_string(HTML, symbol=os.getenv('SYMBOL','XAU/USD'), interval=os.getenv('CHECK_INTERVAL_MINUTES','15'))
 
-
-@app.get("/health")
+@app.get('/health')
 def health():
-    return jsonify({"status": "ok", "last_run": _last_run, "auto_run": AUTO_RUN})
+    return jsonify({'status': 'ok', 'app': 'Gold AI Bot v2'})
 
+@app.get('/analyze')
+def analyze_now():
+    snapshot = fetch_market_snapshot()
+    return jsonify(analyze(snapshot))
 
-@app.get("/run-now")
+@app.get('/run-now')
 def run_now():
-    try:
-        result = run_analysis(send_message=True)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+    result = run_analysis(send_no_trade=True)
+    return '<pre>' + format_signal(result) + '</pre>'
 
+@app.get('/telegram-test')
+def telegram_test():
+    send_telegram('✅ Gold AI Bot v2: test Telegram działa')
+    return jsonify({'status': 'sent'})
 
-@app.get("/last")
-def last():
-    return jsonify(_last_result or {"status": "no analysis yet"})
-
-
-if __name__ == "__main__":
-    start_worker_once()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))

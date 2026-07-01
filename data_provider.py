@@ -1,49 +1,46 @@
 import os
 import requests
 
-
-def _to_float(value):
-    try:
-        return float(value)
-    except Exception:
-        return None
+BASE_URL = 'https://api.twelvedata.com/time_series'
 
 
-def fetch_twelvedata(symbol: str, interval: str, outputsize: int = 120):
-    api_key = os.getenv("TWELVEDATA_API_KEY")
-    if not api_key:
-        raise RuntimeError("Brak TWELVEDATA_API_KEY w Environment Variables")
-
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": api_key,
-        "format": "JSON",
-    }
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    payload = r.json()
-
-    if payload.get("status") == "error" or "values" not in payload:
-        raise RuntimeError(f"TwelveData error for {symbol} {interval}: {payload}")
-
+def _parse_values(payload):
+    if 'values' not in payload:
+        raise RuntimeError(payload.get('message') or str(payload))
+    values = list(reversed(payload['values']))
     candles = []
-    for item in reversed(payload["values"]):
+    for row in values:
         candles.append({
-            "datetime": item.get("datetime"),
-            "open": _to_float(item.get("open")),
-            "high": _to_float(item.get("high")),
-            "low": _to_float(item.get("low")),
-            "close": _to_float(item.get("close")),
+            'datetime': row.get('datetime'),
+            'open': float(row['open']),
+            'high': float(row['high']),
+            'low': float(row['low']),
+            'close': float(row['close']),
         })
     return candles
 
 
-def get_multi_timeframe_data(symbol: str):
+def fetch_candles(symbol=None, interval='1h', outputsize=200):
+    api_key = os.getenv('TWELVEDATA_API_KEY')
+    if not api_key:
+        raise RuntimeError('Brak TWELVEDATA_API_KEY w Render Environment')
+    symbol = symbol or os.getenv('SYMBOL', 'XAU/USD')
+    params = {
+        'symbol': symbol,
+        'interval': interval,
+        'outputsize': outputsize,
+        'apikey': api_key,
+    }
+    r = requests.get(BASE_URL, params=params, timeout=20)
+    r.raise_for_status()
+    return _parse_values(r.json())
+
+
+def fetch_market_snapshot(symbol=None):
+    symbol = symbol or os.getenv('SYMBOL', 'XAU/USD')
     return {
-        "H1": fetch_twelvedata(symbol, "1h", 150),
-        "H4": fetch_twelvedata(symbol, "4h", 150),
-        "D1": fetch_twelvedata(symbol, "1day", 150),
+        'symbol': symbol,
+        'h1': fetch_candles(symbol, '1h', 220),
+        'h4': fetch_candles(symbol, '4h', 220),
+        'd1': fetch_candles(symbol, '1day', 220),
     }

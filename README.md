@@ -1,24 +1,53 @@
-# Gold AI Bot v1
+# Gold AI Bot v2
 
-Automatyczny bot do analizy XAU/USD i wysyłania sygnałów BUY/SELL/NO TRADE na Telegram.
+Automatyczny bot do analizy XAU/USD i wysyłania sygnałów na Telegram.
 
-## Endpointy
-- `/health` — status aplikacji
-- `/run-now` — uruchamia analizę teraz i wysyła alert na Telegram, jeśli jest sygnał
-- `/last` — ostatni wynik analizy
+## Funkcje
+
+- analiza H1/H4/D1,
+- EMA 50/200,
+- RSI 14,
+- MACD,
+- ATR,
+- sygnały BUY / SELL / NO TRADE,
+- Entry, SL, TP1, TP2, RR,
+- Telegram,
+- endpointy testowe na Render.
+
+## Pliki
+
+- `app.py` — aplikacja Flask,
+- `data_provider.py` — pobieranie danych z TwelveData,
+- `indicators.py` — wskaźniki,
+- `strategy.py` — logika sygnałów,
+- `notifier.py` — Telegram,
+- `scheduler.py` — automatyczna analiza,
+- `requirements.txt` — biblioteki,
+- `render.yaml` — konfiguracja Render.
 
 ## Zmienne Render
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
-- `TWELVEDATA_API_KEY`
-- `SYMBOL=XAU/USD`
-- `CHECK_INTERVAL_MINUTES=60`
-- `AUTO_RUN=true`
-- `SEND_NO_TRADE=false`
 
-## Render
-Build Command:
-`pip install -r requirements.txt`
+Dodaj w Render → Environment:
 
-Start Command:
-`gunicorn app:app`
+```text
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+TWELVEDATA_API_KEY=...
+SYMBOL=XAU/USD
+CHECK_INTERVAL_MINUTES=15
+MIN_SCORE=70
+SEND_NO_TRADE=false
+ENABLE_SCHEDULER=true
+```
+
+## Endpointy
+
+- `/` — panel startowy,
+- `/health` — test działania,
+- `/analyze` — analiza bez wysyłki,
+- `/run-now` — analiza + Telegram,
+- `/telegram-test` — test wiadomości Telegram.
+
+## Ważne
+
+To narzędzie edukacyjne. Nie jest poradą inwestycyjną i nie gwarantuje zysków. Przed użyciem na realnym kapitale testuj na demo i stosuj kontrolę ryzyka.

@@ -1,132 +1,134 @@
-from indicators import ema, rsi, atr
+import os
+from indicators import ema, rsi, atr, macd
 
 
-def round_price(x):
-    return None if x is None else round(float(x), 2)
+def last_valid(items):
+    for x in reversed(items):
+        if x is not None:
+            return x
+    return None
 
 
-def recent_high(candles, lookback=12):
-    return max(c["high"] for c in candles[-lookback:])
-
-
-def recent_low(candles, lookback=12):
-    return min(c["low"] for c in candles[-lookback:])
-
-
-def trend_for(candles):
-    closes = [c["close"] for c in candles]
-    e50 = ema(closes, 50)[-1]
-    e200 = ema(closes, 200)[-1] if len(closes) >= 200 else None
+def trend_from_emas(candles):
+    closes = [c['close'] for c in candles]
+    e50 = last_valid(ema(closes, 50))
+    e200 = last_valid(ema(closes, 200))
     price = closes[-1]
-    # Przy 150 świecach używamy EMA100 jako zastępstwa długiego filtra.
-    long_ema = e200 if e200 is not None else ema(closes, 100)[-1]
-    if e50 is None or long_ema is None:
-        return "UNKNOWN", e50, long_ema
-    if price > e50 > long_ema:
-        return "UP", e50, long_ema
-    if price < e50 < long_ema:
-        return "DOWN", e50, long_ema
-    return "SIDE", e50, long_ema
+    if not e50 or not e200:
+        return 'UNKNOWN'
+    if price > e50 > e200:
+        return 'UP'
+    if price < e50 < e200:
+        return 'DOWN'
+    return 'NEUTRAL'
+
+
+def recent_structure(candles, lookback=12):
+    recent = candles[-lookback:]
+    highs = [c['high'] for c in recent]
+    lows = [c['low'] for c in recent]
+    return {
+        'local_high': max(highs),
+        'local_low': min(lows),
+        'last_high': recent[-1]['high'],
+        'last_low': recent[-1]['low'],
+    }
 
 
 def rr(entry, sl, tp):
     risk = abs(entry - sl)
-    if risk == 0:
-        return 0
-    return round(abs(tp - entry) / risk, 2)
+    return round(abs(tp - entry) / risk, 2) if risk else None
 
 
-def analyze_gold(symbol: str, data: dict):
-    h1 = data["H1"]
-    h4 = data["H4"]
-    d1 = data["D1"]
-    price = h1[-1]["close"]
+def round_price(x):
+    return round(float(x), 2) if x is not None else None
 
-    h1_closes = [c["close"] for c in h1]
-    h1_rsi = rsi(h1_closes, 14)[-1]
-    h1_atr = atr(h1, 14)[-1]
-    h1_trend, h1_ema50, h1_ema_long = trend_for(h1)
-    h4_trend, _, _ = trend_for(h4)
-    d1_trend, _, _ = trend_for(d1)
 
-    score_buy = 0
-    score_sell = 0
-    reasons_buy = []
-    reasons_sell = []
+def analyze(snapshot):
+    symbol = snapshot['symbol']
+    h1, h4, d1 = snapshot['h1'], snapshot['h4'], snapshot['d1']
+    closes = [c['close'] for c in h1]
+    price = closes[-1]
+    h1_rsi = last_valid(rsi(closes, 14))
+    h1_atr = last_valid(atr(h1, 14))
+    _, _, hist = macd(closes)
+    macd_hist = last_valid(hist)
+    h1_trend = trend_from_emas(h1)
+    h4_trend = trend_from_emas(h4)
+    d1_trend = trend_from_emas(d1)
+    struct = recent_structure(h1)
 
-    if d1_trend in ["UP", "SIDE"]:
-        score_buy += 15; reasons_buy.append(f"D1 nie blokuje BUY ({d1_trend})")
-    if h4_trend == "UP":
-        score_buy += 25; reasons_buy.append("H4 trend wzrostowy")
-    if h1_trend == "UP":
-        score_buy += 20; reasons_buy.append("H1 trend wzrostowy")
-    if h1_rsi is not None and 50 <= h1_rsi <= 70:
-        score_buy += 15; reasons_buy.append(f"RSI H1 w strefie siły: {round(h1_rsi, 1)}")
+    buy_score = 0
+    sell_score = 0
+    buy_reasons = []
+    sell_reasons = []
 
-    if d1_trend in ["DOWN", "SIDE"]:
-        score_sell += 15; reasons_sell.append(f"D1 nie blokuje SELL ({d1_trend})")
-    if h4_trend == "DOWN":
-        score_sell += 25; reasons_sell.append("H4 trend spadkowy")
-    if h1_trend == "DOWN":
-        score_sell += 20; reasons_sell.append("H1 trend spadkowy")
-    if h1_rsi is not None and 30 <= h1_rsi <= 50:
-        score_sell += 15; reasons_sell.append(f"RSI H1 w strefie podaży: {round(h1_rsi, 1)}")
-
-    # Price action: wybicie ostatnich 12 świec z wyłączeniem aktualnej
-    prev_h1 = h1[:-1]
-    last_close = price
-    high_level = recent_high(prev_h1, 12)
-    low_level = recent_low(prev_h1, 12)
-
-    if last_close > high_level:
-        score_buy += 15; reasons_buy.append(f"Wybicie lokalnego oporu H1: {round_price(high_level)}")
-    if last_close < low_level:
-        score_sell += 15; reasons_sell.append(f"Wybicie lokalnego wsparcia H1: {round_price(low_level)}")
-
+    if d1_trend == 'UP':
+        buy_score += 20; buy_reasons.append('D1 trend wzrostowy')
+    if h4_trend == 'UP':
+        buy_score += 25; buy_reasons.append('H4 trend wzrostowy')
+    if h1_trend == 'UP':
+        buy_score += 15; buy_reasons.append('H1 trend wzrostowy')
+    if h1_rsi and 50 <= h1_rsi <= 70:
+        buy_score += 15; buy_reasons.append(f'RSI H1 wspiera BUY ({h1_rsi:.1f})')
+    if macd_hist and macd_hist > 0:
+        buy_score += 10; buy_reasons.append('MACD momentum dodatnie')
+    if price > struct['local_high'] * 0.998:
+        buy_score += 10; buy_reasons.append('Cena blisko wybicia lokalnego oporu')
     if h1_atr:
-        score_buy += 10; score_sell += 10
-        reasons_buy.append(f"ATR H1 dostępny: {round(h1_atr, 2)}")
-        reasons_sell.append(f"ATR H1 dostępny: {round(h1_atr, 2)}")
+        buy_score += 5; buy_reasons.append('ATR dostępny do SL/TP')
 
-    min_score = 70
-    signal = "NO TRADE"
-    score = max(score_buy, score_sell)
-    reasons = ["Brak przewagi minimum 70/100"]
-    entry = price
-    sl = tp1 = tp2 = None
+    if d1_trend == 'DOWN':
+        sell_score += 20; sell_reasons.append('D1 trend spadkowy')
+    if h4_trend == 'DOWN':
+        sell_score += 25; sell_reasons.append('H4 trend spadkowy')
+    if h1_trend == 'DOWN':
+        sell_score += 15; sell_reasons.append('H1 trend spadkowy')
+    if h1_rsi and 30 <= h1_rsi <= 50:
+        sell_score += 15; sell_reasons.append(f'RSI H1 wspiera SELL ({h1_rsi:.1f})')
+    if macd_hist and macd_hist < 0:
+        sell_score += 10; sell_reasons.append('MACD momentum ujemne')
+    if price < struct['local_low'] * 1.002:
+        sell_score += 10; sell_reasons.append('Cena blisko wybicia lokalnego wsparcia')
+    if h1_atr:
+        sell_score += 5; sell_reasons.append('ATR dostępny do SL/TP')
 
-    if score_buy >= min_score and score_buy > score_sell and h1_atr:
-        signal = "BUY"
-        score = score_buy
-        reasons = reasons_buy
-        sl = min(recent_low(h1, 10), price - 1.2 * h1_atr)
-        risk = price - sl
-        tp1 = price + 2 * risk
-        tp2 = price + 3 * risk
-    elif score_sell >= min_score and score_sell > score_buy and h1_atr:
-        signal = "SELL"
-        score = score_sell
-        reasons = reasons_sell
-        sl = max(recent_high(h1, 10), price + 1.2 * h1_atr)
-        risk = sl - price
-        tp1 = price - 2 * risk
-        tp2 = price - 3 * risk
+    min_score = int(os.getenv('MIN_SCORE', '70'))
+    signal = 'NO TRADE'
+    score = max(buy_score, sell_score)
+    reasons = ['Brak wystarczającej przewagi']
+    entry = sl = tp1 = tp2 = None
+
+    if buy_score >= min_score and buy_score > sell_score and h1_atr:
+        signal = 'BUY'; score = buy_score; reasons = buy_reasons
+        entry = price
+        sl = min(struct['local_low'], price - 1.4 * h1_atr)
+        risk = entry - sl
+        tp1 = entry + 2 * risk
+        tp2 = entry + 3 * risk
+    elif sell_score >= min_score and sell_score > buy_score and h1_atr:
+        signal = 'SELL'; score = sell_score; reasons = sell_reasons
+        entry = price
+        sl = max(struct['local_high'], price + 1.4 * h1_atr)
+        risk = sl - entry
+        tp1 = entry - 2 * risk
+        tp2 = entry - 3 * risk
 
     return {
-        "symbol": symbol,
-        "signal": signal,
-        "score": int(score),
-        "price": round_price(price),
-        "entry": round_price(entry) if signal != "NO TRADE" else None,
-        "sl": round_price(sl),
-        "tp1": round_price(tp1),
-        "tp2": round_price(tp2),
-        "rr1": rr(entry, sl, tp1) if sl and tp1 else None,
-        "rr2": rr(entry, sl, tp2) if sl and tp2 else None,
-        "trend_h1": h1_trend,
-        "trend_h4": h4_trend,
-        "trend_d1": d1_trend,
-        "rsi_h1": round(h1_rsi, 1) if h1_rsi else None,
-        "atr_h1": round(h1_atr, 2) if h1_atr else None,
-        "reasons": reasons,
+        'symbol': symbol,
+        'signal': signal,
+        'score': int(score),
+        'price': round_price(price),
+        'entry': round_price(entry),
+        'sl': round_price(sl),
+        'tp1': round_price(tp1),
+        'tp2': round_price(tp2),
+        'rr1': rr(entry, sl, tp1) if entry and sl and tp1 else None,
+        'rr2': rr(entry, sl, tp2) if entry and sl and tp2 else None,
+        'trend_h1': h1_trend,
+        'trend_h4': h4_trend,
+        'trend_d1': d1_trend,
+        'rsi_h1': round(h1_rsi, 1) if h1_rsi else None,
+        'atr_h1': round(h1_atr, 2) if h1_atr else None,
+        'reasons': reasons,
     }

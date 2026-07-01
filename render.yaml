@@ -1,6 +1,15 @@
 services:
   - type: web
-    name: gold-ai-bot
-    env: python
+    name: gold-ai-bot-v2
+    runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app
+    envVars:
+      - key: SYMBOL
+        value: XAU/USD
+      - key: CHECK_INTERVAL_MINUTES
+        value: 15
+      - key: MIN_SCORE
+        value: 70
+      - key: SEND_NO_TRADE
+        value: false
