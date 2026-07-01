@@ -1,57 +1,89 @@
-import os
+import os, json
 from flask import Flask, jsonify, render_template_string
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
-from data_provider import fetch_market_snapshot
 from strategy import analyze
-from notifier import send_telegram, format_signal, format_daily_report
-from scheduler import start_scheduler, run_analysis, send_daily_report
+from notifier import send_telegram, format_signal
+from storage import add_history, load_history, load_state, save_state
 
 load_dotenv()
 app = Flask(__name__)
-scheduler = None
 
 HTML = """
-<!doctype html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>Gold AI Bot v3</title>
-<style>body{font-family:Arial;margin:24px;max-width:860px;background:#fafafa}.card{background:white;border:1px solid #ddd;border-radius:14px;padding:18px;margin:12px 0;box-shadow:0 2px 10px #eee}button{font-size:18px;padding:12px 18px;border-radius:10px;border:0;background:#111;color:white;margin:4px}code{background:#eee;padding:2px 6px;border-radius:4px}a{color:#111}</style>
-</head><body><h1>Gold AI Bot v3</h1><div class='card'><b>Status:</b> działa ✅<br><b>Symbol:</b> {{symbol}}<br><b>Interwał:</b> co {{interval}} min<br><b>MIN_SCORE:</b> {{min_score}}</div>
-<div class='card'><button onclick="location.href='/analyze'">Analizuj</button><button onclick="location.href='/run-now'">Analizuj i wyślij Telegram</button><button onclick="location.href='/daily-report'">Raport dzienny</button></div>
-<div class='card'><p>Endpointy: <code>/health</code>, <code>/analyze</code>, <code>/run-now</code>, <code>/telegram-test</code>, <code>/daily-report</code></p><p>v3: M15/H1/H4/D1, EMA, RSI, MACD, ATR, ADX, Bollinger, Price Action, DXY, blokada makro.</p><p>Uwaga: bot edukacyjny, nie gwarantuje zysków.</p></div></body></html>
+<!doctype html><html lang='pl'><head><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Gold AI Bot Pro</title><style>body{font-family:Arial;margin:0;background:#f5f5f5;color:#111}.box{max-width:760px;margin:20px auto;background:white;padding:20px;border-radius:16px;box-shadow:0 2px 18px #0001}button,a.btn{display:inline-block;background:#111;color:#fff;padding:12px 16px;border-radius:10px;text-decoration:none;border:0;margin:6px 4px}.muted{color:#666}pre{white-space:pre-wrap;background:#f0f0f0;padding:12px;border-radius:10px}</style></head>
+<body><div class='box'><h1>Gold AI Bot Pro</h1><p class='muted'>Automatyczna analiza XAU/USD: M15/H1/H4/D1, EMA, RSI, MACD, ATR, ADX, Bollinger, Price Action, RR.</p>
+<a class='btn' href='/analyze'>Analizuj teraz</a><a class='btn' href='/run-now'>Analizuj i wyślij Telegram</a><a class='btn' href='/daily-report'>Raport dzienny</a><a class='btn' href='/history'>Historia</a>
+<p>Status: <b>działa</b></p></div></body></html>
 """
-
-@app.before_request
-def ensure_scheduler():
-    global scheduler
-    if scheduler is None and os.getenv('ENABLE_SCHEDULER', 'true').lower() == 'true':
-        scheduler = start_scheduler()
 
 @app.get('/')
 def home():
-    return render_template_string(HTML, symbol=os.getenv('SYMBOL','XAU/USD'), interval=os.getenv('CHECK_INTERVAL_MINUTES','15'), min_score=os.getenv('MIN_SCORE','80'))
+    return HTML
 
 @app.get('/health')
 def health():
-    return jsonify({'status': 'ok', 'app': 'Gold AI Bot v3'})
+    return jsonify({"status":"ok", "version":"pro", "scheduler": os.getenv("SCHEDULER_ENABLED","true")})
 
 @app.get('/analyze')
-def analyze_now():
-    snapshot = fetch_market_snapshot()
-    return jsonify(analyze(snapshot))
+def analyze_endpoint():
+    return jsonify(analyze())
 
 @app.get('/run-now')
 def run_now():
-    result = run_analysis(send_no_trade=True)
-    return '<pre>' + format_signal(result) + '</pre>'
-
-@app.get('/daily-report')
-def daily_report():
-    result = send_daily_report()
-    return '<pre>' + format_daily_report(result) + '</pre>'
+    result = analyze()
+    sent = send_telegram(format_signal(result))
+    add_history({"type":"manual", **result, "telegram_sent": sent})
+    return jsonify({"telegram_sent": sent, "result": result})
 
 @app.get('/telegram-test')
 def telegram_test():
-    send_telegram('✅ Gold AI Bot v3: test Telegram działa')
-    return jsonify({'status': 'sent'})
+    sent = send_telegram("✅ Gold AI Bot Pro: test Telegram działa")
+    return jsonify({"telegram_sent": sent})
+
+@app.get('/history')
+def history():
+    return jsonify(load_history(50))
+
+@app.get('/daily-report')
+def daily_report():
+    result = analyze()
+    text = "📊 <b>Raport dzienny GOLD</b>\n\n" + format_signal(result)
+    sent = send_telegram(text)
+    add_history({"type":"daily_report", **result, "telegram_sent": sent})
+    return jsonify({"telegram_sent": sent, "result": result})
+
+def scheduled_analysis():
+    try:
+        result = analyze()
+        add_history({"type":"scheduled", **result})
+        if result.get("signal") in ["BUY", "SELL"]:
+            key = f"{result['signal']}:{result.get('entry')}:{result.get('sl')}:{result.get('tp2')}"
+            state = load_state()
+            if state.get("last_signal_key") != key:
+                sent = send_telegram(format_signal(result))
+                state["last_signal_key"] = key
+                state["last_sent"] = result
+                save_state(state)
+                add_history({"type":"sent_signal", **result, "telegram_sent": sent})
+    except Exception as e:
+        add_history({"type":"error", "error": str(e)})
+
+def scheduled_daily():
+    try:
+        result = analyze()
+        send_telegram("📊 <b>Raport dzienny GOLD</b>\n\n" + format_signal(result))
+        add_history({"type":"scheduled_daily", **result})
+    except Exception as e:
+        add_history({"type":"error_daily", "error": str(e)})
+
+if os.getenv("SCHEDULER_ENABLED", "true").lower() == "true":
+    scheduler = BackgroundScheduler(timezone=os.getenv("TIMEZONE", "Europe/Warsaw"))
+    scheduler.add_job(scheduled_analysis, IntervalTrigger(minutes=int(os.getenv("ANALYZE_INTERVAL_MINUTES", "5"))), id="analysis", replace_existing=True)
+    scheduler.add_job(scheduled_daily, CronTrigger(hour=int(os.getenv("DAILY_REPORT_HOUR", "7")), minute=0), id="daily", replace_existing=True)
+    scheduler.start()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', '5000')))
