@@ -19,3 +19,14 @@ def candle_patterns(df):
     if cur.high < prev.high and cur.low > prev.low:
         out.append("inside_bar")
     return out
+
+
+def interpret_patterns(patterns):
+    mapping = {
+        "inside_bar": "Inside Bar — konsolidacja; czekaj na potwierdzone wybicie",
+        "pin_bar_bullish": "Byczy Pin Bar — odrzucenie niższych cen",
+        "pin_bar_bearish": "Niedźwiedzi Pin Bar — odrzucenie wyższych cen",
+        "bullish_engulfing": "Bycze objęcie — krótkoterminowa przewaga popytu",
+        "bearish_engulfing": "Niedźwiedzie objęcie — krótkoterminowa przewaga podaży",
+    }
+    return [mapping[p] for p in patterns if p in mapping]
