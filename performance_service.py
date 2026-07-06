@@ -1,13 +1,18 @@
 import hashlib
-import json
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict
 
 from config import env_int
 from db import (
-    add_run, count_signals_since, create_signal, last_closed_loss,
+    acquire_job_lock,
+    add_run,
+    count_signals_since,
+    create_signal,
+    database_info,
+    last_closed_loss,
     recent_fingerprint_exists,
+    release_job_lock,
 )
 from notifier import format_signal, send_telegram
 from performance import performance_report
@@ -48,10 +53,26 @@ def _cooldown_reason(analysis: Dict) -> str | None:
 
 
 def tick() -> Dict:
+    lock_name = "tick"
+    owner = acquire_job_lock(lock_name, ttl_seconds=env_int("TICK_LOCK_TTL_SECONDS", 240))
+    if not owner:
+        return {
+            "status": "skipped",
+            "reason": "tick_already_running",
+            "database": database_info(),
+        }
+
     try:
         tracking = track_open_signals()
         analysis = analyze()
-        result = {"tracking": tracking, "analysis": analysis, "new_signal": None, "telegram_sent": False}
+        result = {
+            "status": "ok",
+            "tracking": tracking,
+            "analysis": analysis,
+            "new_signal": None,
+            "telegram_sent": False,
+            "database": database_info(),
+        }
 
         if analysis.get("signal") in {"BUY", "SELL"}:
             reason = _cooldown_reason(analysis)
@@ -70,8 +91,13 @@ def tick() -> Dict:
         return result
     except Exception as exc:
         payload = {"error": str(exc), "type": type(exc).__name__}
-        add_run("tick", "error", payload)
+        try:
+            add_run("tick", "error", payload)
+        except Exception:
+            pass
         raise
+    finally:
+        release_job_lock(lock_name, owner)
 
 
 def manual_run(send_any: bool = True) -> Dict:

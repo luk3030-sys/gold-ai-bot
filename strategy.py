@@ -3,7 +3,7 @@ import os
 from typing import Dict, Tuple
 
 from config import env_bool, env_float, env_int
-from data_provider import fetch_ohlc
+from data_provider import fetch_dxy_context, fetch_ohlc
 from indicators import enrich
 from patterns import candle_patterns, interpret_patterns
 
@@ -156,23 +156,33 @@ def analyze() -> dict:
     if setup_type in {"TREND_PULLBACK", "BREAKOUT_DOWN"} and tr["h4"] == "DOWN":
         sell_score += 10; sell_reasons.append(f"Setup: {setup_type}")
 
-    dxy_status = "UNAVAILABLE"
+    dxy_ctx = fetch_dxy_context("1h", 220)
+    dxy_status = dxy_ctx.get("status", "UNAVAILABLE")
+    dxy_symbol_used = dxy_ctx.get("symbol")
+    dxy_kind = dxy_ctx.get("kind", "none")
     data_quality_score = 90
-    try:
-        dxy_symbol = os.getenv("DXY_SYMBOL", "DXY")
-        dxy_df = enrich(fetch_ohlc(dxy_symbol, "1h", 220, closed_only=True))
+    if dxy_ctx.get("available"):
+        dxy_df = enrich(dxy_ctx["df"])
         dxy_last = dxy_df.iloc[-1]
-        if dxy_last.close > dxy_last.ema50:
-            sell_score += 5; sell_reasons.append("DXY powyżej EMA50 — wsparcie dla SELL GOLD")
-            dxy_status = "BULLISH"
+        dxy_bullish = dxy_last.close > dxy_last.ema50
+        # A proxy is deliberately weighted less than the direct DXY index.
+        dxy_weight = env_int("DXY_WEIGHT", 5) if dxy_kind == "direct" else env_int("DXY_PROXY_WEIGHT", 2)
+        if dxy_bullish:
+            sell_score += dxy_weight
+            sell_reasons.append(f"USD filtr {dxy_symbol_used} powyżej EMA50 — wsparcie dla SELL GOLD")
+            dxy_status = f"BULLISH_{dxy_kind.upper()}"
         else:
-            buy_score += 5; buy_reasons.append("DXY poniżej EMA50 — wsparcie dla BUY GOLD")
-            dxy_status = "BEARISH"
-        data_quality_score = 100
-    except Exception as exc:
+            buy_score += dxy_weight
+            buy_reasons.append(f"USD filtr {dxy_symbol_used} poniżej EMA50 — wsparcie dla BUY GOLD")
+            dxy_status = f"BEARISH_{dxy_kind.upper()}"
+        data_quality_score = 100 if dxy_kind == "direct" else 95
+    else:
         penalty = env_int("DXY_MISSING_PENALTY", 5)
-        buy_score -= penalty; sell_score -= penalty
-        dxy_status = f"UNAVAILABLE: {type(exc).__name__}"
+        if env_bool("DXY_REQUIRED", False):
+            buy_score -= max(penalty, 15); sell_score -= max(penalty, 15)
+        else:
+            buy_score -= penalty; sell_score -= penalty
+        dxy_status = "UNAVAILABLE"
         data_quality_score = 80
 
     if macro_block:
@@ -239,6 +249,8 @@ def analyze() -> dict:
         "pattern_notes": interpret_patterns(patterns),
         "reasons": reasons or ["Brak wystarczającej przewagi"],
         "dxy_status": dxy_status,
+        "dxy_symbol_used": dxy_symbol_used,
+        "dxy_kind": dxy_kind,
         "data_quality_score": data_quality_score,
         "closed_h1_candle_time": h1_time,
         "watch_plan": [

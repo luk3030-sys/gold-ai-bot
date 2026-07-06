@@ -1,4 +1,3 @@
-import json
 import os
 from functools import wraps
 
@@ -9,8 +8,8 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
 from config import env_bool, env_int
-from data_provider import fetch_last_price
-from db import init_db, list_signals, recent_runs
+from data_provider import fetch_last_price, provider_health
+from db import db_health, database_info, init_db, list_signals, recent_runs
 from notifier import format_signal, send_telegram
 from performance import performance_report
 from performance_service import manual_run, tick
@@ -21,6 +20,8 @@ from validation import run_validation
 load_dotenv()
 init_db()
 app = Flask(__name__)
+
+VERSION = "5.1-stability-data-layer"
 
 
 def _authorized() -> bool:
@@ -41,12 +42,17 @@ def protected(fn):
 
 HTML = """
 <!doctype html><html lang='pl'><head><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Gold AI Bot v5</title><style>
-body{font-family:Arial,sans-serif;margin:0;background:#f4f5f7;color:#111}.box{max-width:920px;margin:20px auto;background:#fff;padding:22px;border-radius:16px;box-shadow:0 2px 18px #0001}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.card{padding:16px;border:1px solid #ddd;border-radius:12px}a.btn{display:inline-block;background:#111;color:#fff;padding:11px 14px;border-radius:9px;text-decoration:none;margin:5px}.muted{color:#666}</style></head>
-<body><div class='box'><h1>Gold AI Bot v5 — Performance & Validation</h1>
-<p class='muted'>Śledzenie wyników, TP/SL outcome engine, statystyki R, reżim rynku, zamknięte świece, cooldown i walidacja historyczna.</p>
-<div class='grid'><div class='card'><b>Live</b><br><a class='btn' href='/analyze'>Analiza</a><a class='btn' href='/performance'>Wyniki</a></div><div class='card'><b>Tracking</b><br><a class='btn' href='/signals'>Sygnały</a><a class='btn' href='/track-now'>Track now</a></div><div class='card'><b>Validation</b><br><a class='btn' href='/validate?bars=1500'>Waliduj 1500 H1</a></div></div>
-<p>Automatyka na Render Free: ustaw zewnętrzny cron na <code>/tick</code> co 5 minut.</p></div></body></html>
+<title>Gold AI Bot v5.1</title><style>
+body{font-family:Arial,sans-serif;margin:0;background:#f4f5f7;color:#111}.box{max-width:980px;margin:20px auto;background:#fff;padding:22px;border-radius:16px;box-shadow:0 2px 18px #0001}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.card{padding:16px;border:1px solid #ddd;border-radius:12px}a.btn{display:inline-block;background:#111;color:#fff;padding:11px 14px;border-radius:9px;text-decoration:none;margin:5px}.muted{color:#666}code{background:#f1f1f1;padding:2px 5px;border-radius:5px}</style></head>
+<body><div class='box'><h1>Gold AI Bot v5.1 — Stability & Data Layer</h1>
+<p class='muted'>Trwała baza PostgreSQL, blokady równoległych ticków, odporniejszy provider danych, fallback DXY i diagnostyka gotowości.</p>
+<div class='grid'>
+<div class='card'><b>Live</b><br><a class='btn' href='/analyze'>Analiza</a><a class='btn' href='/performance'>Wyniki</a></div>
+<div class='card'><b>Tracking</b><br><a class='btn' href='/signals'>Sygnały</a><a class='btn' href='/track-now'>Track now</a></div>
+<div class='card'><b>Stability</b><br><a class='btn' href='/health'>Health</a><a class='btn' href='/ready'>Ready</a></div>
+<div class='card'><b>Validation</b><br><a class='btn' href='/validate?bars=1500'>Waliduj 1500 H1</a></div>
+</div>
+<p>Na Render Free zalecany zewnętrzny cron na <code>/tick</code> co 5 minut i <code>SCHEDULER_ENABLED=false</code>.</p></div></body></html>
 """
 
 
@@ -57,12 +63,28 @@ def home():
 
 @app.get("/health")
 def health():
+    db = db_health()
     return jsonify({
-        "status": "ok", "version": "5.0-performance-validation",
-        "scheduler_enabled": env_bool("SCHEDULER_ENABLED", True),
+        "status": "ok" if db.get("ok") else "degraded",
+        "version": VERSION,
+        "scheduler_enabled": env_bool("SCHEDULER_ENABLED", False),
         "closed_candles": env_bool("USE_CLOSED_CANDLES", True),
-        "database_path": os.getenv("DATABASE_PATH", os.path.join(os.getenv("DATA_DIR", "/tmp/gold_ai_bot_v5"), "gold_ai_bot_v5.db")),
+        "database": db,
+        "dxy_enabled": env_bool("DXY_ENABLED", True),
     })
+
+
+@app.get("/ready")
+def ready():
+    db = db_health()
+    market = provider_health() if env_bool("READY_CHECK_MARKET", True) else {"ok": True, "skipped": True}
+    ok = bool(db.get("ok")) and bool(market.get("ok"))
+    return jsonify({"ready": ok, "version": VERSION, "database": db, "market": market}), (200 if ok else 503)
+
+
+@app.get("/data-health")
+def data_health():
+    return jsonify(provider_health())
 
 
 @app.get("/analyze")
@@ -90,7 +112,7 @@ def track_now():
 
 @app.get("/telegram-test")
 def telegram_test():
-    return jsonify({"telegram_sent": send_telegram("✅ Gold AI Bot v5: test Telegram działa")})
+    return jsonify({"telegram_sent": send_telegram("✅ Gold AI Bot v5.1: test Telegram działa")})
 
 
 @app.get("/signals")
@@ -129,6 +151,11 @@ def feed_check():
     })
 
 
+@app.get("/db-info")
+def db_info():
+    return jsonify({"database": database_info(), "health": db_health()})
+
+
 @app.get("/daily-report")
 @protected
 def daily_report():
@@ -147,23 +174,26 @@ def scheduled_tick():
 
 def scheduled_daily():
     try:
-        analysis = analyze(); perf = performance_report()
+        analysis = analyze()
+        perf = performance_report()
         send_telegram("📊 <b>Raport dzienny GOLD</b>\n\n" + format_signal(analysis, perf.get("overall")))
     except Exception:
         app.logger.exception("scheduled_daily failed")
 
 
-if env_bool("SCHEDULER_ENABLED", True):
+# External cron is recommended on sleeping/free web instances. DB-backed locks in tick()
+# prevent duplicate cycles if an internal scheduler and external cron overlap.
+if env_bool("SCHEDULER_ENABLED", False):
     scheduler = BackgroundScheduler(timezone=os.getenv("TIMEZONE", "Europe/Warsaw"))
     scheduler.add_job(
         scheduled_tick,
         IntervalTrigger(minutes=env_int("ANALYZE_INTERVAL_MINUTES", 5)),
-        id="v5_tick", replace_existing=True, max_instances=1, coalesce=True,
+        id="v5_1_tick", replace_existing=True, max_instances=1, coalesce=True,
     )
     scheduler.add_job(
         scheduled_daily,
         CronTrigger(hour=env_int("DAILY_REPORT_HOUR", 7), minute=0),
-        id="v5_daily", replace_existing=True, max_instances=1, coalesce=True,
+        id="v5_1_daily", replace_existing=True, max_instances=1, coalesce=True,
     )
     scheduler.start()
 
