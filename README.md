@@ -1,51 +1,87 @@
-# Gold AI Bot v6.2 — Institutional Smart Money + Large Candle Alerts
+# Gold AI Bot v6.3 — Institutional + Persistent Performance
 
-Bot dla XAU/USD z alertami Telegram.
+v6.3 łączy warstwę **Institutional Smart Money** z trwałym **Performance & Validation Engine** z v5.1.
 
-## Funkcje
-- BOS / CHOCH
-- liquidity sweep
-- fair value gap
-- order block
-- trend M15/H1/H4/D1
-- Entry, SL, TP1, TP2, TP3
-- alert Telegram przy mocnym sygnale
-- dodatkowy alert Telegram, gdy zamknięta świeca M15 lub H1 ma duży ruch w górę albo w dół
+## Najważniejsze funkcje
 
-## Nowe zmienne ENV dla dużych świec
+- M15 / H1 / H4 / D1
+- EMA 20/50/100/200, RSI, MACD, ATR, ADX, Bollinger
+- **BOS / CHOCH**
+- **liquidity sweeps** nad swing high i pod swing low
+- **Fair Value Gaps (FVG)**
+- **displacement + uproszczone Order Blocks**
+- **premium / discount range**
+- Price Action: pin bar, engulfing, inside bar
+- DXY direct/proxy fallback
+- BUY / SELL / NO TRADE, Entry zone, SL, TP1/TP2/TP3, RR
+- PostgreSQL persistent history
+- TP/SL outcome tracking
+- performance: win rate, expectancy, profit factor, net R, max drawdown
+- deduplication, daily limit, cooldown po stracie
+- DB-backed tick lock
+- **large candle / fast move alert** na Telegram
+- closed candles dla głównych sygnałów
+
+## Kluczowe endpointy
+
+- `/health`
+- `/ready`
+- `/analyze`
+- `/institutional`
+- `/tick` — pełny cykl automatyczny
+- `/signal` — kompatybilność ze starszym v6
+- `/move-watch`
+- `/track-now`
+- `/signals`
+- `/performance`
+- `/history`
+- `/validate?bars=1500`
+- `/feed-check?broker_price=4057.28`
+- `/db-info`
+- `/daily-report`
+- `/telegram-test`
+
+## Rekomendowana automatyka na Render Free
+
+1. `SCHEDULER_ENABLED=false`
+2. zewnętrzny cron wywołujący `/tick` co 5 minut
+3. najlepiej ustawić `CRON_SECRET` i używać:
 
 ```text
-LARGE_CANDLE_ALERT_ENABLED=true
-LARGE_CANDLE_INTERVALS=15min,1h
-LARGE_CANDLE_ATR_MULTIPLIER=1.2
-LARGE_CANDLE_MIN_POINTS=20
-LARGE_CANDLE_BODY_RATIO=0.55
+https://TWOJ-SERWIS.onrender.com/tick?secret=TWOJE_HASLO
 ```
 
-Znaczenie:
-- `LARGE_CANDLE_INTERVALS` — interwały monitorowane pod duże świece.
-- `LARGE_CANDLE_MIN_POINTS` — minimalny korpus świecy w punktach/cenie złota.
-- `LARGE_CANDLE_ATR_MULTIPLIER` — korpus musi być większy niż ATR × ten mnożnik.
-- `LARGE_CANDLE_BODY_RATIO` — korpus musi stanowić minimum podaną część całego zakresu świecy, aby nie alertować samych knotów.
+`/tick` wykonuje:
 
-Alert dużej świecy nie jest automatycznym sygnałem wejścia. To informacja o silnym impulsie i zmienności.
+1. tracking otwartych sygnałów i TP/SL,
+2. alert dużego ruchu świecy, jeśli wystąpi i jest nowy,
+3. pełną analizę institutional + technical,
+4. blokady duplikatów/cooldown/limit dzienny,
+5. zapis nowego BUY/SELL do PostgreSQL,
+6. Telegram tylko dla nowego kwalifikowanego sygnału.
 
-## Endpointy
-- `/health`
-- `/signal`
-- `/last`
+## Migracja z v5.1
 
+Baza PostgreSQL jest zgodna z istniejącymi tabelami v5.1. Po podmianie kodu zachowasz historię sygnałów, o ile pozostawisz ten sam `DATABASE_URL`.
 
-## v6.2 — alert na duży ruch świecy ogólnie
+## Ustawienia wymagane
 
-Bot wykrywa teraz nie tylko mocny korpus świecy, ale też duży całkowity zakres świecy HIGH–LOW. Dzięki temu Telegram może wysłać alert, gdy świeca zrobiła duży ruch, nawet jeśli zamknięcie wróciło blisko otwarcia, np. długi knot po danych makro.
+```text
+SYMBOL=XAU/USD
+TWELVEDATA_API_KEY=...
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+DATABASE_URL=postgresql://...
+PYTHON_VERSION=3.12.11
+USE_CLOSED_CANDLES=true
+SCHEDULER_ENABLED=false
+MIN_SCORE=80
+MIN_RR=2.0
+```
 
-Nowe zmienne ENV:
+## Ważne ograniczenia
 
-- `LARGE_CANDLE_MODE=ANY` — domyślnie; alert dla mocnego korpusu LUB dużego zakresu świecy.
-- `LARGE_CANDLE_MODE=BODY` — tylko mocny kierunkowy korpus.
-- `LARGE_CANDLE_MODE=RANGE` — tylko duży zakres HIGH–LOW.
-- `LARGE_CANDLE_RANGE_ATR_MULTIPLIER=1.5` — alert, gdy zakres świecy jest co najmniej 1.5x ATR14.
-- `LARGE_CANDLE_MIN_POINTS=20` — minimalny ruch w punktach.
-
-Przykład: jeśli świeca M15 ma zakres 28 pkt, a ATR14 wynosi 15 pkt, to zakres/ATR = 1.87 i bot wyśle alert w trybie ANY/RANGE.
+- Score 0–100 jest wynikiem regułowym, **nie prawdopodobieństwem**.
+- FVG, Order Block, BOS/CHOCH są algorytmicznymi przybliżeniami i wymagają walidacji.
+- `/validate` pozostaje uproszczonym testem historycznym; nie odwzorowuje w pełni live institutional engine.
+- System nie gwarantuje zysków i nie jest poradą inwestycyjną.

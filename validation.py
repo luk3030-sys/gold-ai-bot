@@ -1,7 +1,7 @@
 """Historical validation engine.
 
 This is deliberately separated from the live engine. It uses H1 bars and resamples
-H4/D1 from them, so results are an approximation of live v5 (no M15/DXY filter).
+H4/D1 from them, so results are an approximation of live v6.3 (no M15/DXY/Institutional live filter).
 It is intended to detect obviously bad parameter sets, not to promise future returns.
 """
 import math
@@ -134,7 +134,7 @@ def run_validation(symbol: str, bars: int = 1500) -> Dict:
         "bars": len(h1),
         "method": "H1 walk-forward-like simulation; H4/D1 resampled; no M15/DXY; conservative same-bar policy",
         "limitations": [
-            "To nie jest identyczny silnik live v5.",
+            "To nie jest identyczny silnik live v6.3.",
             "Nie uwzględnia spreadu, poślizgu ani opóźnienia egzekucji.",
             "Wyniki historyczne nie gwarantują przyszłych rezultatów.",
         ],

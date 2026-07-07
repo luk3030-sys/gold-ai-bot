@@ -31,7 +31,7 @@ def _http_session() -> requests.Session:
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-    session.headers.update({"User-Agent": "Gold-AI-Bot/5.1"})
+    session.headers.update({"User-Agent": "Gold-AI-Bot/6.3"})
     return session
 
 

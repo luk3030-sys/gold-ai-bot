@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict
 
-from config import env_int
+from config import env_bool, env_int
 from db import (
     acquire_job_lock,
     add_run,
@@ -14,7 +14,8 @@ from db import (
     recent_fingerprint_exists,
     release_job_lock,
 )
-from notifier import format_signal, send_telegram
+from move_detector import detect_large_move, mark_move_alert_sent
+from notifier import format_move_alert, format_signal, send_telegram
 from performance import performance_report
 from strategy import analyze
 from tracker import track_open_signals
@@ -56,18 +57,29 @@ def tick() -> Dict:
     lock_name = "tick"
     owner = acquire_job_lock(lock_name, ttl_seconds=env_int("TICK_LOCK_TTL_SECONDS", 240))
     if not owner:
-        return {
-            "status": "skipped",
-            "reason": "tick_already_running",
-            "database": database_info(),
-        }
+        return {"status": "skipped", "reason": "tick_already_running", "database": database_info()}
 
     try:
         tracking = track_open_signals()
+
+        move_alert = None
+        move_sent = False
+        if env_bool("MOVE_ALERT_ENABLED", True):
+            try:
+                move_alert = detect_large_move()
+                if move_alert.get("triggered") and move_alert.get("is_new"):
+                    move_sent = send_telegram(format_move_alert(move_alert))
+                    if move_sent:
+                        mark_move_alert_sent(move_alert)
+            except Exception as exc:
+                move_alert = {"triggered": False, "error": f"{type(exc).__name__}: {exc}"}
+
         analysis = analyze()
         result = {
             "status": "ok",
             "tracking": tracking,
+            "move_alert": move_alert,
+            "move_telegram_sent": move_sent,
             "analysis": analysis,
             "new_signal": None,
             "telegram_sent": False,
@@ -82,17 +94,16 @@ def tick() -> Dict:
                 fingerprint = _fingerprint(analysis)
                 signal = create_signal(analysis, fingerprint, os.getenv("PRIMARY_TARGET", "TP2"))
                 perf = performance_report()
-                text = format_signal(analysis, perf.get("overall"))
-                sent = send_telegram(text)
+                sent = send_telegram(format_signal(analysis, perf.get("overall")))
                 result["new_signal"] = signal
                 result["telegram_sent"] = sent
 
-        add_run("tick", "ok", result)
+        add_run("tick_v6_3", "ok", result)
         return result
     except Exception as exc:
         payload = {"error": str(exc), "type": type(exc).__name__}
         try:
-            add_run("tick", "error", payload)
+            add_run("tick_v6_3", "error", payload)
         except Exception:
             pass
         raise
@@ -108,5 +119,5 @@ def manual_run(send_any: bool = True) -> Dict:
     if send_any or analysis.get("signal") in {"BUY", "SELL"}:
         sent = send_telegram(format_signal(analysis, perf.get("overall")))
     result = {"tracking": tracking, "analysis": analysis, "telegram_sent": sent}
-    add_run("manual", "ok", result)
+    add_run("manual_v6_3", "ok", result)
     return result

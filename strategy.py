@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 import os
 from typing import Dict, Tuple
@@ -5,6 +7,7 @@ from typing import Dict, Tuple
 from config import env_bool, env_float, env_int
 from data_provider import fetch_dxy_context, fetch_ohlc
 from indicators import enrich
+from institutional import institutional_context
 from patterns import candle_patterns, interpret_patterns
 
 INTERVALS = {"m15": "15min", "h1": "1h", "h4": "4h", "d1": "1day"}
@@ -38,7 +41,6 @@ def trend(row) -> str:
 
 
 def levels(df, lookback=40) -> Tuple[float, float]:
-    # Exclude the current signal candle so a breakout is not its own resistance/support.
     sub = df.iloc[-(lookback + 1):-1] if len(df) > lookback + 1 else df.iloc[:-1]
     if sub.empty:
         sub = df
@@ -63,13 +65,31 @@ def detect_regime(dfs, tr: Dict[str, str]) -> str:
     return "RANGE"
 
 
-def detect_setup(dfs, tr: Dict[str, str], support: float, resistance: float, regime: str) -> str:
+def detect_setup(dfs, tr: Dict[str, str], support: float, resistance: float, regime: str, inst: Dict[str, dict]) -> str:
     h1 = dfs["h1"]
     cur = h1.iloc[-1]
     prev = h1.iloc[-2]
     atr = max(_num(cur.atr14), 1e-9)
     near_ema = min(abs(cur.close - cur.ema20), abs(cur.close - cur.ema50)) <= 0.6 * atr
 
+    h1_event = inst["h1"]["structure"]["event"]
+    h1_sweep = inst["h1"]["liquidity_sweep"]["type"]
+    h1_fvg = (inst["h1"].get("fvg") or {}).get("nearest")
+
+    if h1_event == "CHOCH_UP":
+        return "CHOCH_UP_REVERSAL"
+    if h1_event == "CHOCH_DOWN":
+        return "CHOCH_DOWN_REVERSAL"
+    if h1_sweep == "SELL_SIDE_SWEEP":
+        return "SELL_SIDE_SWEEP_REVERSAL"
+    if h1_sweep == "BUY_SIDE_SWEEP":
+        return "BUY_SIDE_SWEEP_REVERSAL"
+    if h1_event == "BOS_UP":
+        return "BOS_UP_CONTINUATION"
+    if h1_event == "BOS_DOWN":
+        return "BOS_DOWN_CONTINUATION"
+    if h1_fvg and h1_fvg.get("price_inside"):
+        return "BULLISH_FVG_REBALANCE" if h1_fvg.get("type") == "BULLISH_FVG" else "BEARISH_FVG_REBALANCE"
     if tr["d1"] == tr["h4"] and tr["h4"] in {"UP", "DOWN"} and (tr["h1"] == "NEUTRAL" or near_ema):
         return "TREND_PULLBACK"
     if cur.close > resistance and prev.close <= resistance:
@@ -83,13 +103,28 @@ def detect_setup(dfs, tr: Dict[str, str], support: float, resistance: float, reg
     return "NO_CLEAR_SETUP"
 
 
+def _smart_money_summary(inst: Dict[str, dict]) -> dict:
+    return {
+        tf: {
+            "buy_score": ctx.get("buy_score", 0),
+            "sell_score": ctx.get("sell_score", 0),
+            "structure": ctx.get("structure"),
+            "liquidity_sweep": ctx.get("liquidity_sweep"),
+            "nearest_fvg": (ctx.get("fvg") or {}).get("nearest"),
+            "displacement": ctx.get("displacement"),
+            "premium_discount": ctx.get("premium_discount"),
+        }
+        for tf, ctx in inst.items()
+    }
+
+
 def analyze() -> dict:
     symbol = os.getenv("SYMBOL", "XAU/USD")
     min_score = env_int("MIN_SCORE", 80)
     min_rr = env_float("MIN_RR", 2.0)
     macro_block = env_bool("MACRO_BLOCK", False)
 
-    dfs = {key: enrich(fetch_ohlc(symbol, interval, 260, closed_only=True)) for key, interval in INTERVALS.items()}
+    dfs = {key: enrich(fetch_ohlc(symbol, interval, 320, closed_only=True)) for key, interval in INTERVALS.items()}
     if any(len(df) < 205 for df in dfs.values()):
         raise RuntimeError("Za mało danych do stabilnego EMA200")
 
@@ -100,7 +135,13 @@ def analyze() -> dict:
     support, resistance = levels(dfs["h1"], env_int("LEVEL_LOOKBACK", 40))
     patterns = candle_patterns(dfs["h1"])
     regime = detect_regime(dfs, tr)
-    setup_type = detect_setup(dfs, tr, support, resistance, regime)
+
+    inst = {
+        "m15": institutional_context(dfs["m15"], timeframe="M15"),
+        "h1": institutional_context(dfs["h1"], timeframe="H1"),
+        "h4": institutional_context(dfs["h4"], timeframe="H4"),
+    }
+    setup_type = detect_setup(dfs, tr, support, resistance, regime, inst)
 
     buy_score = sell_score = 0
     buy_reasons, sell_reasons = [], []
@@ -108,7 +149,7 @@ def analyze() -> dict:
     weights = {
         "d1": env_int("WEIGHT_D1", 15),
         "h4": env_int("WEIGHT_H4", 20),
-        "h1": env_int("WEIGHT_H1", 20),
+        "h1": env_int("WEIGHT_H1", 15),
         "m15": env_int("WEIGHT_M15", 5),
     }
     for tf in ["d1", "h4", "h1"]:
@@ -127,34 +168,60 @@ def analyze() -> dict:
     adx_h4 = _num(last["h4"].adx14)
     macdh = _num(last["h1"].macd_hist)
     if 45 <= rsi_h1 <= 68:
-        buy_score += 10; buy_reasons.append(f"RSI H1 sprzyja BUY: {rsi_h1:.1f}")
+        buy_score += 8; buy_reasons.append(f"RSI H1 sprzyja BUY: {rsi_h1:.1f}")
     if 32 <= rsi_h1 <= 55:
-        sell_score += 10; sell_reasons.append(f"RSI H1 sprzyja SELL: {rsi_h1:.1f}")
+        sell_score += 8; sell_reasons.append(f"RSI H1 sprzyja SELL: {rsi_h1:.1f}")
     if macdh > 0:
-        buy_score += 10; buy_reasons.append("MACD histogram dodatni")
+        buy_score += 7; buy_reasons.append("MACD histogram dodatni")
     elif macdh < 0:
-        sell_score += 10; sell_reasons.append("MACD histogram ujemny")
+        sell_score += 7; sell_reasons.append("MACD histogram ujemny")
     if adx_h1 >= 18:
-        buy_score += 5; sell_score += 5
+        buy_score += 3; sell_score += 3
 
     if "bullish_engulfing" in patterns or "pin_bar_bullish" in patterns:
-        buy_score += 10; buy_reasons.append("Price Action wspiera BUY")
+        buy_score += 7; buy_reasons.append("Price Action wspiera BUY")
     if "bearish_engulfing" in patterns or "pin_bar_bearish" in patterns:
-        sell_score += 10; sell_reasons.append("Price Action wspiera SELL")
+        sell_score += 7; sell_reasons.append("Price Action wspiera SELL")
 
     if regime == "STRONG_UP":
-        buy_score += 10; buy_reasons.append("Reżim: silny trend wzrostowy")
+        buy_score += 8; buy_reasons.append("Reżim: silny trend wzrostowy")
         sell_score -= 5
     elif regime == "STRONG_DOWN":
-        sell_score += 10; sell_reasons.append("Reżim: silny trend spadkowy")
+        sell_score += 8; sell_reasons.append("Reżim: silny trend spadkowy")
         buy_score -= 5
     elif regime == "HIGH_VOLATILITY_RANGE":
-        buy_score -= 5; sell_score -= 5
+        buy_score -= 4; sell_score -= 4
 
-    if setup_type in {"TREND_PULLBACK", "BREAKOUT_UP"} and tr["h4"] == "UP":
-        buy_score += 10; buy_reasons.append(f"Setup: {setup_type}")
-    if setup_type in {"TREND_PULLBACK", "BREAKOUT_DOWN"} and tr["h4"] == "DOWN":
-        sell_score += 10; sell_reasons.append(f"Setup: {setup_type}")
+    # Institutional/Smart Money layer. H4 context is weighted more than M15.
+    smc_weights = {
+        "m15": env_float("SMC_WEIGHT_M15", 0.30),
+        "h1": env_float("SMC_WEIGHT_H1", 0.55),
+        "h4": env_float("SMC_WEIGHT_H4", 0.75),
+    }
+    for tf in ["m15", "h1", "h4"]:
+        ctx = inst[tf]
+        buy_add = int(round(ctx.get("buy_score", 0) * smc_weights[tf]))
+        sell_add = int(round(ctx.get("sell_score", 0) * smc_weights[tf]))
+        buy_score += buy_add
+        sell_score += sell_add
+        if buy_add:
+            buy_reasons.extend(ctx.get("buy_reasons", []))
+        if sell_add:
+            sell_reasons.extend(ctx.get("sell_reasons", []))
+
+    # Setup alignment bonus. Counter-trend reversals need stronger confirmation.
+    if setup_type in {"TREND_PULLBACK", "BREAKOUT_UP", "BOS_UP_CONTINUATION", "BULLISH_FVG_REBALANCE"} and tr["h4"] == "UP":
+        buy_score += 8; buy_reasons.append(f"Setup zgodny z H4: {setup_type}")
+    if setup_type in {"TREND_PULLBACK", "BREAKOUT_DOWN", "BOS_DOWN_CONTINUATION", "BEARISH_FVG_REBALANCE"} and tr["h4"] == "DOWN":
+        sell_score += 8; sell_reasons.append(f"Setup zgodny z H4: {setup_type}")
+    if setup_type == "SELL_SIDE_SWEEP_REVERSAL":
+        buy_score += 5; buy_reasons.append("H1 sweep sell-side liquidity")
+    elif setup_type == "BUY_SIDE_SWEEP_REVERSAL":
+        sell_score += 5; sell_reasons.append("H1 sweep buy-side liquidity")
+    elif setup_type == "CHOCH_UP_REVERSAL":
+        buy_score += 6; buy_reasons.append("H1 CHOCH up reversal")
+    elif setup_type == "CHOCH_DOWN_REVERSAL":
+        sell_score += 6; sell_reasons.append("H1 CHOCH down reversal")
 
     dxy_ctx = fetch_dxy_context("1h", 220)
     dxy_status = dxy_ctx.get("status", "UNAVAILABLE")
@@ -165,15 +232,14 @@ def analyze() -> dict:
         dxy_df = enrich(dxy_ctx["df"])
         dxy_last = dxy_df.iloc[-1]
         dxy_bullish = dxy_last.close > dxy_last.ema50
-        # A proxy is deliberately weighted less than the direct DXY index.
         dxy_weight = env_int("DXY_WEIGHT", 5) if dxy_kind == "direct" else env_int("DXY_PROXY_WEIGHT", 2)
         if dxy_bullish:
             sell_score += dxy_weight
-            sell_reasons.append(f"USD filtr {dxy_symbol_used} powyżej EMA50 — wsparcie dla SELL GOLD")
+            sell_reasons.append(f"USD filtr {dxy_symbol_used} powyżej EMA50 — wsparcie SELL GOLD")
             dxy_status = f"BULLISH_{dxy_kind.upper()}"
         else:
             buy_score += dxy_weight
-            buy_reasons.append(f"USD filtr {dxy_symbol_used} poniżej EMA50 — wsparcie dla BUY GOLD")
+            buy_reasons.append(f"USD filtr {dxy_symbol_used} poniżej EMA50 — wsparcie BUY GOLD")
             dxy_status = f"BEARISH_{dxy_kind.upper()}"
         data_quality_score = 100 if dxy_kind == "direct" else 95
     else:
@@ -196,15 +262,17 @@ def analyze() -> dict:
     if buy_score > sell_score:
         signal, score, reasons = "BUY", buy_score, buy_reasons
         entry = price
-        structural_sl = support
-        sl = min(structural_sl, price - 1.3 * atr_h1)
+        h1_swing_low = inst["h1"]["structure"].get("last_swing_low")
+        structural_sl = h1_swing_low if h1_swing_low is not None else support
+        sl = min(float(structural_sl), price - 1.3 * atr_h1)
         risk = abs(entry - sl)
         tp1, tp2, tp3 = entry + 2 * risk, entry + 3 * risk, entry + 4 * risk
     elif sell_score > buy_score:
         signal, score, reasons = "SELL", sell_score, sell_reasons
         entry = price
-        structural_sl = resistance
-        sl = max(structural_sl, price + 1.3 * atr_h1)
+        h1_swing_high = inst["h1"]["structure"].get("last_swing_high")
+        structural_sl = h1_swing_high if h1_swing_high is not None else resistance
+        sl = max(float(structural_sl), price + 1.3 * atr_h1)
         risk = abs(sl - entry)
         tp1, tp2, tp3 = entry - 2 * risk, entry - 3 * risk, entry - 4 * risk
     else:
@@ -217,6 +285,10 @@ def analyze() -> dict:
         signal = "NO TRADE"
 
     h1_time = str(dfs["h1"].iloc[-1].datetime)
+    entry_zone_half = max(0.20 * atr_h1, env_float("ENTRY_ZONE_MIN_POINTS", 2.0))
+    entry_zone_low = roundp(price - entry_zone_half)
+    entry_zone_high = roundp(price + entry_zone_half)
+
     return {
         "symbol": symbol,
         "signal": signal,
@@ -238,6 +310,8 @@ def analyze() -> dict:
         "support": roundp(support),
         "resistance": roundp(resistance),
         "entry": roundp(entry),
+        "entry_zone_low": entry_zone_low if entry is not None else None,
+        "entry_zone_high": entry_zone_high if entry is not None else None,
         "sl": roundp(sl),
         "tp1": roundp(tp1),
         "tp2": roundp(tp2),
@@ -253,9 +327,10 @@ def analyze() -> dict:
         "dxy_kind": dxy_kind,
         "data_quality_score": data_quality_score,
         "closed_h1_candle_time": h1_time,
+        "institutional": _smart_money_summary(inst),
         "watch_plan": [
-            f"BUY dopiero po wybiciu i utrzymaniu powyżej {roundp(resistance)}",
-            f"SELL dopiero po utracie i retestcie poniżej {roundp(support)}",
+            f"BUY po akceptacji powyżej {roundp(resistance)} lub potwierdzonym sweepie sell-side + CHOCH",
+            f"SELL po akceptacji poniżej {roundp(support)} lub potwierdzonym sweepie buy-side + CHOCH",
             f"Strefa neutralna: {roundp(support)}–{roundp(resistance)}",
         ],
     }

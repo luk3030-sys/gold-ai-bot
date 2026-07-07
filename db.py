@@ -39,7 +39,7 @@ def db_path() -> str:
     if explicit:
         path = Path(explicit)
     else:
-        path = Path(os.getenv("DATA_DIR", "/tmp/gold_ai_bot_v5_1")) / "gold_ai_bot_v5_1.db"
+        path = Path(os.getenv("DATA_DIR", "/tmp/gold_ai_bot_v6_3")) / "gold_ai_bot_v6_3.db"
     path.parent.mkdir(parents=True, exist_ok=True)
     return str(path)
 
@@ -194,7 +194,7 @@ def init_db() -> None:
         conn.execute(
             """INSERT INTO metadata(key, value, updated_at) VALUES (?,?,?)
                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
-            ("schema_version", "5.1", utc_now_iso()),
+            ("schema_version", "6.3", utc_now_iso()),
         )
 
 
