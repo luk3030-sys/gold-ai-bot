@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
 from config import env_bool, env_int
-from data_provider import fetch_last_price, provider_health
+from data_provider import fetch_last_price, fetch_ohlc, provider_health
 from db import db_health, database_info, init_db, list_signals, recent_runs
 from move_detector import detect_large_move
 from notifier import format_signal, send_telegram
@@ -22,7 +22,7 @@ load_dotenv()
 init_db()
 app = Flask(__name__)
 
-VERSION = "6.3-institutional-persistent-performance"
+VERSION = "6.3.1-institutional-hotfix"
 
 
 def _authorized() -> bool:
@@ -39,6 +39,26 @@ def protected(fn):
             return jsonify({"error": "unauthorized"}), 401
         return fn(*args, **kwargs)
     return wrapper
+
+
+def _endpoint_error(endpoint: str, exc: Exception):
+    """Return a useful JSON error instead of a generic Flask 500 page."""
+    app.logger.exception("%s failed", endpoint)
+    message = str(exc)
+    hint = "Sprawdź Render Logs oraz /market-diagnostics."
+    lower = message.lower()
+    if "twelvedata" in lower or "api" in lower or "429" in lower:
+        hint = "Prawdopodobny problem danych/API Twelve Data: limit, plan, chwilowy błąd lub brak danych dla interwału."
+    elif "za mało danych" in lower or "ema200" in lower:
+        hint = "Dostawca zwrócił za mało świec do stabilnego EMA200."
+    return jsonify({
+        "status": "error",
+        "version": VERSION,
+        "endpoint": endpoint,
+        "error_type": type(exc).__name__,
+        "error": message,
+        "hint": hint,
+    }), 503
 
 
 HTML = """
@@ -92,17 +112,50 @@ def data_health():
 
 @app.get("/analyze")
 def analyze_endpoint():
-    return jsonify(analyze())
+    try:
+        return jsonify(analyze())
+    except Exception as exc:
+        return _endpoint_error("/analyze", exc)
 
 
 @app.get("/institutional")
 def institutional_endpoint():
-    a = analyze()
-    return jsonify({
-        "symbol": a.get("symbol"), "price": a.get("price"), "signal": a.get("signal"),
-        "setup_type": a.get("setup_type"), "regime": a.get("regime"),
-        "institutional": a.get("institutional"), "watch_plan": a.get("watch_plan"),
-    })
+    try:
+        a = analyze()
+        return jsonify({
+            "symbol": a.get("symbol"), "price": a.get("price"), "signal": a.get("signal"),
+            "setup_type": a.get("setup_type"), "regime": a.get("regime"),
+            "institutional": a.get("institutional"), "watch_plan": a.get("watch_plan"),
+        })
+    except Exception as exc:
+        return _endpoint_error("/institutional", exc)
+
+
+@app.get("/market-diagnostics")
+@protected
+def market_diagnostics():
+    symbol = os.getenv("SYMBOL", "XAU/USD")
+    checks = {}
+    for name, interval in (("m15", "15min"), ("h1", "1h"), ("h4", "4h"), ("d1", "1day")):
+        try:
+            df = fetch_ohlc(symbol, interval, 320, closed_only=True)
+            checks[name] = {
+                "ok": True,
+                "interval": interval,
+                "rows": int(len(df)),
+                "last_candle": str(df.iloc[-1].datetime) if len(df) else None,
+                "data_source": df.attrs.get("data_source"),
+                "stale": bool(df.attrs.get("stale", False)),
+            }
+        except Exception as exc:
+            checks[name] = {
+                "ok": False,
+                "interval": interval,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+    all_ok = all(item.get("ok") for item in checks.values())
+    return jsonify({"status": "ok" if all_ok else "degraded", "symbol": symbol, "checks": checks}), (200 if all_ok else 503)
 
 
 @app.get("/run-now")
