@@ -182,6 +182,43 @@ def _ddl_statements() -> List[str]:
             updated_at TEXT NOT NULL
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS api_usage_events (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            endpoint TEXT,
+            symbol TEXT,
+            interval TEXT,
+            credits INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL,
+            detail TEXT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_api_usage_provider_time ON api_usage_events(provider, created_at)",
+        """
+        CREATE TABLE IF NOT EXISTS provider_state (
+            provider TEXT PRIMARY KEY,
+            blocked_until TEXT,
+            reason TEXT,
+            consecutive_429 INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS market_cache (
+            cache_key TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            interval TEXT NOT NULL,
+            closed_only INTEGER NOT NULL,
+            outputsize INTEGER NOT NULL,
+            fetched_at TEXT NOT NULL,
+            bucket_id TEXT,
+            payload_json TEXT NOT NULL,
+            meta_json TEXT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_market_cache_symbol_interval ON market_cache(symbol, interval)",
     ]
 
 
@@ -194,7 +231,7 @@ def init_db() -> None:
         conn.execute(
             """INSERT INTO metadata(key, value, updated_at) VALUES (?,?,?)
                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
-            ("schema_version", "6.3", utc_now_iso()),
+            ("schema_version", "6.3.2", utc_now_iso()),
         )
 
 
@@ -360,3 +397,137 @@ def set_metadata(key: str, value: str) -> None:
                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
             (key, value, utc_now_iso()),
         )
+
+
+# ---- v6.3.2 Quota Guard & Persistent Market Cache ----
+
+def record_api_usage(
+    provider: str,
+    endpoint: str,
+    symbol: str,
+    interval: str,
+    credits: int,
+    status: str,
+    detail: str = "",
+) -> None:
+    with connection() as conn:
+        conn.execute(
+            """INSERT INTO api_usage_events(
+                id, created_at, provider, endpoint, symbol, interval, credits, status, detail
+            ) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                str(uuid.uuid4()), utc_now_iso(), provider, endpoint, symbol, interval,
+                max(0, int(credits)), status, detail,
+            ),
+        )
+
+
+def api_usage_counts(provider: str) -> Dict[str, int]:
+    now = datetime.now(timezone.utc)
+    minute_since = (now - timedelta(seconds=60)).isoformat()
+    day_since = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    with connection() as conn:
+        minute = conn.execute(
+            """SELECT COUNT(*) AS requests, COALESCE(SUM(credits),0) AS credits
+               FROM api_usage_events WHERE provider=? AND created_at>=?""",
+            (provider, minute_since),
+        ).fetchone()
+        daily = conn.execute(
+            """SELECT COUNT(*) AS requests, COALESCE(SUM(credits),0) AS credits,
+                      COALESCE(SUM(CASE WHEN status='http_429' THEN 1 ELSE 0 END),0) AS n429
+               FROM api_usage_events WHERE provider=? AND created_at>=?""",
+            (provider, day_since),
+        ).fetchone()
+    return {
+        "minute_requests": int(minute["requests"] or 0),
+        "minute_credits": int(minute["credits"] or 0),
+        "daily_requests": int(daily["requests"] or 0),
+        "daily_credits": int(daily["credits"] or 0),
+        "daily_429": int(daily["n429"] or 0),
+    }
+
+
+def get_provider_state(provider: str) -> Optional[Dict[str, Any]]:
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM provider_state WHERE provider=?", (provider,)).fetchone()
+    return dict(row) if row else None
+
+
+def set_provider_state(
+    provider: str,
+    *,
+    blocked_until: Optional[str],
+    reason: str,
+    consecutive_429: int,
+) -> None:
+    with connection() as conn:
+        conn.execute(
+            """INSERT INTO provider_state(provider, blocked_until, reason, consecutive_429, updated_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(provider) DO UPDATE SET
+                   blocked_until=excluded.blocked_until,
+                   reason=excluded.reason,
+                   consecutive_429=excluded.consecutive_429,
+                   updated_at=excluded.updated_at""",
+            (provider, blocked_until, reason, int(consecutive_429), utc_now_iso()),
+        )
+
+
+def put_market_cache(
+    cache_key: str,
+    *,
+    symbol: str,
+    interval: str,
+    closed_only: bool,
+    outputsize: int,
+    fetched_at: str,
+    bucket_id: Optional[str],
+    payload_json: str,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    with connection() as conn:
+        conn.execute(
+            """INSERT INTO market_cache(
+                cache_key, symbol, interval, closed_only, outputsize, fetched_at, bucket_id, payload_json, meta_json
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                symbol=excluded.symbol,
+                interval=excluded.interval,
+                closed_only=excluded.closed_only,
+                outputsize=excluded.outputsize,
+                fetched_at=excluded.fetched_at,
+                bucket_id=excluded.bucket_id,
+                payload_json=excluded.payload_json,
+                meta_json=excluded.meta_json""",
+            (
+                cache_key, symbol, interval, 1 if closed_only else 0, int(outputsize), fetched_at,
+                bucket_id, payload_json, json.dumps(meta or {}, ensure_ascii=False, default=str),
+            ),
+        )
+
+
+def get_market_cache(cache_key: str) -> Optional[Dict[str, Any]]:
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM market_cache WHERE cache_key=?", (cache_key,)).fetchone()
+    return dict(row) if row else None
+
+
+def market_cache_rows(limit: int = 100) -> List[Dict[str, Any]]:
+    with connection() as conn:
+        rows = conn.execute(
+            "SELECT cache_key, symbol, interval, closed_only, outputsize, fetched_at, bucket_id, meta_json "
+            "FROM market_cache ORDER BY fetched_at DESC LIMIT ?",
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def find_market_cache(symbol: str, interval: str, closed_only: bool, min_outputsize: int = 1) -> Optional[Dict[str, Any]]:
+    with connection() as conn:
+        row = conn.execute(
+            """SELECT * FROM market_cache
+               WHERE symbol=? AND interval=? AND closed_only=? AND outputsize>=?
+               ORDER BY outputsize DESC, fetched_at DESC LIMIT 1""",
+            (symbol, interval, 1 if closed_only else 0, int(min_outputsize)),
+        ).fetchone()
+    return dict(row) if row else None

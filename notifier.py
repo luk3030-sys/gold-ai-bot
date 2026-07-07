@@ -39,7 +39,7 @@ def _smc_lines(a: dict) -> list[str]:
 def format_signal(a: dict, performance: Optional[dict] = None) -> str:
     icon = "🟢" if a.get("signal") == "BUY" else "🔴" if a.get("signal") == "SELL" else "⚪"
     lines = [
-        f"{icon} <b>GOLD AI BOT v6.3 — INSTITUTIONAL + PERFORMANCE</b>",
+        f"{icon} <b>GOLD AI BOT v6.3.2 — QUOTA GUARD + SMART CACHE</b>",
         f"Symbol: {a.get('symbol')}",
         f"Sygnał: <b>{a.get('signal')}</b>",
         f"Score regułowy: {a.get('score')}/100 (nie jest prawdopodobieństwem)",

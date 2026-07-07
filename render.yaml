@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: gold-ai-bot-v6-3
+    name: gold-ai-bot-v6-3-2
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn --workers 1 --threads 2 --timeout 120 app:app
@@ -11,5 +11,17 @@ services:
         value: "true"
       - key: SCHEDULER_ENABLED
         value: "false"
+      - key: ANALYZE_INTERVAL_MINUTES
+        value: "10"
       - key: MOVE_ALERT_ENABLED
         value: "true"
+      - key: QUOTA_GUARD_ENABLED
+        value: "true"
+      - key: TD_MINUTE_CREDIT_LIMIT
+        value: "8"
+      - key: TD_DAILY_CREDIT_LIMIT
+        value: "800"
+      - key: TD_MINUTE_CREDIT_RESERVE
+        value: "1"
+      - key: TD_DAILY_CREDIT_RESERVE
+        value: "80"

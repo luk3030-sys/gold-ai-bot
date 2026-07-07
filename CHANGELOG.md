@@ -1,20 +1,19 @@
 # Changelog
 
-## 6.3.0 — Institutional + Persistent Performance
+## 6.3.2 — Quota Guard & Smart Multi-Timeframe Cache
 
-- zachowano PostgreSQL, tracking TP/SL, performance, cooldowny i blokady ticka z v5.1
-- dodano Institutional Smart Money Engine:
-  - BOS / CHOCH
-  - struktura HH/HL i LH/LL
-  - buy-side / sell-side liquidity sweeps
-  - Fair Value Gaps
-  - displacement
-  - uproszczone Order Blocks
-  - premium / discount range
-- dodano scoring SMC dla M15/H1/H4
-- dodano strefę Entry
-- dodano alert dużego ruchu świecy niezależny od BUY/SELL
-- dodano `/institutional` i `/move-watch`
-- przywrócono kompatybilny endpoint `/signal`
-- `/tick` pozostaje głównym automatycznym cyklem
-- podniesiono schema metadata do 6.3 bez zmiany istniejących tabel sygnałów
+- persistent `api_usage_events` ledger
+- persistent provider circuit breaker
+- `/quota-status`
+- persistent `market_cache` in PostgreSQL/SQLite
+- `/cache-status`
+- Smart bucket refresh for M15/H1/H4/D1
+- reuse larger cached frames for smaller outputsize requests
+- 429 removed from automatic HTTP retry list
+- exponential circuit breaker after 429
+- stale-cache fallback on quota/HTTP/provider errors
+- DXY uses Smart Cache and does not negative-cache symbols merely because of global rate limiting
+- `/tick` returns `degraded` on provider/quota failures instead of 500
+- `/market-diagnostics?refresh=1` for explicit live refresh
+- default scheduler interval changed to 10 minutes
+- version endpoint updated to `6.3.2-quota-guard-smart-cache`
