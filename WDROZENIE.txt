@@ -1,0 +1,54 @@
+Gold AI Bot v6 — Position Manager — instrukcja wdrożenia
+
+1. Wgraj do repozytorium pliki:
+   - position_store.py
+   - telegram_position_commands.py
+
+2. Do requirements.txt dopisz:
+   psycopg2-binary>=2.9.9
+
+3. W app.py dodaj importy:
+   from position_store import init_position_db, evaluate_positions
+   from telegram_position_commands import handle_position_command
+
+4. Po starcie aplikacji dodaj:
+   init_position_db()
+
+5. W obsłudze wiadomości Telegram dodaj:
+   reply = handle_position_command(message_text)
+   if reply:
+       send_telegram_message(reply)
+       return
+
+6. W pętli/schedulerze, po pobraniu aktualnej ceny XAU/USD, dodaj:
+   position_alerts = evaluate_positions(current_price)
+   for alert in position_alerts:
+       send_telegram_message(alert)
+
+7. Gdy bot wygeneruje własny sygnał BUY albo SELL, zapisz go:
+   from position_store import add_position
+
+   if signal in ("BUY", "SELL"):
+       add_position(
+           side=signal,
+           entry=entry,
+           sl=sl,
+           tp1=tp1,
+           tp2=tp2,
+           tp3=tp3,
+           source="bot_signal",
+           note=f"score={score}; setup={setup}; regime={regime}"
+       )
+
+8. Ręczne dodawanie pozycji przez Telegram:
+   /position SELL 4124.55 4202.03 3969.59 3892.11 3814.63
+   /position BUY 4100 4070 4130 4160 4200
+
+9. Lista pozycji:
+   /positions
+
+10. Ręczne zamknięcie pozycji:
+   /close ID_POZYCJI
+
+Mechanizm działa dla BUY i SELL.
+Bot pamięta pozycje w PostgreSQL, więc po restarcie aplikacji ich nie traci.
