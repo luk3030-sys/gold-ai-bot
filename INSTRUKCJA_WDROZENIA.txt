@@ -1,0 +1,49 @@
+# INTEGRACJA Z app.py
+
+1. Wgraj plik `position_manager.py` do tego samego katalogu co `app.py`.
+
+2. Na górze `app.py` dodaj:
+
+from position_manager import handle_position_message
+
+3. W miejscu, gdzie obsługujesz wiadomości z Telegrama, dodaj PRZED standardową logiką sygnałów:
+
+text = message.get("text", "")
+
+# market_state to słownik z aktualnymi danymi bota.
+# Jeśli masz ATR H1, przekaż go tutaj.
+# Przykład:
+# market_state = {"atr_h1": atr_h1}
+market_state = globals().get("latest_market_state", {})
+
+position_reply = handle_position_message(text, market_state=market_state)
+if position_reply:
+    send_telegram_message(position_reply)
+    return
+
+4. Komendy na Telegramie:
+
+/position SELL 4097
+/position BUY 4097
+/positions
+/close 1
+/clear_positions
+
+5. Bot sam wylicza SL/TP:
+SELL:
+- SL nad wejściem
+- TP poniżej wejścia
+
+BUY:
+- SL pod wejściem
+- TP powyżej wejścia
+
+6. Domyślne parametry możesz ustawić w zmiennych środowiskowych:
+
+DEFAULT_ATR_H1=12
+SL_ATR_MULT=1.5
+POSITIONS_FILE=positions.json
+
+7. Ważne:
+Bot NIE ustawia automatycznie zleceń u brokera.
+Bot zapisuje pozycję i podaje poziomy, które trzeba ręcznie wpisać w aplikacji brokera.
