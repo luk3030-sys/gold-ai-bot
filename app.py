@@ -9,7 +9,7 @@ import numpy as np
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.5.1-scheduler-fix"
+APP_VERSION = "6.5.2-telegram-polling-fix"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -39,6 +39,7 @@ POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json")
 TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", "telegram_offset.json")
 POSITION_CHECK_INTERVAL_MINUTES = int(os.getenv("POSITION_CHECK_INTERVAL_MINUTES", "5"))
 TELEGRAM_POLL_INTERVAL_MINUTES = int(os.getenv("TELEGRAM_POLL_INTERVAL_MINUTES", "1"))
+TELEGRAM_POLLING_ENABLED = env_bool("TELEGRAM_POLLING_ENABLED", True)
 DEFAULT_POSITION_VOLUME = float(os.getenv("DEFAULT_POSITION_VOLUME", "0.003"))
 AUTO_RISK_ATR_MULTIPLIER = float(os.getenv("AUTO_RISK_ATR_MULTIPLIER", "1.4"))
 AUTO_RISK_MIN_POINTS = float(os.getenv("AUTO_RISK_MIN_POINTS", "18"))
@@ -60,6 +61,17 @@ app = Flask(__name__)
 LAST_SIGNAL: Dict[str, Any] = {"status": "starting", "version": APP_VERSION}
 LAST_ALERT_KEY: Optional[str] = None
 scheduler = None
+TELEGRAM_STATUS: Dict[str, Any] = {
+    "enabled": TELEGRAM_POLLING_ENABLED,
+    "last_run_utc": None,
+    "last_success_utc": None,
+    "last_error": None,
+    "last_http_status": None,
+    "last_updates_count": 0,
+    "last_update_id": None,
+    "webhook_deleted": False,
+    "bot_username": None,
+}
 LAST_MOVE_ALERT_KEYS: set = set()
 
 
@@ -425,12 +437,18 @@ def format_signal(s: Dict[str, Any]) -> str:
 
 def send_telegram(text: str, chat_id: Optional[str] = None) -> None:
     if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN:
-        return
+        raise RuntimeError("Telegram wyłączony albo brak TELEGRAM_BOT_TOKEN")
     target_chat_id = chat_id or TELEGRAM_CHAT_ID
     if not target_chat_id:
-        return
+        raise RuntimeError("Brak TELEGRAM_CHAT_ID i brak chat_id z wiadomości")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": target_chat_id, "text": text}, timeout=15)
+    r = requests.post(url, json={"chat_id": target_chat_id, "text": text}, timeout=15)
+    TELEGRAM_STATUS["last_http_status"] = r.status_code
+    r.raise_for_status()
+    payload = r.json()
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram sendMessage error: {payload}")
+
 
 
 def format_position(p: Dict[str, Any], price: Optional[float] = None) -> str:
@@ -652,35 +670,104 @@ def handle_command(text: str, chat_id: str) -> str:
     return "Nieznana komenda.\n\n" + command_help()
 
 
-def telegram_poll_job() -> None:
-    if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN:
+def telegram_api_get(method: str, params: Optional[Dict[str, Any]] = None, timeout: int = 12) -> Dict[str, Any]:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    r = requests.get(url, params=params or {}, timeout=timeout)
+    TELEGRAM_STATUS["last_http_status"] = r.status_code
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram {method} error: {data}")
+    return data
+
+
+def ensure_telegram_polling_mode() -> None:
+    if not TELEGRAM_POLLING_ENABLED or not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN:
         return
+
+    me = telegram_api_get("getMe")
+    TELEGRAM_STATUS["bot_username"] = (me.get("result") or {}).get("username")
+
+    webhook = telegram_api_get("getWebhookInfo")
+    webhook_url = str((webhook.get("result") or {}).get("url") or "")
+    if webhook_url:
+        telegram_api_get("deleteWebhook", {"drop_pending_updates": "false"})
+        TELEGRAM_STATUS["webhook_deleted"] = True
+    TELEGRAM_STATUS["last_error"] = None
+
+
+def telegram_poll_job() -> None:
+    TELEGRAM_STATUS["last_run_utc"] = now_utc()
+    TELEGRAM_STATUS["last_updates_count"] = 0
+
+    if not TELEGRAM_POLLING_ENABLED:
+        TELEGRAM_STATUS["last_error"] = "TELEGRAM_POLLING_ENABLED=false"
+        return
+    if not ENABLE_TELEGRAM:
+        TELEGRAM_STATUS["last_error"] = "ENABLE_TELEGRAM=false"
+        return
+    if not TELEGRAM_BOT_TOKEN:
+        TELEGRAM_STATUS["last_error"] = "Brak TELEGRAM_BOT_TOKEN"
+        return
+
     state = load_json(TELEGRAM_OFFSET_FILE, {"offset": None})
-    params = {"timeout": 5}
+    params: Dict[str, Any] = {
+        "timeout": 0,
+        "allowed_updates": json.dumps(["message", "edited_message"]),
+    }
     if state.get("offset") is not None:
         params["offset"] = int(state["offset"])
+
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-        r = requests.get(url, params=params, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        if not data.get("ok"):
-            return
+        webhook = telegram_api_get("getWebhookInfo")
+        webhook_url = str((webhook.get("result") or {}).get("url") or "")
+        if webhook_url:
+            telegram_api_get("deleteWebhook", {"drop_pending_updates": "false"})
+            TELEGRAM_STATUS["webhook_deleted"] = True
+
+        data = telegram_api_get("getUpdates", params=params, timeout=12)
+        updates = data.get("result", [])
+        TELEGRAM_STATUS["last_updates_count"] = len(updates)
+
         max_update_id = None
-        for update in data.get("result", []):
-            max_update_id = update.get("update_id")
+        for update in updates:
+            update_id = update.get("update_id")
+            if update_id is not None:
+                update_id = int(update_id)
+                max_update_id = update_id if max_update_id is None else max(max_update_id, update_id)
+                TELEGRAM_STATUS["last_update_id"] = update_id
+
             message = update.get("message") or update.get("edited_message") or {}
-            text = message.get("text") or ""
+            text_value = message.get("text") or ""
             chat = message.get("chat") or {}
             chat_id = str(chat.get("id", ""))
-            if not text or not chat_id:
+
+            if not text_value or not chat_id:
                 continue
-            response = handle_command(text, chat_id)
-            send_telegram(response, chat_id=chat_id)
+
+            try:
+                response = handle_command(text_value, chat_id)
+                send_telegram(response, chat_id=chat_id)
+            except Exception as command_error:
+                try:
+                    send_telegram(f"❌ Błąd obsługi komendy: {command_error}", chat_id=chat_id)
+                except Exception:
+                    pass
+                raise
+
         if max_update_id is not None:
-            save_json(TELEGRAM_OFFSET_FILE, {"offset": int(max_update_id) + 1, "updated_utc": now_utc()})
+            save_json(
+                TELEGRAM_OFFSET_FILE,
+                {"offset": int(max_update_id) + 1, "updated_utc": now_utc()},
+            )
+
+        TELEGRAM_STATUS["last_success_utc"] = now_utc()
+        TELEGRAM_STATUS["last_error"] = None
+
     except Exception as e:
-        print(f"TELEGRAM POLL ERROR: {e}")
+        TELEGRAM_STATUS["last_error"] = f"{type(e).__name__}: {e}"
+        print(f"TELEGRAM POLL ERROR: {type(e).__name__}: {e}")
+
 
 
 def job() -> None:
@@ -722,10 +809,52 @@ def health():
         "position_check_interval_minutes": POSITION_CHECK_INTERVAL_MINUTES,
         "closed_candles": CLOSED_CANDLES_ONLY,
         "telegram_polling": ENABLE_TELEGRAM and bool(TELEGRAM_BOT_TOKEN),
+        "telegram_polling_enabled": TELEGRAM_POLLING_ENABLED,
+        "telegram_last_run_utc": TELEGRAM_STATUS.get("last_run_utc"),
+        "telegram_last_success_utc": TELEGRAM_STATUS.get("last_success_utc"),
+        "telegram_last_error": TELEGRAM_STATUS.get("last_error"),
+        "telegram_last_updates_count": TELEGRAM_STATUS.get("last_updates_count"),
+        "telegram_bot_username": TELEGRAM_STATUS.get("bot_username"),
+        "telegram_webhook_deleted": TELEGRAM_STATUS.get("webhook_deleted"),
         "positions_count": len(load_positions()),
         "move_alert_enabled": MOVE_ALERT_ENABLED,
         "move_alert_intervals": MOVE_ALERT_INTERVALS,
     })
+
+
+@app.get("/telegram-status")
+def telegram_status_endpoint():
+    result = dict(TELEGRAM_STATUS)
+    result.update({
+        "enabled": ENABLE_TELEGRAM,
+        "polling_enabled": TELEGRAM_POLLING_ENABLED,
+        "token_present": bool(TELEGRAM_BOT_TOKEN),
+        "configured_chat_id_present": bool(TELEGRAM_CHAT_ID),
+        "poll_interval_minutes": TELEGRAM_POLL_INTERVAL_MINUTES,
+    })
+    if TELEGRAM_BOT_TOKEN:
+        try:
+            me = telegram_api_get("getMe")
+            result["get_me_ok"] = True
+            result["bot_username"] = (me.get("result") or {}).get("username")
+        except Exception as e:
+            result["get_me_ok"] = False
+            result["get_me_error"] = f"{type(e).__name__}: {e}"
+        try:
+            wh = telegram_api_get("getWebhookInfo")
+            whr = wh.get("result") or {}
+            result["webhook_url"] = whr.get("url") or ""
+            result["webhook_pending_update_count"] = whr.get("pending_update_count")
+            result["webhook_last_error_message"] = whr.get("last_error_message")
+        except Exception as e:
+            result["webhook_check_error"] = f"{type(e).__name__}: {e}"
+    return jsonify(result)
+
+
+@app.post("/telegram-poll-now")
+def telegram_poll_now_endpoint():
+    telegram_poll_job()
+    return jsonify(dict(TELEGRAM_STATUS))
 
 
 @app.get("/signal")
@@ -787,6 +916,12 @@ if SCHEDULER_ENABLED:
     # Polling allows Telegram commands without setting a webhook. Highest practical frequency is 1 minute.
     scheduler.add_job(telegram_poll_job, "interval", minutes=max(1, TELEGRAM_POLL_INTERVAL_MINUTES), id="telegram_poll", replace_existing=True)
     scheduler.start()
+    try:
+        ensure_telegram_polling_mode()
+        telegram_poll_job()
+    except Exception as e:
+        TELEGRAM_STATUS["last_error"] = f"startup: {type(e).__name__}: {e}"
+        print(f"TELEGRAM STARTUP ERROR: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
