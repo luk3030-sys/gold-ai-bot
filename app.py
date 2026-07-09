@@ -9,7 +9,7 @@ import numpy as np
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.5.2-telegram-polling-fix"
+APP_VERSION = "6.5.3-runtime-tick-fix"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -43,6 +43,7 @@ TELEGRAM_POLLING_ENABLED = env_bool("TELEGRAM_POLLING_ENABLED", True)
 DEFAULT_POSITION_VOLUME = float(os.getenv("DEFAULT_POSITION_VOLUME", "0.003"))
 AUTO_RISK_ATR_MULTIPLIER = float(os.getenv("AUTO_RISK_ATR_MULTIPLIER", "1.4"))
 AUTO_RISK_MIN_POINTS = float(os.getenv("AUTO_RISK_MIN_POINTS", "18"))
+DEFAULT_ATR_H1 = float(os.getenv("DEFAULT_ATR_H1", "12.0"))
 TP1_RR = float(os.getenv("TP1_RR", "1.5"))
 TP2_RR = float(os.getenv("TP2_RR", "2.5"))
 TP3_RR = float(os.getenv("TP3_RR", "3.5"))
@@ -474,10 +475,41 @@ def format_position(p: Dict[str, Any], price: Optional[float] = None) -> str:
 
 
 def add_position(side: str, entry: float, volume: Optional[float] = None, chat_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Dodaje pozycję nawet wtedy, gdy Twelve Data chwilowo nie odpowiada.
+    Priorytet:
+    1) aktualny ATR H1 z Twelve Data,
+    2) ostatni znany ATR z LAST_SIGNAL, jeśli dostępny,
+    3) DEFAULT_ATR_H1 z ENV.
+    """
     side = side.upper()
     if side not in ("BUY", "SELL"):
         raise ValueError("Użyj BUY albo SELL")
-    price, atr_value = current_price_and_atr()
+
+    atr_value = None
+    atr_source = "twelve_data_h1"
+
+    try:
+        _, atr_value = current_price_and_atr()
+    except Exception as market_error:
+        atr_source = "fallback"
+        # Spróbuj użyć danych z ostatniego sygnału, jeśli kiedyś zostaną tam dodane.
+        try:
+            candidate = safe_float(
+                (LAST_SIGNAL.get("market") or {}).get("atr_h1")
+                if isinstance(LAST_SIGNAL, dict)
+                else None
+            )
+            if candidate and candidate > 0:
+                atr_value = candidate
+                atr_source = "last_signal"
+        except Exception:
+            atr_value = None
+
+        if atr_value is None or atr_value <= 0:
+            atr_value = DEFAULT_ATR_H1
+            atr_source = "default_env"
+
     rp = risk_plan_for_position(side, entry, atr_value)
     positions = load_positions()
     p = {
@@ -491,11 +523,17 @@ def add_position(side: str, entry: float, volume: Optional[float] = None, chat_i
         "tp2": rp["tp2"],
         "tp3": rp["tp3"],
         "risk_distance": rp["risk_distance"],
+        "atr_used": round(float(atr_value), 2),
+        "atr_source": atr_source,
         "created_utc": now_utc(),
         "status": "OPEN",
         "alerts_sent": [],
         "chat_id": str(chat_id or TELEGRAM_CHAT_ID or ""),
-        "note": "SL/TP calculated automatically from H1 ATR. Update broker manually unless you connect broker API.",
+        "note": (
+            "SL/TP calculated automatically from H1 ATR. "
+            "If market data was unavailable, fallback ATR was used. "
+            "Update broker manually unless you connect broker API."
+        ),
     }
     positions.append(p)
     save_positions(positions)
@@ -697,6 +735,10 @@ def ensure_telegram_polling_mode() -> None:
 
 
 def telegram_poll_job() -> None:
+    """
+    Pobiera update'y z Telegrama.
+    Ważne: pojedyncza błędna komenda NIE blokuje całej kolejki i offset jest przesuwany dalej.
+    """
     TELEGRAM_STATUS["last_run_utc"] = now_utc()
     TELEGRAM_STATUS["last_updates_count"] = 0
 
@@ -718,6 +760,8 @@ def telegram_poll_job() -> None:
     if state.get("offset") is not None:
         params["offset"] = int(state["offset"])
 
+    command_errors: List[str] = []
+
     try:
         webhook = telegram_api_get("getWebhookInfo")
         webhook_url = str((webhook.get("result") or {}).get("url") or "")
@@ -730,6 +774,7 @@ def telegram_poll_job() -> None:
         TELEGRAM_STATUS["last_updates_count"] = len(updates)
 
         max_update_id = None
+
         for update in updates:
             update_id = update.get("update_id")
             if update_id is not None:
@@ -749,12 +794,19 @@ def telegram_poll_job() -> None:
                 response = handle_command(text_value, chat_id)
                 send_telegram(response, chat_id=chat_id)
             except Exception as command_error:
+                err = f"update_id={update_id}: {type(command_error).__name__}: {command_error}"
+                command_errors.append(err)
                 try:
-                    send_telegram(f"❌ Błąd obsługi komendy: {command_error}", chat_id=chat_id)
+                    send_telegram(
+                        f"❌ Błąd obsługi komendy: {type(command_error).__name__}: {command_error}",
+                        chat_id=chat_id,
+                    )
                 except Exception:
                     pass
-                raise
+                # NIE przerywamy całej pętli.
+                continue
 
+        # Offset zapisujemy także wtedy, gdy pojedyncza komenda była błędna.
         if max_update_id is not None:
             save_json(
                 TELEGRAM_OFFSET_FILE,
@@ -762,12 +814,13 @@ def telegram_poll_job() -> None:
             )
 
         TELEGRAM_STATUS["last_success_utc"] = now_utc()
-        TELEGRAM_STATUS["last_error"] = None
+        TELEGRAM_STATUS["last_error"] = (
+            " | ".join(command_errors[-3:]) if command_errors else None
+        )
 
     except Exception as e:
         TELEGRAM_STATUS["last_error"] = f"{type(e).__name__}: {e}"
         print(f"TELEGRAM POLL ERROR: {type(e).__name__}: {e}")
-
 
 
 def job() -> None:
@@ -819,6 +872,8 @@ def health():
         "positions_count": len(load_positions()),
         "move_alert_enabled": MOVE_ALERT_ENABLED,
         "move_alert_intervals": MOVE_ALERT_INTERVALS,
+        "twelve_data_key_present": bool(TWELVE_DATA_API_KEY),
+        "default_atr_h1": DEFAULT_ATR_H1,
     })
 
 
@@ -855,6 +910,121 @@ def telegram_status_endpoint():
 def telegram_poll_now_endpoint():
     telegram_poll_job()
     return jsonify(dict(TELEGRAM_STATUS))
+
+
+@app.route("/tick", methods=["GET", "POST"])
+def tick_endpoint():
+    """
+    Ręczny pełny cykl diagnostyczny.
+    Uruchamia:
+    - analizę sygnału,
+    - monitoring pozycji,
+    - alerty dużego ruchu,
+    - polling Telegrama.
+    """
+    global LAST_SIGNAL
+
+    result: Dict[str, Any] = {
+        "status": "ok",
+        "version": APP_VERSION,
+        "time_utc": now_utc(),
+        "steps": {},
+    }
+
+    # 1. Signal analysis
+    try:
+        job()
+        signal_ok = LAST_SIGNAL.get("status") != "error"
+        result["steps"]["signal"] = {
+            "ok": signal_ok,
+            "signal": LAST_SIGNAL.get("signal"),
+            "score": LAST_SIGNAL.get("score"),
+            "error": LAST_SIGNAL.get("error"),
+        }
+        if not signal_ok:
+            result["status"] = "partial_error"
+    except Exception as e:
+        result["steps"]["signal"] = {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+        }
+        result["status"] = "partial_error"
+
+    # 2. Position monitor
+    try:
+        position_monitor_job()
+        result["steps"]["position_monitor"] = {
+            "ok": True,
+            "positions_count": len(load_positions()),
+        }
+    except Exception as e:
+        result["steps"]["position_monitor"] = {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+        }
+        result["status"] = "partial_error"
+
+    # 3. Move alerts
+    try:
+        check_move_alerts()
+        result["steps"]["move_alerts"] = {"ok": True}
+    except Exception as e:
+        result["steps"]["move_alerts"] = {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+        }
+        result["status"] = "partial_error"
+
+    # 4. Telegram polling
+    try:
+        telegram_poll_job()
+        tg_ok = TELEGRAM_STATUS.get("last_success_utc") is not None
+        result["steps"]["telegram_poll"] = {
+            "ok": tg_ok,
+            "last_success_utc": TELEGRAM_STATUS.get("last_success_utc"),
+            "last_error": TELEGRAM_STATUS.get("last_error"),
+            "updates_count": TELEGRAM_STATUS.get("last_updates_count"),
+        }
+        if not tg_ok:
+            result["status"] = "partial_error"
+    except Exception as e:
+        result["steps"]["telegram_poll"] = {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+        }
+        result["status"] = "partial_error"
+
+    return jsonify(result)
+
+
+@app.get("/twelve-data-status")
+def twelve_data_status_endpoint():
+    result: Dict[str, Any] = {
+        "status": "ok",
+        "version": APP_VERSION,
+        "key_present": bool(TWELVE_DATA_API_KEY),
+        "symbol": SYMBOL,
+    }
+
+    if not TWELVE_DATA_API_KEY:
+        result["status"] = "error"
+        result["error"] = "Missing TWELVE_DATA_API_KEY"
+        return jsonify(result), 503
+
+    try:
+        df = fetch_ohlc("1h", 20)
+        result.update({
+            "fetch_ok": True,
+            "rows": len(df),
+            "last_datetime": str(df.iloc[-1]["datetime"]) if len(df) else None,
+            "last_close": round(float(df.iloc[-1]["close"]), 2) if len(df) else None,
+        })
+        return jsonify(result)
+    except Exception as e:
+        result["status"] = "error"
+        result["fetch_ok"] = False
+        result["error"] = f"{type(e).__name__}: {e}"
+        return jsonify(result), 503
 
 
 @app.get("/signal")
