@@ -9,14 +9,27 @@ import numpy as np
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.5-smart-position-manager"
+APP_VERSION = "6.5.1-scheduler-fix"
+
+def env_bool(name: str, default: bool = False) -> bool:
+    """
+    Robust parser for environment booleans.
+    Accepts: true/1/yes/on/y/t (case-insensitive, surrounding spaces ignored).
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().strip('"').strip("'").lower() in {
+        "1", "true", "yes", "on", "y", "t"
+    }
+
 SYMBOL = os.getenv("SYMBOL", "XAU/USD")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-ENABLE_TELEGRAM = os.getenv("ENABLE_TELEGRAM", "true").lower() == "true"
-SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").lower() == "true"
-CLOSED_CANDLES_ONLY = os.getenv("CLOSED_CANDLES_ONLY", "true").lower() == "true"
+ENABLE_TELEGRAM = env_bool("ENABLE_TELEGRAM", True)
+SCHEDULER_ENABLED = env_bool("SCHEDULER_ENABLED", True)
+CLOSED_CANDLES_ONLY = env_bool("CLOSED_CANDLES_ONLY", True)
 RUN_INTERVAL_MINUTES = int(os.getenv("RUN_INTERVAL_MINUTES", "15"))
 MIN_SCORE_TO_ALERT = int(os.getenv("MIN_SCORE_TO_ALERT", "75"))
 MAX_SPREAD_POINTS = float(os.getenv("MAX_SPREAD_POINTS", "2.0"))
@@ -37,7 +50,7 @@ SL_WARNING_DISTANCE_ATR = float(os.getenv("SL_WARNING_DISTANCE_ATR", "0.35"))
 TP_WARNING_DISTANCE_ATR = float(os.getenv("TP_WARNING_DISTANCE_ATR", "0.35"))
 
 # Big candle / volatility alerts
-MOVE_ALERT_ENABLED = os.getenv("MOVE_ALERT_ENABLED", "true").lower() == "true"
+MOVE_ALERT_ENABLED = env_bool("MOVE_ALERT_ENABLED", True)
 MOVE_ALERT_INTERVALS = [x.strip() for x in os.getenv("MOVE_ALERT_INTERVALS", "5min,15min,1h").split(",") if x.strip()]
 MOVE_BODY_ATR_MIN = float(os.getenv("MOVE_BODY_ATR_MIN", "0.85"))
 MOVE_RANGE_ATR_MIN = float(os.getenv("MOVE_RANGE_ATR_MIN", "1.00"))
@@ -46,6 +59,7 @@ MOVE_BODY_RATIO_MIN = float(os.getenv("MOVE_BODY_RATIO_MIN", "0.55"))
 app = Flask(__name__)
 LAST_SIGNAL: Dict[str, Any] = {"status": "starting", "version": APP_VERSION}
 LAST_ALERT_KEY: Optional[str] = None
+scheduler = None
 LAST_MOVE_ALERT_KEYS: set = set()
 
 
@@ -689,10 +703,23 @@ def root():
 
 @app.get("/health")
 def health():
+    scheduler_running = bool(scheduler is not None and getattr(scheduler, "running", False))
+    scheduler_jobs = []
+    if scheduler_running:
+        try:
+            scheduler_jobs = [job.id for job in scheduler.get_jobs()]
+        except Exception:
+            scheduler_jobs = []
+
     return jsonify({
         "status": "ok",
         "version": APP_VERSION,
         "scheduler_enabled": SCHEDULER_ENABLED,
+        "scheduler_running": scheduler_running,
+        "scheduler_jobs": scheduler_jobs,
+        "scheduler_env_raw": os.getenv("SCHEDULER_ENABLED"),
+        "run_interval_minutes": RUN_INTERVAL_MINUTES,
+        "position_check_interval_minutes": POSITION_CHECK_INTERVAL_MINUTES,
         "closed_candles": CLOSED_CANDLES_ONLY,
         "telegram_polling": ENABLE_TELEGRAM and bool(TELEGRAM_BOT_TOKEN),
         "positions_count": len(load_positions()),
