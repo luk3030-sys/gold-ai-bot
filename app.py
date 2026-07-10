@@ -11,7 +11,7 @@ import numpy as np
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.5.4.2-closed-candle-cache-fix"
+APP_VERSION = "6.5.5-fast-check-low-quota"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -77,6 +77,17 @@ QUOTA_GUARD_ENABLED = env_bool("QUOTA_GUARD_ENABLED", True)
 QUOTA_BACKOFF_SECONDS = int(os.getenv("QUOTA_BACKOFF_SECONDS", "60"))
 QUOTA_BACKOFF_MAX_SECONDS = int(os.getenv("QUOTA_BACKOFF_MAX_SECONDS", "3600"))
 QUOTA_STALE_MAX_AGE_SECONDS = int(os.getenv("QUOTA_STALE_MAX_AGE_SECONDS", "172800"))
+
+
+# Fast Check / Low Quota Mode
+FAST_CHECK_ENABLED = env_bool("FAST_CHECK_ENABLED", True)
+FAST_CHECK_INTERVAL_MINUTES = int(os.getenv("FAST_CHECK_INTERVAL_MINUTES", "1"))
+MOVE_ALERT_CHECK_INTERVAL_MINUTES = int(os.getenv("MOVE_ALERT_CHECK_INTERVAL_MINUTES", "1"))
+
+# Cache housekeeping
+CACHE_MAX_ROWS_PER_INTERVAL = int(os.getenv("CACHE_MAX_ROWS_PER_INTERVAL", "400"))
+CACHE_CLEANUP_INTERVAL_MINUTES = int(os.getenv("CACHE_CLEANUP_INTERVAL_MINUTES", "60"))
+CACHE_MAX_FILE_AGE_SECONDS = int(os.getenv("CACHE_MAX_FILE_AGE_SECONDS", "604800"))  # 7 days
 
 app = Flask(__name__)
 LAST_SIGNAL: Dict[str, Any] = {"status": "starting", "version": APP_VERSION}
@@ -290,23 +301,68 @@ def _cache_get(interval: str, outputsize: int, allow_stale: bool = False) -> Tup
 def _cache_put(interval: str, df: pd.DataFrame, outputsize: int, source: str = "api") -> None:
     if not CACHE_ENABLED or df is None or df.empty:
         return
+
+    capped_df = df.tail(max(20, CACHE_MAX_ROWS_PER_INTERVAL)).copy()
+
     with CACHE_LOCK:
         current = OHLC_CACHE.get(interval)
-        # Keep the larger dataset when possible.
-        if current and len(current.get("df", [])) > len(df):
-            merged = current["df"].copy()
-            # Refresh timestamp only when data actually came from API.
+
+        # Gdy aktualny cache ma więcej danych niż nowa odpowiedź API,
+        # zachowujemy większy zestaw, ale odświeżamy timestamp.
+        if current and len(current.get("df", [])) > len(capped_df):
             if source == "api":
                 current["fetched_ts"] = _utc_ts()
                 current["source"] = source
+            # Ogranicz maksymalny rozmiar również dla istniejącego cache.
+            current_df = current.get("df")
+            if current_df is not None and not current_df.empty:
+                current["df"] = current_df.tail(max(20, CACHE_MAX_ROWS_PER_INTERVAL)).copy()
+            save_ohlc_cache()
             return
+
         OHLC_CACHE[interval] = {
-            "df": df.copy(),
+            "df": capped_df,
             "fetched_ts": _utc_ts(),
-            "outputsize": max(int(outputsize), len(df)),
+            "outputsize": max(int(outputsize), len(capped_df)),
             "source": source,
         }
+
     save_ohlc_cache()
+
+
+def cleanup_cache_job() -> None:
+    """
+    Ogranicza rozmiar pamięci cache i usuwa bardzo stare wpisy.
+    Nie wykonuje żadnych zapytań do API.
+    """
+    if not CACHE_ENABLED:
+        return
+
+    now_ts = _utc_ts()
+    changed = False
+
+    with CACHE_LOCK:
+        to_delete = []
+
+        for interval, item in list(OHLC_CACHE.items()):
+            df = item.get("df")
+            fetched_ts = float(item.get("fetched_ts", 0) or 0)
+            age = max(0.0, now_ts - fetched_ts)
+
+            if age > CACHE_MAX_FILE_AGE_SECONDS:
+                to_delete.append(interval)
+                continue
+
+            if df is not None and not df.empty and len(df) > CACHE_MAX_ROWS_PER_INTERVAL:
+                item["df"] = df.tail(CACHE_MAX_ROWS_PER_INTERVAL).copy()
+                changed = True
+
+        for interval in to_delete:
+            OHLC_CACHE.pop(interval, None)
+            changed = True
+
+    if changed:
+        save_ohlc_cache()
 
 
 def quota_guard_active() -> bool:
@@ -354,6 +410,17 @@ def api_runtime_snapshot() -> Dict[str, Any]:
     result["cache_enabled"] = CACHE_ENABLED
     result["cache_allow_stale"] = CACHE_ALLOW_STALE
     return result
+
+
+def fast_check_status_snapshot() -> Dict[str, Any]:
+    return {
+        "enabled": FAST_CHECK_ENABLED,
+        "fast_check_interval_minutes": FAST_CHECK_INTERVAL_MINUTES,
+        "move_alert_check_interval_minutes": MOVE_ALERT_CHECK_INTERVAL_MINUTES,
+        "cache_ttl_seconds": dict(CACHE_TTL_SECONDS),
+        "cache_max_rows_per_interval": CACHE_MAX_ROWS_PER_INTERVAL,
+        "cache_cleanup_interval_minutes": CACHE_CLEANUP_INTERVAL_MINUTES,
+    }
 
 
 def cache_status_snapshot() -> Dict[str, Any]:
@@ -1160,6 +1227,11 @@ def health():
         "quota_guard_remaining_seconds": quota_guard_remaining_seconds(),
         "api_requests_total": API_RUNTIME.get("requests_total"),
         "api_http_429_count": API_RUNTIME.get("http_429_count"),
+        "fast_check_enabled": FAST_CHECK_ENABLED,
+        "fast_check_interval_minutes": FAST_CHECK_INTERVAL_MINUTES,
+        "move_alert_check_interval_minutes": MOVE_ALERT_CHECK_INTERVAL_MINUTES,
+        "cache_cleanup_interval_minutes": CACHE_CLEANUP_INTERVAL_MINUTES,
+        "cache_max_rows_per_interval": CACHE_MAX_ROWS_PER_INTERVAL,
     })
 
 
@@ -1204,11 +1276,24 @@ def cache_status_endpoint():
         "status": "ok",
         "version": APP_VERSION,
         "cache": cache_status_snapshot(),
+        "fast_check": fast_check_status_snapshot(),
         "runtime": {
             "fresh_hits": API_RUNTIME.get("cache_hits_fresh"),
             "stale_hits": API_RUNTIME.get("cache_hits_stale"),
             "misses": API_RUNTIME.get("cache_misses"),
         },
+    })
+
+
+@app.get("/fast-check-status")
+def fast_check_status_endpoint():
+    return jsonify({
+        "status": "ok",
+        "version": APP_VERSION,
+        "fast_check": fast_check_status_snapshot(),
+        "cache": cache_status_snapshot(),
+        "api_runtime": api_runtime_snapshot(),
+        "positions_count": len(load_positions()),
     })
 
 
@@ -1378,15 +1463,58 @@ def move_alert_test():
 
 # Restore persistent cache before scheduler starts.
 load_ohlc_cache()
+cleanup_cache_job()
 
 
 if SCHEDULER_ENABLED:
     scheduler = BackgroundScheduler(daemon=True)
-    scheduler.add_job(job, "interval", minutes=RUN_INTERVAL_MINUTES, id="gold_ai_bot_v6_5_signal", replace_existing=True)
-    scheduler.add_job(position_monitor_job, "interval", minutes=POSITION_CHECK_INTERVAL_MINUTES, id="position_monitor", replace_existing=True)
-    scheduler.add_job(check_move_alerts, "interval", minutes=POSITION_CHECK_INTERVAL_MINUTES, id="move_alerts", replace_existing=True)
-    # Polling allows Telegram commands without setting a webhook. Highest practical frequency is 1 minute.
-    scheduler.add_job(telegram_poll_job, "interval", minutes=max(1, TELEGRAM_POLL_INTERVAL_MINUTES), id="telegram_poll", replace_existing=True)
+
+    # Pełna analiza sygnału. Domyślnie nadal co RUN_INTERVAL_MINUTES,
+    # bo MTF cache ogranicza realne requesty API.
+    scheduler.add_job(
+        job,
+        "interval",
+        minutes=max(1, RUN_INTERVAL_MINUTES),
+        id="gold_ai_bot_v6_5_signal",
+        replace_existing=True,
+    )
+
+    # Monitor pozycji może działać co 1 minutę; przy 0 pozycjach robi 0 requestów.
+    scheduler.add_job(
+        position_monitor_job,
+        "interval",
+        minutes=max(1, FAST_CHECK_INTERVAL_MINUTES if FAST_CHECK_ENABLED else POSITION_CHECK_INTERVAL_MINUTES),
+        id="position_monitor",
+        replace_existing=True,
+    )
+
+    # Move Alert Engine co 1 minutę; dane pochodzą z cache, więc API nie jest odpytywane co minutę.
+    scheduler.add_job(
+        check_move_alerts,
+        "interval",
+        minutes=max(1, MOVE_ALERT_CHECK_INTERVAL_MINUTES),
+        id="move_alerts",
+        replace_existing=True,
+    )
+
+    # Telegram polling co najmniej raz na minutę.
+    scheduler.add_job(
+        telegram_poll_job,
+        "interval",
+        minutes=max(1, TELEGRAM_POLL_INTERVAL_MINUTES),
+        id="telegram_poll",
+        replace_existing=True,
+    )
+
+    # Czyszczenie cache bez zapytań do API.
+    scheduler.add_job(
+        cleanup_cache_job,
+        "interval",
+        minutes=max(5, CACHE_CLEANUP_INTERVAL_MINUTES),
+        id="cache_cleanup",
+        replace_existing=True,
+    )
+
     scheduler.start()
     try:
         ensure_telegram_polling_mode()
