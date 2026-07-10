@@ -1,5 +1,7 @@
 import os
 import json
+import time
+import threading
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -9,7 +11,7 @@ import numpy as np
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.5.3-runtime-tick-fix"
+APP_VERSION = "6.5.4-quota-guard-smart-mtf-cache"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -43,7 +45,6 @@ TELEGRAM_POLLING_ENABLED = env_bool("TELEGRAM_POLLING_ENABLED", True)
 DEFAULT_POSITION_VOLUME = float(os.getenv("DEFAULT_POSITION_VOLUME", "0.003"))
 AUTO_RISK_ATR_MULTIPLIER = float(os.getenv("AUTO_RISK_ATR_MULTIPLIER", "1.4"))
 AUTO_RISK_MIN_POINTS = float(os.getenv("AUTO_RISK_MIN_POINTS", "18"))
-DEFAULT_ATR_H1 = float(os.getenv("DEFAULT_ATR_H1", "12.0"))
 TP1_RR = float(os.getenv("TP1_RR", "1.5"))
 TP2_RR = float(os.getenv("TP2_RR", "2.5"))
 TP3_RR = float(os.getenv("TP3_RR", "3.5"))
@@ -57,6 +58,25 @@ MOVE_ALERT_INTERVALS = [x.strip() for x in os.getenv("MOVE_ALERT_INTERVALS", "5m
 MOVE_BODY_ATR_MIN = float(os.getenv("MOVE_BODY_ATR_MIN", "0.85"))
 MOVE_RANGE_ATR_MIN = float(os.getenv("MOVE_RANGE_ATR_MIN", "1.00"))
 MOVE_BODY_RATIO_MIN = float(os.getenv("MOVE_BODY_RATIO_MIN", "0.55"))
+
+
+# Smart Multi-Timeframe Cache / Quota Guard
+CACHE_ENABLED = env_bool("CACHE_ENABLED", True)
+CACHE_ALLOW_STALE = env_bool("CACHE_ALLOW_STALE", True)
+CACHE_FILE = os.getenv("CACHE_FILE", "ohlc_cache.json")
+
+CACHE_TTL_SECONDS = {
+    "5min": int(os.getenv("CACHE_TTL_5MIN_SECONDS", "300")),
+    "15min": int(os.getenv("CACHE_TTL_15MIN_SECONDS", "900")),
+    "1h": int(os.getenv("CACHE_TTL_1H_SECONDS", "3600")),
+    "4h": int(os.getenv("CACHE_TTL_4H_SECONDS", "14400")),
+    "1day": int(os.getenv("CACHE_TTL_1DAY_SECONDS", "86400")),
+}
+
+QUOTA_GUARD_ENABLED = env_bool("QUOTA_GUARD_ENABLED", True)
+QUOTA_BACKOFF_SECONDS = int(os.getenv("QUOTA_BACKOFF_SECONDS", "60"))
+QUOTA_BACKOFF_MAX_SECONDS = int(os.getenv("QUOTA_BACKOFF_MAX_SECONDS", "3600"))
+QUOTA_STALE_MAX_AGE_SECONDS = int(os.getenv("QUOTA_STALE_MAX_AGE_SECONDS", "172800"))
 
 app = Flask(__name__)
 LAST_SIGNAL: Dict[str, Any] = {"status": "starting", "version": APP_VERSION}
@@ -74,6 +94,29 @@ TELEGRAM_STATUS: Dict[str, Any] = {
     "bot_username": None,
 }
 LAST_MOVE_ALERT_KEYS: set = set()
+
+
+CACHE_LOCK = threading.RLock()
+OHLC_CACHE: Dict[str, Dict[str, Any]] = {}
+
+API_RUNTIME: Dict[str, Any] = {
+    "requests_total": 0,
+    "requests_success": 0,
+    "cache_hits_fresh": 0,
+    "cache_hits_stale": 0,
+    "cache_misses": 0,
+    "http_429_count": 0,
+    "consecutive_429": 0,
+    "blocked_until_ts": 0.0,
+    "last_request_utc": None,
+    "last_success_utc": None,
+    "last_error": None,
+    "last_http_status": None,
+    "last_interval": None,
+    "last_retry_after_seconds": None,
+    "api_credits_used": None,
+    "api_credits_left": None,
+}
 
 
 def now_utc() -> str:
@@ -120,9 +163,223 @@ def next_position_id(positions: List[Dict[str, Any]]) -> int:
     return max(ids, default=0) + 1
 
 
-def fetch_ohlc(interval: str, outputsize: int = 300) -> pd.DataFrame:
+
+def _utc_ts() -> float:
+    return time.time()
+
+
+def _iso_from_ts(ts: float) -> Optional[str]:
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _cache_ttl(interval: str) -> int:
+    return int(CACHE_TTL_SECONDS.get(interval, 900))
+
+
+def _serialize_df(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    records = df.copy()
+    if "datetime" in records.columns:
+        records["datetime"] = records["datetime"].astype(str)
+    return records.to_dict(orient="records")
+
+
+def _deserialize_df(records: List[Dict[str, Any]]) -> pd.DataFrame:
+    df = pd.DataFrame(records or [])
+    if df.empty:
+        return df
+    if "datetime" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    for col in ["open", "high", "low", "close"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna(subset=["open", "high", "low", "close"]).sort_values("datetime").reset_index(drop=True)
+
+
+def load_ohlc_cache() -> None:
+    if not CACHE_ENABLED:
+        return
+    raw = load_json(CACHE_FILE, {"items": {}})
+    items = raw.get("items", {}) if isinstance(raw, dict) else {}
+    with CACHE_LOCK:
+        for interval, payload in items.items():
+            try:
+                df = _deserialize_df(payload.get("records", []))
+                if df.empty:
+                    continue
+                OHLC_CACHE[interval] = {
+                    "df": df,
+                    "fetched_ts": float(payload.get("fetched_ts", 0) or 0),
+                    "outputsize": int(payload.get("outputsize", len(df)) or len(df)),
+                    "source": payload.get("source", "disk"),
+                }
+            except Exception:
+                continue
+
+
+def save_ohlc_cache() -> None:
+    if not CACHE_ENABLED:
+        return
+    with CACHE_LOCK:
+        payload = {"version": APP_VERSION, "updated_utc": now_utc(), "items": {}}
+        for interval, item in OHLC_CACHE.items():
+            df = item.get("df")
+            if df is None or getattr(df, "empty", True):
+                continue
+            payload["items"][interval] = {
+                "fetched_ts": float(item.get("fetched_ts", 0) or 0),
+                "outputsize": int(item.get("outputsize", len(df)) or len(df)),
+                "source": item.get("source", "memory"),
+                "records": _serialize_df(df),
+            }
+    try:
+        save_json(CACHE_FILE, payload)
+    except Exception as e:
+        API_RUNTIME["last_error"] = f"cache_save: {type(e).__name__}: {e}"
+
+
+def _cache_get(interval: str, outputsize: int, allow_stale: bool = False) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
+    if not CACHE_ENABLED:
+        return None, None
+    now_ts = _utc_ts()
+    with CACHE_LOCK:
+        item = OHLC_CACHE.get(interval)
+        if not item:
+            API_RUNTIME["cache_misses"] += 1
+            return None, None
+        df = item.get("df")
+        if df is None or getattr(df, "empty", True):
+            API_RUNTIME["cache_misses"] += 1
+            return None, None
+        age = max(0.0, now_ts - float(item.get("fetched_ts", 0) or 0))
+        fresh = age <= _cache_ttl(interval)
+        enough_rows = len(df) >= min(max(outputsize, 1), 200)
+        if fresh and enough_rows:
+            API_RUNTIME["cache_hits_fresh"] += 1
+            return df.tail(outputsize).copy(), {"age_seconds": age, "fresh": True}
+        if allow_stale and age <= QUOTA_STALE_MAX_AGE_SECONDS and len(df) >= 20:
+            API_RUNTIME["cache_hits_stale"] += 1
+            return df.tail(outputsize).copy(), {"age_seconds": age, "fresh": False}
+        API_RUNTIME["cache_misses"] += 1
+        return None, {"age_seconds": age, "fresh": fresh}
+
+
+def _cache_put(interval: str, df: pd.DataFrame, outputsize: int, source: str = "api") -> None:
+    if not CACHE_ENABLED or df is None or df.empty:
+        return
+    with CACHE_LOCK:
+        current = OHLC_CACHE.get(interval)
+        # Keep the larger dataset when possible.
+        if current and len(current.get("df", [])) > len(df):
+            merged = current["df"].copy()
+            # Refresh timestamp only when data actually came from API.
+            if source == "api":
+                current["fetched_ts"] = _utc_ts()
+                current["source"] = source
+            return
+        OHLC_CACHE[interval] = {
+            "df": df.copy(),
+            "fetched_ts": _utc_ts(),
+            "outputsize": max(int(outputsize), len(df)),
+            "source": source,
+        }
+    save_ohlc_cache()
+
+
+def quota_guard_active() -> bool:
+    if not QUOTA_GUARD_ENABLED:
+        return False
+    return _utc_ts() < float(API_RUNTIME.get("blocked_until_ts", 0) or 0)
+
+
+def quota_guard_remaining_seconds() -> int:
+    return max(0, int(float(API_RUNTIME.get("blocked_until_ts", 0) or 0) - _utc_ts()))
+
+
+def _activate_quota_guard(retry_after_seconds: Optional[int] = None) -> int:
+    API_RUNTIME["http_429_count"] += 1
+    API_RUNTIME["consecutive_429"] += 1
+    consecutive = max(1, int(API_RUNTIME["consecutive_429"]))
+    backoff = retry_after_seconds or min(
+        QUOTA_BACKOFF_MAX_SECONDS,
+        QUOTA_BACKOFF_SECONDS * (2 ** (consecutive - 1)),
+    )
+    backoff = max(1, int(backoff))
+    API_RUNTIME["blocked_until_ts"] = _utc_ts() + backoff
+    API_RUNTIME["last_retry_after_seconds"] = backoff
+    return backoff
+
+
+def _update_api_headers(headers: Dict[str, Any]) -> None:
+    # Capture the most useful provider/rate headers when present.
+    lowered = {str(k).lower(): v for k, v in headers.items()}
+    for key in ("api-credits-used", "x-api-credits-used"):
+        if key in lowered:
+            API_RUNTIME["api_credits_used"] = lowered[key]
+            break
+    for key in ("api-credits-left", "x-api-credits-left", "x-ratelimit-remaining"):
+        if key in lowered:
+            API_RUNTIME["api_credits_left"] = lowered[key]
+            break
+
+
+def api_runtime_snapshot() -> Dict[str, Any]:
+    result = dict(API_RUNTIME)
+    result["quota_guard_active"] = quota_guard_active()
+    result["quota_guard_remaining_seconds"] = quota_guard_remaining_seconds()
+    result["blocked_until_utc"] = _iso_from_ts(float(API_RUNTIME.get("blocked_until_ts", 0) or 0))
+    result["cache_enabled"] = CACHE_ENABLED
+    result["cache_allow_stale"] = CACHE_ALLOW_STALE
+    return result
+
+
+def cache_status_snapshot() -> Dict[str, Any]:
+    now_ts = _utc_ts()
+    out: Dict[str, Any] = {}
+    with CACHE_LOCK:
+        for interval, item in OHLC_CACHE.items():
+            df = item.get("df")
+            fetched_ts = float(item.get("fetched_ts", 0) or 0)
+            age = max(0.0, now_ts - fetched_ts)
+            out[interval] = {
+                "rows": len(df) if df is not None else 0,
+                "age_seconds": round(age, 1),
+                "ttl_seconds": _cache_ttl(interval),
+                "fresh": age <= _cache_ttl(interval),
+                "fetched_utc": _iso_from_ts(fetched_ts),
+                "source": item.get("source"),
+            }
+    return out
+
+
+def fetch_ohlc(interval: str, outputsize: int = 300, force_refresh: bool = False) -> pd.DataFrame:
+    """
+    Smart MTF fetch:
+    - fresh cache first,
+    - quota guard blocks repeated API calls after 429,
+    - stale cache fallback during provider/rate failures,
+    - shared cache between signals, position monitor and move alerts.
+    """
     if not TWELVE_DATA_API_KEY:
+        stale_df, _ = _cache_get(interval, outputsize, allow_stale=True)
+        if stale_df is not None:
+            return stale_df
         raise RuntimeError("Missing TWELVE_DATA_API_KEY")
+
+    if not force_refresh:
+        cached_df, _ = _cache_get(interval, outputsize, allow_stale=False)
+        if cached_df is not None:
+            return cached_df
+
+    if quota_guard_active():
+        stale_df, meta = _cache_get(interval, outputsize, allow_stale=CACHE_ALLOW_STALE)
+        if stale_df is not None:
+            return stale_df
+        raise RuntimeError(
+            f"Quota Guard active for {quota_guard_remaining_seconds()}s; no usable cache for {interval}"
+        )
+
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": SYMBOL,
@@ -132,19 +389,61 @@ def fetch_ohlc(interval: str, outputsize: int = 300) -> pd.DataFrame:
         "format": "JSON",
         "timezone": os.getenv("TIMEZONE", "Europe/Warsaw"),
     }
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if "values" not in data:
-        raise RuntimeError(f"Bad TwelveData response: {data}")
-    df = pd.DataFrame(data["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna().sort_values("datetime").reset_index(drop=True)
-    if CLOSED_CANDLES_ONLY and len(df) > 2:
-        df = df.iloc[:-1].copy()
-    return df
+
+    API_RUNTIME["requests_total"] += 1
+    API_RUNTIME["last_request_utc"] = now_utc()
+    API_RUNTIME["last_interval"] = interval
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        API_RUNTIME["last_http_status"] = r.status_code
+        _update_api_headers(r.headers)
+
+        if r.status_code == 429:
+            retry_after_raw = r.headers.get("Retry-After")
+            retry_after = None
+            try:
+                retry_after = int(float(retry_after_raw)) if retry_after_raw else None
+            except Exception:
+                retry_after = None
+            backoff = _activate_quota_guard(retry_after)
+            API_RUNTIME["last_error"] = f"HTTP 429 Too Many Requests; Quota Guard {backoff}s"
+
+            stale_df, _ = _cache_get(interval, outputsize, allow_stale=CACHE_ALLOW_STALE)
+            if stale_df is not None:
+                return stale_df
+            raise RuntimeError(f"HTTP 429 Too Many Requests; Quota Guard active {backoff}s")
+
+        r.raise_for_status()
+        data = r.json()
+        if "values" not in data:
+            raise RuntimeError(f"Bad TwelveData response: {data}")
+
+        df = pd.DataFrame(data["values"])
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        for col in ["open", "high", "low", "close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna().sort_values("datetime").reset_index(drop=True)
+        if CLOSED_CANDLES_ONLY and len(df) > 2:
+            df = df.iloc[:-1].copy()
+
+        API_RUNTIME["requests_success"] += 1
+        API_RUNTIME["consecutive_429"] = 0
+        API_RUNTIME["blocked_until_ts"] = 0.0
+        API_RUNTIME["last_success_utc"] = now_utc()
+        API_RUNTIME["last_error"] = None
+
+        _cache_put(interval, df, outputsize, source="api")
+        return df.tail(outputsize).copy()
+
+    except Exception as e:
+        if "429" not in str(e):
+            API_RUNTIME["last_error"] = f"{type(e).__name__}: {e}"
+
+        stale_df, _ = _cache_get(interval, outputsize, allow_stale=CACHE_ALLOW_STALE)
+        if stale_df is not None:
+            return stale_df
+        raise
 
 
 def ema(s: pd.Series, period: int) -> pd.Series:
@@ -475,41 +774,10 @@ def format_position(p: Dict[str, Any], price: Optional[float] = None) -> str:
 
 
 def add_position(side: str, entry: float, volume: Optional[float] = None, chat_id: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Dodaje pozycję nawet wtedy, gdy Twelve Data chwilowo nie odpowiada.
-    Priorytet:
-    1) aktualny ATR H1 z Twelve Data,
-    2) ostatni znany ATR z LAST_SIGNAL, jeśli dostępny,
-    3) DEFAULT_ATR_H1 z ENV.
-    """
     side = side.upper()
     if side not in ("BUY", "SELL"):
         raise ValueError("Użyj BUY albo SELL")
-
-    atr_value = None
-    atr_source = "twelve_data_h1"
-
-    try:
-        _, atr_value = current_price_and_atr()
-    except Exception as market_error:
-        atr_source = "fallback"
-        # Spróbuj użyć danych z ostatniego sygnału, jeśli kiedyś zostaną tam dodane.
-        try:
-            candidate = safe_float(
-                (LAST_SIGNAL.get("market") or {}).get("atr_h1")
-                if isinstance(LAST_SIGNAL, dict)
-                else None
-            )
-            if candidate and candidate > 0:
-                atr_value = candidate
-                atr_source = "last_signal"
-        except Exception:
-            atr_value = None
-
-        if atr_value is None or atr_value <= 0:
-            atr_value = DEFAULT_ATR_H1
-            atr_source = "default_env"
-
+    price, atr_value = current_price_and_atr()
     rp = risk_plan_for_position(side, entry, atr_value)
     positions = load_positions()
     p = {
@@ -523,17 +791,11 @@ def add_position(side: str, entry: float, volume: Optional[float] = None, chat_i
         "tp2": rp["tp2"],
         "tp3": rp["tp3"],
         "risk_distance": rp["risk_distance"],
-        "atr_used": round(float(atr_value), 2),
-        "atr_source": atr_source,
         "created_utc": now_utc(),
         "status": "OPEN",
         "alerts_sent": [],
         "chat_id": str(chat_id or TELEGRAM_CHAT_ID or ""),
-        "note": (
-            "SL/TP calculated automatically from H1 ATR. "
-            "If market data was unavailable, fallback ATR was used. "
-            "Update broker manually unless you connect broker API."
-        ),
+        "note": "SL/TP calculated automatically from H1 ATR. Update broker manually unless you connect broker API.",
     }
     positions.append(p)
     save_positions(positions)
@@ -564,8 +826,11 @@ def update_position(position_id: int, **updates: Any) -> Optional[Dict[str, Any]
 
 def position_monitor_job() -> None:
     try:
-        price, atr_value = current_price_and_atr()
         positions = load_positions()
+        # Zero positions = zero market-data requests.
+        if not positions:
+            return
+        price, atr_value = current_price_and_atr()
         changed = False
         for p in positions:
             side = p.get("side")
@@ -735,10 +1000,6 @@ def ensure_telegram_polling_mode() -> None:
 
 
 def telegram_poll_job() -> None:
-    """
-    Pobiera update'y z Telegrama.
-    Ważne: pojedyncza błędna komenda NIE blokuje całej kolejki i offset jest przesuwany dalej.
-    """
     TELEGRAM_STATUS["last_run_utc"] = now_utc()
     TELEGRAM_STATUS["last_updates_count"] = 0
 
@@ -760,8 +1021,6 @@ def telegram_poll_job() -> None:
     if state.get("offset") is not None:
         params["offset"] = int(state["offset"])
 
-    command_errors: List[str] = []
-
     try:
         webhook = telegram_api_get("getWebhookInfo")
         webhook_url = str((webhook.get("result") or {}).get("url") or "")
@@ -774,7 +1033,6 @@ def telegram_poll_job() -> None:
         TELEGRAM_STATUS["last_updates_count"] = len(updates)
 
         max_update_id = None
-
         for update in updates:
             update_id = update.get("update_id")
             if update_id is not None:
@@ -794,19 +1052,12 @@ def telegram_poll_job() -> None:
                 response = handle_command(text_value, chat_id)
                 send_telegram(response, chat_id=chat_id)
             except Exception as command_error:
-                err = f"update_id={update_id}: {type(command_error).__name__}: {command_error}"
-                command_errors.append(err)
                 try:
-                    send_telegram(
-                        f"❌ Błąd obsługi komendy: {type(command_error).__name__}: {command_error}",
-                        chat_id=chat_id,
-                    )
+                    send_telegram(f"❌ Błąd obsługi komendy: {command_error}", chat_id=chat_id)
                 except Exception:
                     pass
-                # NIE przerywamy całej pętli.
-                continue
+                raise
 
-        # Offset zapisujemy także wtedy, gdy pojedyncza komenda była błędna.
         if max_update_id is not None:
             save_json(
                 TELEGRAM_OFFSET_FILE,
@@ -814,13 +1065,12 @@ def telegram_poll_job() -> None:
             )
 
         TELEGRAM_STATUS["last_success_utc"] = now_utc()
-        TELEGRAM_STATUS["last_error"] = (
-            " | ".join(command_errors[-3:]) if command_errors else None
-        )
+        TELEGRAM_STATUS["last_error"] = None
 
     except Exception as e:
         TELEGRAM_STATUS["last_error"] = f"{type(e).__name__}: {e}"
         print(f"TELEGRAM POLL ERROR: {type(e).__name__}: {e}")
+
 
 
 def job() -> None:
@@ -872,8 +1122,13 @@ def health():
         "positions_count": len(load_positions()),
         "move_alert_enabled": MOVE_ALERT_ENABLED,
         "move_alert_intervals": MOVE_ALERT_INTERVALS,
-        "twelve_data_key_present": bool(TWELVE_DATA_API_KEY),
-        "default_atr_h1": DEFAULT_ATR_H1,
+        "cache_enabled": CACHE_ENABLED,
+        "cache_items": len(OHLC_CACHE),
+        "quota_guard_enabled": QUOTA_GUARD_ENABLED,
+        "quota_guard_active": quota_guard_active(),
+        "quota_guard_remaining_seconds": quota_guard_remaining_seconds(),
+        "api_requests_total": API_RUNTIME.get("requests_total"),
+        "api_http_429_count": API_RUNTIME.get("http_429_count"),
     })
 
 
@@ -912,119 +1167,35 @@ def telegram_poll_now_endpoint():
     return jsonify(dict(TELEGRAM_STATUS))
 
 
-@app.route("/tick", methods=["GET", "POST"])
-def tick_endpoint():
-    """
-    Ręczny pełny cykl diagnostyczny.
-    Uruchamia:
-    - analizę sygnału,
-    - monitoring pozycji,
-    - alerty dużego ruchu,
-    - polling Telegrama.
-    """
-    global LAST_SIGNAL
-
-    result: Dict[str, Any] = {
+@app.get("/cache-status")
+def cache_status_endpoint():
+    return jsonify({
         "status": "ok",
         "version": APP_VERSION,
-        "time_utc": now_utc(),
-        "steps": {},
-    }
-
-    # 1. Signal analysis
-    try:
-        job()
-        signal_ok = LAST_SIGNAL.get("status") != "error"
-        result["steps"]["signal"] = {
-            "ok": signal_ok,
-            "signal": LAST_SIGNAL.get("signal"),
-            "score": LAST_SIGNAL.get("score"),
-            "error": LAST_SIGNAL.get("error"),
-        }
-        if not signal_ok:
-            result["status"] = "partial_error"
-    except Exception as e:
-        result["steps"]["signal"] = {
-            "ok": False,
-            "error": f"{type(e).__name__}: {e}",
-        }
-        result["status"] = "partial_error"
-
-    # 2. Position monitor
-    try:
-        position_monitor_job()
-        result["steps"]["position_monitor"] = {
-            "ok": True,
-            "positions_count": len(load_positions()),
-        }
-    except Exception as e:
-        result["steps"]["position_monitor"] = {
-            "ok": False,
-            "error": f"{type(e).__name__}: {e}",
-        }
-        result["status"] = "partial_error"
-
-    # 3. Move alerts
-    try:
-        check_move_alerts()
-        result["steps"]["move_alerts"] = {"ok": True}
-    except Exception as e:
-        result["steps"]["move_alerts"] = {
-            "ok": False,
-            "error": f"{type(e).__name__}: {e}",
-        }
-        result["status"] = "partial_error"
-
-    # 4. Telegram polling
-    try:
-        telegram_poll_job()
-        tg_ok = TELEGRAM_STATUS.get("last_success_utc") is not None
-        result["steps"]["telegram_poll"] = {
-            "ok": tg_ok,
-            "last_success_utc": TELEGRAM_STATUS.get("last_success_utc"),
-            "last_error": TELEGRAM_STATUS.get("last_error"),
-            "updates_count": TELEGRAM_STATUS.get("last_updates_count"),
-        }
-        if not tg_ok:
-            result["status"] = "partial_error"
-    except Exception as e:
-        result["steps"]["telegram_poll"] = {
-            "ok": False,
-            "error": f"{type(e).__name__}: {e}",
-        }
-        result["status"] = "partial_error"
-
-    return jsonify(result)
+        "cache": cache_status_snapshot(),
+        "runtime": {
+            "fresh_hits": API_RUNTIME.get("cache_hits_fresh"),
+            "stale_hits": API_RUNTIME.get("cache_hits_stale"),
+            "misses": API_RUNTIME.get("cache_misses"),
+        },
+    })
 
 
-@app.get("/twelve-data-status")
-def twelve_data_status_endpoint():
-    result: Dict[str, Any] = {
+@app.get("/quota-status")
+def quota_status_endpoint():
+    return jsonify({
         "status": "ok",
         "version": APP_VERSION,
-        "key_present": bool(TWELVE_DATA_API_KEY),
-        "symbol": SYMBOL,
-    }
+        "api_runtime": api_runtime_snapshot(),
+    })
 
-    if not TWELVE_DATA_API_KEY:
-        result["status"] = "error"
-        result["error"] = "Missing TWELVE_DATA_API_KEY"
-        return jsonify(result), 503
 
-    try:
-        df = fetch_ohlc("1h", 20)
-        result.update({
-            "fetch_ok": True,
-            "rows": len(df),
-            "last_datetime": str(df.iloc[-1]["datetime"]) if len(df) else None,
-            "last_close": round(float(df.iloc[-1]["close"]), 2) if len(df) else None,
-        })
-        return jsonify(result)
-    except Exception as e:
-        result["status"] = "error"
-        result["fetch_ok"] = False
-        result["error"] = f"{type(e).__name__}: {e}"
-        return jsonify(result), 503
+@app.post("/quota-reset")
+def quota_reset_endpoint():
+    API_RUNTIME["blocked_until_ts"] = 0.0
+    API_RUNTIME["consecutive_429"] = 0
+    API_RUNTIME["last_error"] = None
+    return jsonify({"status": "ok", "message": "Local Quota Guard reset", "version": APP_VERSION})
 
 
 @app.get("/signal")
@@ -1076,6 +1247,10 @@ def move_alert_test():
         except Exception as e:
             results.append({"interval": interval, "error": str(e)})
     return jsonify({"results": results})
+
+
+# Restore persistent cache before scheduler starts.
+load_ohlc_cache()
 
 
 if SCHEDULER_ENABLED:
