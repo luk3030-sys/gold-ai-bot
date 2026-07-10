@@ -11,7 +11,7 @@ import numpy as np
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.5.4.1-tick-route-fix"
+APP_VERSION = "6.5.4.2-closed-candle-cache-fix"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -254,13 +254,35 @@ def _cache_get(interval: str, outputsize: int, allow_stale: bool = False) -> Tup
             return None, None
         age = max(0.0, now_ts - float(item.get("fetched_ts", 0) or 0))
         fresh = age <= _cache_ttl(interval)
-        enough_rows = len(df) >= min(max(outputsize, 1), 200)
+
+        # Twelve Data zwraca `outputsize` rekordów, ale przy CLOSED_CANDLES_ONLY
+        # usuwamy ostatnią, niedomkniętą świecę. Dlatego cache z 19 rekordami
+        # jest prawidłowy dla zapytania outputsize=20.
+        requested_rows = min(max(int(outputsize), 1), 200)
+        closed_candle_adjustment = 1 if CLOSED_CANDLES_ONLY and requested_rows > 1 else 0
+        min_required_rows = max(1, requested_rows - closed_candle_adjustment)
+        enough_rows = len(df) >= min_required_rows
+
         if fresh and enough_rows:
             API_RUNTIME["cache_hits_fresh"] += 1
-            return df.tail(outputsize).copy(), {"age_seconds": age, "fresh": True}
-        if allow_stale and age <= QUOTA_STALE_MAX_AGE_SECONDS and len(df) >= 20:
+            return df.tail(outputsize).copy(), {
+                "age_seconds": age,
+                "fresh": True,
+                "rows": len(df),
+                "min_required_rows": min_required_rows,
+            }
+
+        # Dla stale fallback stosujemy tę samą logikę closed-candle.
+        # Nie wymagamy sztywno 20 rekordów, bo prawidłowy cache może mieć 19.
+        stale_min_required = max(1, min(min_required_rows, 20))
+        if allow_stale and age <= QUOTA_STALE_MAX_AGE_SECONDS and len(df) >= stale_min_required:
             API_RUNTIME["cache_hits_stale"] += 1
-            return df.tail(outputsize).copy(), {"age_seconds": age, "fresh": False}
+            return df.tail(outputsize).copy(), {
+                "age_seconds": age,
+                "fresh": False,
+                "rows": len(df),
+                "min_required_rows": stale_min_required,
+            }
         API_RUNTIME["cache_misses"] += 1
         return None, {"age_seconds": age, "fresh": fresh}
 
@@ -342,13 +364,22 @@ def cache_status_snapshot() -> Dict[str, Any]:
             df = item.get("df")
             fetched_ts = float(item.get("fetched_ts", 0) or 0)
             age = max(0.0, now_ts - fetched_ts)
+            rows_count = len(df) if df is not None else 0
+            stored_outputsize = int(item.get("outputsize", rows_count) or rows_count or 1)
+            requested_rows = min(max(stored_outputsize, 1), 200)
+            closed_candle_adjustment = 1 if CLOSED_CANDLES_ONLY and requested_rows > 1 else 0
+            min_required_rows = max(1, requested_rows - closed_candle_adjustment)
+
             out[interval] = {
-                "rows": len(df) if df is not None else 0,
+                "rows": rows_count,
                 "age_seconds": round(age, 1),
                 "ttl_seconds": _cache_ttl(interval),
                 "fresh": age <= _cache_ttl(interval),
                 "fetched_utc": _iso_from_ts(fetched_ts),
                 "source": item.get("source"),
+                "stored_outputsize": stored_outputsize,
+                "min_required_rows": min_required_rows,
+                "usable_for_stored_outputsize": rows_count >= min_required_rows,
             }
     return out
 
