@@ -11,7 +11,7 @@ import numpy as np
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.5.4-quota-guard-smart-mtf-cache"
+APP_VERSION = "6.5.4.1-tick-route-fix"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -1196,6 +1196,102 @@ def quota_reset_endpoint():
     API_RUNTIME["consecutive_429"] = 0
     API_RUNTIME["last_error"] = None
     return jsonify({"status": "ok", "message": "Local Quota Guard reset", "version": APP_VERSION})
+
+
+@app.get("/tick")
+def tick_endpoint():
+    """
+    Runtime market-data diagnostic.
+    Default: smart fetch through cache + Quota Guard.
+    Optional query params:
+      ?interval=1h
+      ?outputsize=20
+      ?force=1   -> wymusza próbę odświeżenia z API (używać ostrożnie)
+    """
+    interval = str(request.args.get("interval", "1h")).strip()
+    allowed_intervals = {"5min", "15min", "1h", "4h", "1day"}
+    if interval not in allowed_intervals:
+        return jsonify({
+            "status": "error",
+            "version": APP_VERSION,
+            "message": f"Unsupported interval: {interval}",
+            "allowed_intervals": sorted(allowed_intervals),
+        }), 400
+
+    try:
+        outputsize = int(request.args.get("outputsize", "20"))
+    except Exception:
+        outputsize = 20
+    outputsize = max(5, min(outputsize, 5000))
+
+    force_raw = str(request.args.get("force", "0")).strip().lower()
+    force_refresh = force_raw in {"1", "true", "yes", "on"}
+
+    before = {
+        "requests_success": int(API_RUNTIME.get("requests_success", 0) or 0),
+        "cache_hits_fresh": int(API_RUNTIME.get("cache_hits_fresh", 0) or 0),
+        "cache_hits_stale": int(API_RUNTIME.get("cache_hits_stale", 0) or 0),
+    }
+
+    result = {
+        "status": "ok",
+        "version": APP_VERSION,
+        "symbol": SYMBOL,
+        "interval": interval,
+        "outputsize": outputsize,
+        "force_refresh": force_refresh,
+        "key_present": bool(TWELVE_DATA_API_KEY),
+        "fetch_ok": False,
+        "time_utc": now_utc(),
+    }
+
+    try:
+        df = fetch_ohlc(interval, outputsize=outputsize, force_refresh=force_refresh)
+        if df is None or df.empty:
+            raise RuntimeError("No OHLC rows returned")
+
+        after = {
+            "requests_success": int(API_RUNTIME.get("requests_success", 0) or 0),
+            "cache_hits_fresh": int(API_RUNTIME.get("cache_hits_fresh", 0) or 0),
+            "cache_hits_stale": int(API_RUNTIME.get("cache_hits_stale", 0) or 0),
+        }
+
+        if after["requests_success"] > before["requests_success"]:
+            data_source = "api"
+        elif after["cache_hits_fresh"] > before["cache_hits_fresh"]:
+            data_source = "cache_fresh"
+        elif after["cache_hits_stale"] > before["cache_hits_stale"]:
+            data_source = "cache_stale"
+        else:
+            data_source = "cache_or_api"
+
+        last = df.iloc[-1]
+        result.update({
+            "fetch_ok": True,
+            "data_source": data_source,
+            "rows": int(len(df)),
+            "last_candle": {
+                "datetime": str(last.get("datetime")),
+                "open": safe_float(last.get("open")),
+                "high": safe_float(last.get("high")),
+                "low": safe_float(last.get("low")),
+                "close": safe_float(last.get("close")),
+            },
+            "quota_guard": api_runtime_snapshot(),
+            "cache_interval": cache_status_snapshot().get(interval),
+        })
+        return jsonify(result)
+
+    except Exception as e:
+        result.update({
+            "status": "error",
+            "fetch_ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "quota_guard": api_runtime_snapshot(),
+            "cache_interval": cache_status_snapshot().get(interval),
+        })
+        # Diagnostic endpoint deliberately returns JSON body even on provider failure.
+        return jsonify(result), 200
 
 
 @app.get("/signal")
