@@ -11,7 +11,7 @@ import numpy as np
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.5.6-entry-exit-signal-engine"
+APP_VERSION = "6.5.7-early-watch-entry-execution-guard"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -106,6 +106,20 @@ MOVE_SL_TO_BE_AT_RR = float(os.getenv("MOVE_SL_TO_BE_AT_RR", str(BE_TRIGGER_RR))
 PARTIAL_TP_ALERT = env_bool("PARTIAL_TP_ALERT", True)
 NEAR_SL_EXIT_ATR_MULTIPLIER = float(os.getenv("NEAR_SL_EXIT_ATR_MULTIPLIER", str(SL_WARNING_DISTANCE_ATR)))
 
+# Early Watch / Entry Execution Guard
+EARLY_ENTRY_WATCH_ENABLED = env_bool("EARLY_ENTRY_WATCH_ENABLED", True)
+EARLY_ENTRY_SCORE = int(os.getenv("EARLY_ENTRY_SCORE", "55"))
+EARLY_ENTRY_MIN_DIRECTION_EDGE = int(os.getenv("EARLY_ENTRY_MIN_DIRECTION_EDGE", "10"))
+EARLY_ENTRY_ALERT_COOLDOWN_MINUTES = int(os.getenv("EARLY_ENTRY_ALERT_COOLDOWN_MINUTES", "20"))
+
+ENTRY_EXECUTION_GUARD_ENABLED = env_bool("ENTRY_EXECUTION_GUARD_ENABLED", True)
+MAX_ENTRY_DRIFT_POINTS = float(os.getenv("MAX_ENTRY_DRIFT_POINTS", "6"))
+MAX_ENTRY_DRIFT_R_MULTIPLIER = float(os.getenv("MAX_ENTRY_DRIFT_R_MULTIPLIER", "0.25"))
+MIN_LIVE_RR_TO_TP1 = float(os.getenv("MIN_LIVE_RR_TO_TP1", "1.2"))
+MAX_TP1_PROGRESS_BEFORE_ENTRY = float(os.getenv("MAX_TP1_PROGRESS_BEFORE_ENTRY", "0.5"))
+MISSED_TRADE_ALERT_ENABLED = env_bool("MISSED_TRADE_ALERT_ENABLED", True)
+MISSED_TRADE_COOLDOWN_MINUTES = int(os.getenv("MISSED_TRADE_COOLDOWN_MINUTES", "30"))
+
 app = Flask(__name__)
 LAST_SIGNAL: Dict[str, Any] = {"status": "starting", "version": APP_VERSION}
 LAST_ALERT_KEY: Optional[str] = None
@@ -125,6 +139,10 @@ LAST_MOVE_ALERT_KEYS: set = set()
 
 LAST_ENTRY_ALERT_KEY: Optional[str] = None
 LAST_ENTRY_ALERT_TS: float = 0.0
+LAST_EARLY_ALERT_KEY: Optional[str] = None
+LAST_EARLY_ALERT_TS: float = 0.0
+LAST_MISSED_ALERT_KEY: Optional[str] = None
+LAST_MISSED_ALERT_TS: float = 0.0
 LAST_EXIT_ALERT_KEYS: Dict[str, float] = {}
 LAST_ENTRY_EXIT_STATUS: Dict[str, Any] = {
     "version": APP_VERSION,
@@ -453,6 +471,13 @@ def fast_check_status_snapshot() -> Dict[str, Any]:
         "entry_signal_check_interval_minutes": ENTRY_SIGNAL_CHECK_INTERVAL_MINUTES,
         "min_entry_score": MIN_ENTRY_SCORE,
         "min_rr_to_alert": MIN_RR_TO_ALERT,
+        "early_entry_watch_enabled": EARLY_ENTRY_WATCH_ENABLED,
+        "early_entry_score": EARLY_ENTRY_SCORE,
+        "entry_execution_guard_enabled": ENTRY_EXECUTION_GUARD_ENABLED,
+        "max_entry_drift_points": MAX_ENTRY_DRIFT_POINTS,
+        "max_entry_drift_r_multiplier": MAX_ENTRY_DRIFT_R_MULTIPLIER,
+        "min_live_rr_to_tp1": MIN_LIVE_RR_TO_TP1,
+        "max_tp1_progress_before_entry": MAX_TP1_PROGRESS_BEFORE_ENTRY,
         "last_entry_exit_error": LAST_ENTRY_EXIT_STATUS.get("last_error"),
         "last_entry_exit_success_utc": LAST_ENTRY_EXIT_STATUS.get("last_success_utc"),
         "cache_cleanup_interval_minutes": CACHE_CLEANUP_INTERVAL_MINUTES,
@@ -792,6 +817,7 @@ def build_signal() -> Dict[str, Any]:
         "time_utc": now_utc(),
         "signal": side,
         "score": int(score),
+        "directional_scores": {"BUY": int(score_buy), "SELL": int(score_sell)},
         "price": round(price, 2),
         "trend": trends,
         "institutional": {
@@ -1064,6 +1090,106 @@ def rr_for_plan(side: str, entry: float, sl: float, tp: float) -> Optional[float
         return None
 
 
+def live_execution_guard(side: str, entry: float, sl: float, tp1: float, risk_distance: Optional[float] = None) -> Dict[str, Any]:
+    """
+    Blocks late/escaped entries.
+    A directionally good signal is not executable when price is already far from planned entry.
+    """
+    result: Dict[str, Any] = {
+        "enabled": ENTRY_EXECUTION_GUARD_ENABLED,
+        "ok": True,
+        "status": "ok",
+        "reason": None,
+    }
+
+    try:
+        live_price, atr_value = current_price_and_atr()
+        side = side.upper()
+        risk_from_plan = abs(float(sl) - float(entry))
+        if risk_distance is not None and float(risk_distance) > 0:
+            risk_from_plan = max(risk_from_plan, float(risk_distance))
+
+        if risk_from_plan <= 0:
+            result.update({"ok": False, "status": "invalid_risk", "reason": "risk <= 0"})
+            return result
+
+        if side == "SELL":
+            favorable_move = float(entry) - float(live_price)
+            live_risk = float(sl) - float(live_price)
+            live_reward = float(live_price) - float(tp1)
+            full_path_to_tp1 = float(entry) - float(tp1)
+        else:
+            favorable_move = float(live_price) - float(entry)
+            live_risk = float(live_price) - float(sl)
+            live_reward = float(tp1) - float(live_price)
+            full_path_to_tp1 = float(tp1) - float(entry)
+
+        live_rr_to_tp1 = live_reward / live_risk if live_risk and live_risk > 0 else None
+        progress_to_tp1 = favorable_move / full_path_to_tp1 if full_path_to_tp1 and full_path_to_tp1 > 0 else 0.0
+        max_allowed_drift = min(
+            MAX_ENTRY_DRIFT_POINTS,
+            risk_from_plan * MAX_ENTRY_DRIFT_R_MULTIPLIER,
+        )
+
+        result.update({
+            "live_price": round(float(live_price), 2),
+            "atr_h1": round(float(atr_value), 2),
+            "planned_entry": round(float(entry), 2),
+            "planned_sl": round(float(sl), 2),
+            "planned_tp1": round(float(tp1), 2),
+            "risk_from_plan": round(float(risk_from_plan), 2),
+            "favorable_move_from_entry": round(float(favorable_move), 2),
+            "max_allowed_drift": round(float(max_allowed_drift), 2),
+            "live_rr_to_tp1": round(float(live_rr_to_tp1), 2) if live_rr_to_tp1 is not None else None,
+            "progress_to_tp1": round(float(progress_to_tp1), 2),
+        })
+
+        if not ENTRY_EXECUTION_GUARD_ENABLED:
+            return result
+
+        if favorable_move > max_allowed_drift:
+            result.update({
+                "ok": False,
+                "status": "missed_trade",
+                "reason": (
+                    f"Price moved {round(favorable_move, 2)} pts from entry; "
+                    f"allowed max {round(max_allowed_drift, 2)} pts."
+                ),
+            })
+            return result
+
+        if progress_to_tp1 >= MAX_TP1_PROGRESS_BEFORE_ENTRY:
+            result.update({
+                "ok": False,
+                "status": "missed_trade",
+                "reason": (
+                    f"Price already made {round(progress_to_tp1 * 100, 1)}% of the path to TP1."
+                ),
+            })
+            return result
+
+        if live_rr_to_tp1 is None or live_rr_to_tp1 < MIN_LIVE_RR_TO_TP1:
+            result.update({
+                "ok": False,
+                "status": "bad_live_rr",
+                "reason": (
+                    f"Live RR to TP1 {round(live_rr_to_tp1, 2) if live_rr_to_tp1 is not None else None} "
+                    f"is below {MIN_LIVE_RR_TO_TP1}."
+                ),
+            })
+            return result
+
+        return result
+
+    except Exception as e:
+        result.update({
+            "ok": False,
+            "status": "guard_error",
+            "reason": f"{type(e).__name__}: {e}",
+        })
+        return result
+
+
 def evaluate_entry_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "enabled": ENTRY_SIGNAL_ENABLED,
@@ -1102,16 +1228,17 @@ def evaluate_entry_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     rr_tp1 = rr_for_plan(side, entry, sl, tp1)
 
-    valid = (
+    base_valid = (
         score >= MIN_ENTRY_SCORE
         and rr_tp1 is not None
         and rr_tp1 >= MIN_RR_TO_ALERT
     )
 
     result.update({
-        "valid": valid,
-        "status": "entry_signal" if valid else "filtered",
-        "reason": None if valid else f"score/rr filter not met: score={score}, rr_tp1={round(rr_tp1, 2) if rr_tp1 is not None else None}",
+        "valid": False,
+        "base_valid": base_valid,
+        "status": "entry_signal_candidate" if base_valid else "filtered",
+        "reason": None if base_valid else f"score/rr filter not met: score={score}, rr_tp1={round(rr_tp1, 2) if rr_tp1 is not None else None}",
         "signal": side,
         "score": score,
         "entry": round(entry, 2),
@@ -1124,6 +1251,121 @@ def evaluate_entry_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         "trend": signal.get("trend"),
         "reasons": signal.get("reasons", []),
         "time_utc": now_utc(),
+    })
+
+    if not base_valid:
+        return result
+
+    guard = live_execution_guard(side, entry, sl, tp1, risk_distance)
+    result["execution_guard"] = guard
+
+    if guard.get("ok"):
+        result.update({
+            "valid": True,
+            "status": "entry_signal",
+            "reason": None,
+        })
+    else:
+        result.update({
+            "valid": False,
+            "status": guard.get("status", "execution_blocked"),
+            "reason": guard.get("reason"),
+            "missed_trade": guard.get("status") == "missed_trade",
+        })
+
+    return result
+
+
+def evaluate_early_watch(signal: Dict[str, Any], entry_signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "enabled": EARLY_ENTRY_WATCH_ENABLED,
+        "valid": False,
+        "status": "no_watch",
+        "reason": None,
+        "signal": None,
+    }
+
+    if not EARLY_ENTRY_WATCH_ENABLED:
+        result.update({"status": "disabled", "reason": "EARLY_ENTRY_WATCH_ENABLED=false"})
+        return result
+
+    if not signal or signal.get("status") == "error":
+        result.update({"status": "error", "reason": signal.get("error") if isinstance(signal, dict) else "missing signal"})
+        return result
+
+    # Do not send early-watch when final executable entry already exists.
+    if entry_signal and entry_signal.get("valid"):
+        result.update({"status": "final_entry_exists", "reason": "entry signal already valid"})
+        return result
+
+    scores = signal.get("directional_scores") or {}
+    buy_score = int(scores.get("BUY", 0) or 0)
+    sell_score = int(scores.get("SELL", 0) or 0)
+    trends = signal.get("trend") or {}
+
+    # Small early bonus for M15 direction so the bot can warn before H1 confirmation.
+    if trends.get("M15") == "UP":
+        buy_score += 5
+    if trends.get("M15") == "DOWN":
+        sell_score += 5
+
+    side = None
+    score = 0
+    opposite = 0
+    if sell_score >= EARLY_ENTRY_SCORE and sell_score >= buy_score + EARLY_ENTRY_MIN_DIRECTION_EDGE:
+        side, score, opposite = "SELL", sell_score, buy_score
+    elif buy_score >= EARLY_ENTRY_SCORE and buy_score >= sell_score + EARLY_ENTRY_MIN_DIRECTION_EDGE:
+        side, score, opposite = "BUY", buy_score, sell_score
+    else:
+        result.update({
+            "status": "filtered",
+            "reason": f"early score/edge not met: BUY={buy_score}, SELL={sell_score}",
+            "buy_score": buy_score,
+            "sell_score": sell_score,
+        })
+        return result
+
+    price = safe_float(signal.get("price"))
+    atr_value = None
+    try:
+        _, atr_value = current_price_and_atr()
+    except Exception:
+        atr_value = DEFAULT_ATR_H1
+
+    rp = risk_plan_for_position(side, float(price), atr_value) if price is not None else {}
+
+    # Activation level from H1 structure.
+    activation_level = None
+    try:
+        swings = (((signal.get("institutional") or {}).get("market_structure_h1") or {}).get("swings") or {})
+        if side == "SELL":
+            lows = swings.get("lows") or []
+            activation_level = safe_float(lows[-1].get("price")) if lows else None
+        else:
+            highs = swings.get("highs") or []
+            activation_level = safe_float(highs[-1].get("price")) if highs else None
+    except Exception:
+        activation_level = None
+
+    result.update({
+        "valid": True,
+        "status": "setup_forming",
+        "signal": side,
+        "score": int(score),
+        "opposite_score": int(opposite),
+        "price": round(float(price), 2) if price is not None else None,
+        "activation_level": round(float(activation_level), 2) if activation_level is not None else None,
+        "watch_entry": rp.get("entry"),
+        "watch_sl": rp.get("sl"),
+        "watch_tp1": rp.get("tp1"),
+        "watch_tp2": rp.get("tp2"),
+        "watch_tp3": rp.get("tp3"),
+        "trend": trends,
+        "reasons": signal.get("reasons", []),
+        "time_utc": now_utc(),
+        "instruction": (
+            "Do not enter yet. Wait for activation level / close confirmation / retest."
+        ),
     })
     return result
 
@@ -1149,6 +1391,48 @@ def format_entry_signal_alert(e: Dict[str, Any]) -> str:
     )
 
 
+def format_missed_trade_alert(e: Dict[str, Any]) -> str:
+    side = e.get("signal")
+    guard = e.get("execution_guard") or {}
+    return (
+        f"⚠️ GOLD MISSED TRADE — {side}\n\n"
+        f"Sygnał kierunkowo poprawny, ale cena uciekła za daleko od planowanego wejścia.\n\n"
+        f"Planowane entry: {e.get('entry')}\n"
+        f"Aktualna cena: {guard.get('live_price')}\n"
+        f"SL z planu: {e.get('sl')}\n"
+        f"TP1 z planu: {e.get('tp1')}\n"
+        f"Ruch od entry: {guard.get('favorable_move_from_entry')} pkt\n"
+        f"Maks. dopuszczalny drift: {guard.get('max_allowed_drift')} pkt\n"
+        f"Live RR do TP1: {guard.get('live_rr_to_tp1')}\n"
+        f"Postęp do TP1: {round(float(guard.get('progress_to_tp1', 0)) * 100, 1)}%\n\n"
+        f"Decyzja: nie gonić rynku. Czekać na retest albo nowy setup."
+    )
+
+
+def format_early_watch_alert(w: Dict[str, Any]) -> str:
+    side = w.get("signal")
+    emoji = "🟠"
+    activation = w.get("activation_level")
+    if side == "SELL":
+        condition = f"SELL dopiero po zejściu poniżej {activation} albo po retest/odrzuceniu od dołu." if activation else "SELL dopiero po wybiciu wsparcia i potwierdzeniu."
+    else:
+        condition = f"BUY dopiero po wybiciu powyżej {activation} albo po retest/utrzymaniu od góry." if activation else "BUY dopiero po wybiciu oporu i potwierdzeniu."
+
+    return (
+        f"{emoji} GOLD SETUP FORMING — POSSIBLE {side}\n\n"
+        f"Symbol: {SYMBOL}\n"
+        f"Score wstępny: {w.get('score')}/100\n"
+        f"Cena: {w.get('price')}\n"
+        f"Poziom aktywacji: {activation if activation is not None else '-'}\n\n"
+        f"Plan obserwacyjny:\n"
+        f"Entry robocze: {w.get('watch_entry')}\n"
+        f"SL roboczy: {w.get('watch_sl')}\n"
+        f"TP1 roboczy: {w.get('watch_tp1')}\n\n"
+        f"Warunek aktywacji: {condition}\n\n"
+        f"To jest wcześniejsze ostrzeżenie. Nie jest to jeszcze sygnał wejścia."
+    )
+
+
 def should_send_entry_alert(entry_signal: Dict[str, Any]) -> bool:
     global LAST_ENTRY_ALERT_KEY, LAST_ENTRY_ALERT_TS
     if not entry_signal.get("valid"):
@@ -1169,6 +1453,46 @@ def should_send_entry_alert(entry_signal: Dict[str, Any]) -> bool:
     LAST_ENTRY_ALERT_KEY = key
     LAST_ENTRY_ALERT_TS = now_ts
     return True
+
+def should_send_early_watch_alert(watch: Dict[str, Any]) -> bool:
+    global LAST_EARLY_ALERT_KEY, LAST_EARLY_ALERT_TS
+    if not watch.get("valid"):
+        return False
+    key = (
+        f"{watch.get('signal')}:"
+        f"{watch.get('activation_level')}:"
+        f"{watch.get('score')}:"
+        f"{watch.get('status')}"
+    )
+    now_ts = _utc_ts()
+    cooldown = max(60, EARLY_ENTRY_ALERT_COOLDOWN_MINUTES * 60)
+    if key == LAST_EARLY_ALERT_KEY and (now_ts - LAST_EARLY_ALERT_TS) < cooldown:
+        return False
+    LAST_EARLY_ALERT_KEY = key
+    LAST_EARLY_ALERT_TS = now_ts
+    return True
+
+
+def should_send_missed_trade_alert(entry_signal: Dict[str, Any]) -> bool:
+    global LAST_MISSED_ALERT_KEY, LAST_MISSED_ALERT_TS
+    if not MISSED_TRADE_ALERT_ENABLED:
+        return False
+    if not entry_signal.get("missed_trade"):
+        return False
+    key = (
+        f"{entry_signal.get('signal')}:"
+        f"{entry_signal.get('entry')}:"
+        f"{entry_signal.get('tp1')}:"
+        f"{entry_signal.get('status')}"
+    )
+    now_ts = _utc_ts()
+    cooldown = max(60, MISSED_TRADE_COOLDOWN_MINUTES * 60)
+    if key == LAST_MISSED_ALERT_KEY and (now_ts - LAST_MISSED_ALERT_TS) < cooldown:
+        return False
+    LAST_MISSED_ALERT_KEY = key
+    LAST_MISSED_ALERT_TS = now_ts
+    return True
+
 
 
 def latest_h1_invalidation(signal: Optional[Dict[str, Any]], side: str) -> Optional[float]:
@@ -1350,6 +1674,18 @@ def entry_exit_signal_job() -> None:
         LAST_SIGNAL = current_signal
 
         entry_signal = evaluate_entry_signal(current_signal)
+        early_watch = evaluate_early_watch(current_signal, entry_signal)
+
+        early_sent = False
+        if early_watch.get("valid") and should_send_early_watch_alert(early_watch):
+            send_telegram(format_early_watch_alert(early_watch))
+            early_sent = True
+
+        missed_sent = False
+        if entry_signal.get("missed_trade") and should_send_missed_trade_alert(entry_signal):
+            send_telegram(format_missed_trade_alert(entry_signal))
+            missed_sent = True
+
         entry_sent = False
         if entry_signal.get("valid") and should_send_entry_alert(entry_signal):
             send_telegram(format_entry_signal_alert(entry_signal))
@@ -1365,8 +1701,11 @@ def entry_exit_signal_job() -> None:
         LAST_ENTRY_EXIT_STATUS.update({
             "last_success_utc": now_utc(),
             "last_error": None,
+            "last_early_watch": early_watch,
+            "last_early_sent": early_sent,
             "last_entry_signal": entry_signal,
             "last_entry_sent": entry_sent,
+            "last_missed_sent": missed_sent,
             "last_exit_events_count": len(exit_events),
             "last_exit_sent_count": exit_sent_count,
         })
@@ -1389,9 +1728,10 @@ def command_help() -> str:
         "/setsl 1 4202 — zmień SL pozycji #1\n"
         "/settp 1 3969 3892 3814 — zmień TP1/TP2/TP3 pozycji #1\n"
         "/signal — wygeneruj aktualny sygnał\n"
-        "/entry — pokaż aktualny sygnał wejścia BUY/SELL\n"
+        "/early — pokaż wcześniejsze ostrzeżenie SETUP FORMING\n"
+        "/entry — pokaż aktualny sygnał wejścia BUY/SELL albo MISSED TRADE\n"
         "/exit — pokaż sygnały wyjścia/prowadzenia pozycji\n"
-        "/signal-now — pełna diagnostyka entry + exit\n"
+        "/signal-now — pełna diagnostyka early + entry + exit\n"
         "/price — aktualna cena M5 i ATR H1\n"
         "Uwaga: bot nie składa zleceń u brokera. SL/TP trzeba wpisać ręcznie w aplikacji brokera, chyba że podłączysz API brokera."
     )
@@ -1468,11 +1808,21 @@ def handle_command(text: str, chat_id: str) -> str:
         s = build_signal()
         return format_signal(s)
 
+    if cmd == "/early":
+        s = build_signal()
+        e = evaluate_entry_signal(s)
+        w = evaluate_early_watch(s, e)
+        if w.get("valid"):
+            return format_early_watch_alert(w)
+        return "Brak aktywnego early watch. Status: " + str(w.get("status")) + "\nPowód: " + str(w.get("reason"))
+
     if cmd == "/entry":
         s = build_signal()
         e = evaluate_entry_signal(s)
         if e.get("valid"):
             return format_entry_signal_alert(e)
+        if e.get("missed_trade"):
+            return format_missed_trade_alert(e)
         return "Brak aktualnego sygnału wejścia. Status: " + str(e.get("status")) + "\nPowód: " + str(e.get("reason"))
 
     if cmd == "/exit":
@@ -1485,11 +1835,20 @@ def handle_command(text: str, chat_id: str) -> str:
     if cmd == "/signal-now":
         s = build_signal()
         e = evaluate_entry_signal(s)
+        w = evaluate_early_watch(s, e)
         events = evaluate_exit_signals(s)
+
+        entry_text = format_entry_signal_alert(e) if e.get("valid") else (
+            format_missed_trade_alert(e) if e.get("missed_trade") else f"Brak entry. Status: {e.get('status')} | Powód: {e.get('reason')}"
+        )
+        early_text = format_early_watch_alert(w) if w.get("valid") else f"Brak early watch. Status: {w.get('status')} | Powód: {w.get('reason')}"
+
         return (
             format_signal(s)
+            + "\n\n--- EARLY WATCH ---\n"
+            + early_text
             + "\n\n--- ENTRY ENGINE ---\n"
-            + (format_entry_signal_alert(e) if e.get("valid") else f"Brak entry. Status: {e.get('status')} | Powód: {e.get('reason')}")
+            + entry_text
             + "\n\n--- EXIT ENGINE ---\n"
             + ("Brak aktywnych sygnałów exit." if not events else "\n\n".join(format_exit_event_alert(x) for x in events[:5]))
         )
@@ -1850,14 +2209,45 @@ def tick_endpoint():
         return jsonify(result), 200
 
 
+@app.get("/early-status")
+def early_status_endpoint():
+    try:
+        s = build_signal()
+        e = evaluate_entry_signal(s)
+        w = evaluate_early_watch(s, e)
+        return jsonify({
+            "status": "ok",
+            "version": APP_VERSION,
+            "early_watch": w,
+            "entry_status": e.get("status"),
+            "signal": {
+                "signal": s.get("signal"),
+                "score": s.get("score"),
+                "directional_scores": s.get("directional_scores"),
+                "price": s.get("price"),
+                "trend": s.get("trend"),
+            },
+            "api_runtime": api_runtime_snapshot(),
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "version": APP_VERSION,
+            "error": f"{type(e).__name__}: {e}",
+            "api_runtime": api_runtime_snapshot(),
+        }), 200
+
+
 @app.get("/entry-status")
 def entry_status_endpoint():
     try:
         s = build_signal()
         e = evaluate_entry_signal(s)
+        w = evaluate_early_watch(s, e)
         return jsonify({
             "status": "ok",
             "version": APP_VERSION,
+            "early_watch": w,
             "entry": e,
             "signal": {
                 "signal": s.get("signal"),
@@ -1909,11 +2299,13 @@ def signal_now_endpoint():
     try:
         s = build_signal()
         e = evaluate_entry_signal(s)
+        w = evaluate_early_watch(s, e)
         events = evaluate_exit_signals(s)
         return jsonify({
             "status": "ok",
             "version": APP_VERSION,
             "signal": s,
+            "early_watch": w,
             "entry": e,
             "exit_events": events,
             "api_runtime": api_runtime_snapshot(),
