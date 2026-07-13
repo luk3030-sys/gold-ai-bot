@@ -11,7 +11,7 @@ import numpy as np
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.5.5-fast-check-low-quota"
+APP_VERSION = "6.5.6-entry-exit-signal-engine"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -45,6 +45,7 @@ TELEGRAM_POLLING_ENABLED = env_bool("TELEGRAM_POLLING_ENABLED", True)
 DEFAULT_POSITION_VOLUME = float(os.getenv("DEFAULT_POSITION_VOLUME", "0.003"))
 AUTO_RISK_ATR_MULTIPLIER = float(os.getenv("AUTO_RISK_ATR_MULTIPLIER", "1.4"))
 AUTO_RISK_MIN_POINTS = float(os.getenv("AUTO_RISK_MIN_POINTS", "18"))
+DEFAULT_ATR_H1 = float(os.getenv("DEFAULT_ATR_H1", "12.0"))
 TP1_RR = float(os.getenv("TP1_RR", "1.5"))
 TP2_RR = float(os.getenv("TP2_RR", "2.5"))
 TP3_RR = float(os.getenv("TP3_RR", "3.5"))
@@ -89,6 +90,22 @@ CACHE_MAX_ROWS_PER_INTERVAL = int(os.getenv("CACHE_MAX_ROWS_PER_INTERVAL", "400"
 CACHE_CLEANUP_INTERVAL_MINUTES = int(os.getenv("CACHE_CLEANUP_INTERVAL_MINUTES", "60"))
 CACHE_MAX_FILE_AGE_SECONDS = int(os.getenv("CACHE_MAX_FILE_AGE_SECONDS", "604800"))  # 7 days
 
+
+# Entry / Exit Signal Engine
+ENTRY_SIGNAL_ENABLED = env_bool("ENTRY_SIGNAL_ENABLED", True)
+EXIT_SIGNAL_ENABLED = env_bool("EXIT_SIGNAL_ENABLED", True)
+ENTRY_SIGNAL_CHECK_INTERVAL_MINUTES = int(os.getenv("ENTRY_SIGNAL_CHECK_INTERVAL_MINUTES", "1"))
+MIN_ENTRY_SCORE = int(os.getenv("MIN_ENTRY_SCORE", str(MIN_SCORE_TO_ALERT)))
+MIN_RR_TO_ALERT = float(os.getenv("MIN_RR_TO_ALERT", "1.5"))
+ENTRY_SIGNAL_COOLDOWN_MINUTES = int(os.getenv("ENTRY_SIGNAL_COOLDOWN_MINUTES", "45"))
+EXIT_SIGNAL_COOLDOWN_MINUTES = int(os.getenv("EXIT_SIGNAL_COOLDOWN_MINUTES", "15"))
+EXIT_ON_OPPOSITE_SIGNAL = env_bool("EXIT_ON_OPPOSITE_SIGNAL", True)
+EXIT_ON_H1_INVALIDATION = env_bool("EXIT_ON_H1_INVALIDATION", True)
+OPPOSITE_SIGNAL_MIN_SCORE = int(os.getenv("OPPOSITE_SIGNAL_MIN_SCORE", str(MIN_ENTRY_SCORE)))
+MOVE_SL_TO_BE_AT_RR = float(os.getenv("MOVE_SL_TO_BE_AT_RR", str(BE_TRIGGER_RR)))
+PARTIAL_TP_ALERT = env_bool("PARTIAL_TP_ALERT", True)
+NEAR_SL_EXIT_ATR_MULTIPLIER = float(os.getenv("NEAR_SL_EXIT_ATR_MULTIPLIER", str(SL_WARNING_DISTANCE_ATR)))
+
 app = Flask(__name__)
 LAST_SIGNAL: Dict[str, Any] = {"status": "starting", "version": APP_VERSION}
 LAST_ALERT_KEY: Optional[str] = None
@@ -105,6 +122,18 @@ TELEGRAM_STATUS: Dict[str, Any] = {
     "bot_username": None,
 }
 LAST_MOVE_ALERT_KEYS: set = set()
+
+LAST_ENTRY_ALERT_KEY: Optional[str] = None
+LAST_ENTRY_ALERT_TS: float = 0.0
+LAST_EXIT_ALERT_KEYS: Dict[str, float] = {}
+LAST_ENTRY_EXIT_STATUS: Dict[str, Any] = {
+    "version": APP_VERSION,
+    "last_run_utc": None,
+    "last_success_utc": None,
+    "last_error": None,
+    "last_entry_signal": None,
+    "last_exit_events_count": 0,
+}
 
 
 CACHE_LOCK = threading.RLock()
@@ -419,6 +448,13 @@ def fast_check_status_snapshot() -> Dict[str, Any]:
         "move_alert_check_interval_minutes": MOVE_ALERT_CHECK_INTERVAL_MINUTES,
         "cache_ttl_seconds": dict(CACHE_TTL_SECONDS),
         "cache_max_rows_per_interval": CACHE_MAX_ROWS_PER_INTERVAL,
+        "entry_signal_enabled": ENTRY_SIGNAL_ENABLED,
+        "exit_signal_enabled": EXIT_SIGNAL_ENABLED,
+        "entry_signal_check_interval_minutes": ENTRY_SIGNAL_CHECK_INTERVAL_MINUTES,
+        "min_entry_score": MIN_ENTRY_SCORE,
+        "min_rr_to_alert": MIN_RR_TO_ALERT,
+        "last_entry_exit_error": LAST_ENTRY_EXIT_STATUS.get("last_error"),
+        "last_entry_exit_success_utc": LAST_ENTRY_EXIT_STATUS.get("last_success_utc"),
         "cache_cleanup_interval_minutes": CACHE_CLEANUP_INTERVAL_MINUTES,
     }
 
@@ -668,8 +704,22 @@ def trend(df: pd.DataFrame) -> str:
 
 
 def current_price_and_atr() -> Tuple[float, float]:
+    """
+    Fast price + H1 volatility:
+    - price from last closed 5min candle when available,
+    - ATR from H1 for stable SL/TP sizing.
+    Cache keeps this low-quota.
+    """
     h1 = add_indicators(fetch_ohlc("1h", 120))
-    return float(h1.close.iloc[-1]), float(h1.atr14.iloc[-1])
+    atr_value = float(h1.atr14.iloc[-1])
+
+    try:
+        m5 = add_indicators(fetch_ohlc("5min", 80))
+        price = float(m5.close.iloc[-1])
+    except Exception:
+        price = float(h1.close.iloc[-1])
+
+    return price, atr_value
 
 
 def risk_plan_for_position(side: str, entry: float, atr_value: Optional[float] = None) -> Dict[str, float]:
@@ -872,10 +922,23 @@ def format_position(p: Dict[str, Any], price: Optional[float] = None) -> str:
 
 
 def add_position(side: str, entry: float, volume: Optional[float] = None, chat_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Dodaje pozycję nawet wtedy, gdy Twelve Data chwilowo nie odpowiada.
+    SL/TP liczone są na podstawie H1 ATR, a przy awarii używany jest DEFAULT_ATR_H1.
+    """
     side = side.upper()
     if side not in ("BUY", "SELL"):
         raise ValueError("Użyj BUY albo SELL")
-    price, atr_value = current_price_and_atr()
+
+    atr_value = None
+    atr_source = "twelve_data_h1"
+
+    try:
+        _, atr_value = current_price_and_atr()
+    except Exception as market_error:
+        atr_value = DEFAULT_ATR_H1
+        atr_source = "default_env"
+
     rp = risk_plan_for_position(side, entry, atr_value)
     positions = load_positions()
     p = {
@@ -889,11 +952,17 @@ def add_position(side: str, entry: float, volume: Optional[float] = None, chat_i
         "tp2": rp["tp2"],
         "tp3": rp["tp3"],
         "risk_distance": rp["risk_distance"],
+        "atr_used": round(float(atr_value), 2),
+        "atr_source": atr_source,
         "created_utc": now_utc(),
         "status": "OPEN",
         "alerts_sent": [],
         "chat_id": str(chat_id or TELEGRAM_CHAT_ID or ""),
-        "note": "SL/TP calculated automatically from H1 ATR. Update broker manually unless you connect broker API.",
+        "note": (
+            "SL/TP calculated automatically from H1 ATR. "
+            "If market data was unavailable, fallback ATR was used. "
+            "Update broker manually unless you connect broker API."
+        ),
     }
     positions.append(p)
     save_positions(positions)
@@ -978,6 +1047,338 @@ def position_monitor_job() -> None:
         print(f"POSITION MONITOR ERROR: {e}")
 
 
+
+def opposite_side(side: str) -> str:
+    side = str(side).upper()
+    return "BUY" if side == "SELL" else "SELL"
+
+
+def rr_for_plan(side: str, entry: float, sl: float, tp: float) -> Optional[float]:
+    try:
+        risk = abs(float(entry) - float(sl))
+        if risk <= 0:
+            return None
+        reward = (float(tp) - float(entry)) if side == "BUY" else (float(entry) - float(tp))
+        return reward / risk
+    except Exception:
+        return None
+
+
+def evaluate_entry_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "enabled": ENTRY_SIGNAL_ENABLED,
+        "valid": False,
+        "status": "no_trade",
+        "reason": None,
+        "signal": None,
+    }
+
+    if not ENTRY_SIGNAL_ENABLED:
+        result.update({"status": "disabled", "reason": "ENTRY_SIGNAL_ENABLED=false"})
+        return result
+
+    if not signal or signal.get("status") == "error":
+        result.update({"status": "error", "reason": signal.get("error") if isinstance(signal, dict) else "missing signal"})
+        return result
+
+    side = str(signal.get("signal", "NO_TRADE")).upper()
+    score = int(signal.get("score", 0) or 0)
+    rp = signal.get("risk_plan") or {}
+
+    if side not in ("BUY", "SELL"):
+        result.update({"status": "no_trade", "reason": "main signal is NO_TRADE", "score": score})
+        return result
+
+    entry = safe_float(rp.get("entry"))
+    sl = safe_float(rp.get("sl"))
+    tp1 = safe_float(rp.get("tp1"))
+    tp2 = safe_float(rp.get("tp2"))
+    tp3 = safe_float(rp.get("tp3"))
+    risk_distance = safe_float(rp.get("risk_distance"))
+
+    if entry is None or sl is None or tp1 is None or not risk_distance:
+        result.update({"status": "invalid_plan", "reason": "missing entry/sl/tp/risk"})
+        return result
+
+    rr_tp1 = rr_for_plan(side, entry, sl, tp1)
+
+    valid = (
+        score >= MIN_ENTRY_SCORE
+        and rr_tp1 is not None
+        and rr_tp1 >= MIN_RR_TO_ALERT
+    )
+
+    result.update({
+        "valid": valid,
+        "status": "entry_signal" if valid else "filtered",
+        "reason": None if valid else f"score/rr filter not met: score={score}, rr_tp1={round(rr_tp1, 2) if rr_tp1 is not None else None}",
+        "signal": side,
+        "score": score,
+        "entry": round(entry, 2),
+        "sl": round(sl, 2),
+        "tp1": round(tp1, 2),
+        "tp2": round(tp2, 2) if tp2 is not None else None,
+        "tp3": round(tp3, 2) if tp3 is not None else None,
+        "risk_distance": round(risk_distance, 2),
+        "rr_to_tp1": round(rr_tp1, 2) if rr_tp1 is not None else None,
+        "trend": signal.get("trend"),
+        "reasons": signal.get("reasons", []),
+        "time_utc": now_utc(),
+    })
+    return result
+
+
+def format_entry_signal_alert(e: Dict[str, Any]) -> str:
+    side = e.get("signal")
+    emoji = "🟢" if side == "BUY" else "🔴"
+    return (
+        f"{emoji} GOLD ENTRY SIGNAL — {side}\n\n"
+        f"Symbol: {SYMBOL}\n"
+        f"Score regułowy: {e.get('score')}/100\n"
+        f"RR do TP1: {e.get('rr_to_tp1')}\n\n"
+        f"Entry: {e.get('entry')}\n"
+        f"SL: {e.get('sl')}\n"
+        f"TP1: {e.get('tp1')}\n"
+        f"TP2: {e.get('tp2')}\n"
+        f"TP3: {e.get('tp3')}\n\n"
+        f"Trend M15/H1/H4/D1: "
+        f"{(e.get('trend') or {}).get('M15')} / {(e.get('trend') or {}).get('H1')} / "
+        f"{(e.get('trend') or {}).get('H4')} / {(e.get('trend') or {}).get('D1')}\n"
+        f"Powody: {', '.join(e.get('reasons') or []) or '-'}\n\n"
+        f"Zasady: ryzyko max 1–2%, nie dokładaj do straty, SL wpisz ręcznie u brokera."
+    )
+
+
+def should_send_entry_alert(entry_signal: Dict[str, Any]) -> bool:
+    global LAST_ENTRY_ALERT_KEY, LAST_ENTRY_ALERT_TS
+    if not entry_signal.get("valid"):
+        return False
+
+    key = (
+        f"{entry_signal.get('signal')}:"
+        f"{entry_signal.get('entry')}:"
+        f"{entry_signal.get('sl')}:"
+        f"{entry_signal.get('score')}"
+    )
+    now_ts = _utc_ts()
+    cooldown = max(60, ENTRY_SIGNAL_COOLDOWN_MINUTES * 60)
+
+    if key == LAST_ENTRY_ALERT_KEY and (now_ts - LAST_ENTRY_ALERT_TS) < cooldown:
+        return False
+
+    LAST_ENTRY_ALERT_KEY = key
+    LAST_ENTRY_ALERT_TS = now_ts
+    return True
+
+
+def latest_h1_invalidation(signal: Optional[Dict[str, Any]], side: str) -> Optional[float]:
+    try:
+        inst = (signal or {}).get("institutional") or {}
+        swings = ((inst.get("market_structure_h1") or {}).get("swings") or {})
+        if side == "SELL":
+            highs = swings.get("highs") or []
+            return safe_float(highs[-1].get("price")) if highs else None
+        if side == "BUY":
+            lows = swings.get("lows") or []
+            return safe_float(lows[-1].get("price")) if lows else None
+    except Exception:
+        return None
+    return None
+
+
+def evaluate_exit_signals(current_signal: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    if not EXIT_SIGNAL_ENABLED:
+        return events
+
+    positions = load_positions()
+    if not positions:
+        return events
+
+    price, atr_value = current_price_and_atr()
+    signal_side = str((current_signal or {}).get("signal", "NO_TRADE")).upper()
+    signal_score = int((current_signal or {}).get("score", 0) or 0)
+
+    for p in positions:
+        try:
+            position_id = int(p.get("id"))
+            side = str(p.get("side")).upper()
+            entry = float(p.get("entry"))
+            sl = safe_float(p.get("sl"))
+            tp1 = safe_float(p.get("tp1"))
+            tp2 = safe_float(p.get("tp2"))
+            tp3 = safe_float(p.get("tp3"))
+            risk = abs(float(sl) - entry) if sl is not None else None
+            pnl_points = (entry - price) if side == "SELL" else (price - entry)
+            rr = pnl_points / risk if risk and risk > 0 else None
+            opposite = opposite_side(side)
+
+            base = {
+                "position_id": position_id,
+                "side": side,
+                "entry": round(entry, 2),
+                "price": round(float(price), 2),
+                "sl": round(sl, 2) if sl is not None else None,
+                "tp1": round(tp1, 2) if tp1 is not None else None,
+                "tp2": round(tp2, 2) if tp2 is not None else None,
+                "tp3": round(tp3, 2) if tp3 is not None else None,
+                "pnl_points": round(float(pnl_points), 2),
+                "rr": round(rr, 2) if rr is not None else None,
+                "atr_h1": round(float(atr_value), 2),
+                "time_utc": now_utc(),
+            }
+
+            # 1) SL hit / near SL
+            if sl is not None:
+                sl_hit = price >= sl if side == "SELL" else price <= sl
+                sl_near = abs(price - sl) <= atr_value * NEAR_SL_EXIT_ATR_MULTIPLIER
+                if sl_hit:
+                    events.append(base | {
+                        "type": "EXIT_NOW_SL_HIT",
+                        "priority": "HIGH",
+                        "dedupe_key": f"{position_id}:EXIT_NOW_SL_HIT",
+                        "message": f"Cena dotknęła/przebiła SL {round(sl, 2)}.",
+                    })
+                elif sl_near:
+                    events.append(base | {
+                        "type": "EXIT_RISK_NEAR_SL",
+                        "priority": "MEDIUM",
+                        "dedupe_key": f"{position_id}:EXIT_RISK_NEAR_SL",
+                        "message": f"Cena jest blisko SL {round(sl, 2)}.",
+                    })
+
+            # 2) Opposite signal
+            if (
+                EXIT_ON_OPPOSITE_SIGNAL
+                and signal_side == opposite
+                and signal_score >= OPPOSITE_SIGNAL_MIN_SCORE
+            ):
+                events.append(base | {
+                    "type": "EXIT_OR_REDUCE_OPPOSITE_SIGNAL",
+                    "priority": "HIGH",
+                    "dedupe_key": f"{position_id}:OPPOSITE:{signal_side}:{signal_score}",
+                    "message": f"Pojawił się przeciwny sygnał {signal_side} z wynikiem {signal_score}/100.",
+                })
+
+            # 3) H1 structural invalidation
+            invalidation = latest_h1_invalidation(current_signal, side) if EXIT_ON_H1_INVALIDATION else None
+            if invalidation is not None:
+                invalidated = price >= invalidation if side == "SELL" else price <= invalidation
+                if invalidated:
+                    events.append(base | {
+                        "type": "EXIT_INVALIDATION_H1",
+                        "priority": "HIGH",
+                        "dedupe_key": f"{position_id}:H1_INVALIDATION:{round(invalidation, 2)}",
+                        "invalidation_level": round(invalidation, 2),
+                        "message": f"Poziom zanegowania H1 {round(invalidation, 2)} został naruszony.",
+                    })
+
+            # 4) BE management
+            if rr is not None and rr >= MOVE_SL_TO_BE_AT_RR:
+                events.append(base | {
+                    "type": "MOVE_SL_TO_BE",
+                    "priority": "MEDIUM",
+                    "dedupe_key": f"{position_id}:MOVE_SL_TO_BE:{MOVE_SL_TO_BE_AT_RR}",
+                    "message": f"Pozycja osiągnęła ok. RR {round(rr, 2)}. Rozważ SL na BE: {round(entry, 2)}.",
+                })
+
+            # 5) Partial TP management
+            if PARTIAL_TP_ALERT and tp1 is not None:
+                tp1_hit = price <= tp1 if side == "SELL" else price >= tp1
+                if tp1_hit:
+                    events.append(base | {
+                        "type": "TAKE_PARTIAL_TP1",
+                        "priority": "MEDIUM",
+                        "dedupe_key": f"{position_id}:TAKE_PARTIAL_TP1",
+                        "message": f"TP1 {round(tp1, 2)} osiągnięty. Rozważ częściowe zamknięcie lub SL na BE.",
+                    })
+
+        except Exception as e:
+            events.append({
+                "type": "EXIT_ENGINE_POSITION_ERROR",
+                "priority": "LOW",
+                "position_id": p.get("id"),
+                "dedupe_key": f"{p.get('id')}:POSITION_ERROR",
+                "message": f"Błąd oceny pozycji: {type(e).__name__}: {e}",
+                "time_utc": now_utc(),
+            })
+
+    return events
+
+
+def format_exit_event_alert(e: Dict[str, Any]) -> str:
+    priority = e.get("priority", "MEDIUM")
+    icon = "🚨" if priority == "HIGH" else "🟡"
+    return (
+        f"{icon} GOLD EXIT / MANAGEMENT SIGNAL — {e.get('type')}\n\n"
+        f"Pozycja #{e.get('position_id')} {e.get('side')}\n"
+        f"Entry: {e.get('entry')} | Aktualna cena: {e.get('price')}\n"
+        f"SL: {e.get('sl')} | TP1: {e.get('tp1')} | TP2: {e.get('tp2')} | TP3: {e.get('tp3')}\n"
+        f"PnL pkt: {e.get('pnl_points')} | RR: {e.get('rr')}\n\n"
+        f"Powód: {e.get('message')}\n\n"
+        f"To jest sygnał zarządzania pozycją. Bot nie zamyka pozycji u brokera automatycznie."
+    )
+
+
+def should_send_exit_alert(event: Dict[str, Any]) -> bool:
+    key = str(event.get("dedupe_key") or f"{event.get('position_id')}:{event.get('type')}")
+    now_ts = _utc_ts()
+    cooldown = max(60, EXIT_SIGNAL_COOLDOWN_MINUTES * 60)
+    last_ts = float(LAST_EXIT_ALERT_KEYS.get(key, 0) or 0)
+
+    if now_ts - last_ts < cooldown:
+        return False
+
+    LAST_EXIT_ALERT_KEYS[key] = now_ts
+
+    # Keep memory bounded.
+    if len(LAST_EXIT_ALERT_KEYS) > 200:
+        oldest = sorted(LAST_EXIT_ALERT_KEYS.items(), key=lambda x: x[1])[:50]
+        for old_key, _ in oldest:
+            LAST_EXIT_ALERT_KEYS.pop(old_key, None)
+
+    return True
+
+
+def entry_exit_signal_job() -> None:
+    global LAST_SIGNAL, LAST_ENTRY_EXIT_STATUS
+
+    LAST_ENTRY_EXIT_STATUS["last_run_utc"] = now_utc()
+
+    try:
+        current_signal = build_signal()
+        LAST_SIGNAL = current_signal
+
+        entry_signal = evaluate_entry_signal(current_signal)
+        entry_sent = False
+        if entry_signal.get("valid") and should_send_entry_alert(entry_signal):
+            send_telegram(format_entry_signal_alert(entry_signal))
+            entry_sent = True
+
+        exit_events = evaluate_exit_signals(current_signal)
+        exit_sent_count = 0
+        for event in exit_events:
+            if should_send_exit_alert(event):
+                send_telegram(format_exit_event_alert(event), chat_id=None)
+                exit_sent_count += 1
+
+        LAST_ENTRY_EXIT_STATUS.update({
+            "last_success_utc": now_utc(),
+            "last_error": None,
+            "last_entry_signal": entry_signal,
+            "last_entry_sent": entry_sent,
+            "last_exit_events_count": len(exit_events),
+            "last_exit_sent_count": exit_sent_count,
+        })
+
+    except Exception as e:
+        LAST_ENTRY_EXIT_STATUS.update({
+            "last_error": f"{type(e).__name__}: {e}",
+            "last_success_utc": None,
+        })
+        print(f"ENTRY/EXIT ENGINE ERROR: {type(e).__name__}: {e}")
+
+
 def command_help() -> str:
     return (
         "Komendy Gold AI Bot v6.5:\n"
@@ -988,7 +1389,10 @@ def command_help() -> str:
         "/setsl 1 4202 — zmień SL pozycji #1\n"
         "/settp 1 3969 3892 3814 — zmień TP1/TP2/TP3 pozycji #1\n"
         "/signal — wygeneruj aktualny sygnał\n"
-        "/price — aktualna cena i ATR H1\n"
+        "/entry — pokaż aktualny sygnał wejścia BUY/SELL\n"
+        "/exit — pokaż sygnały wyjścia/prowadzenia pozycji\n"
+        "/signal-now — pełna diagnostyka entry + exit\n"
+        "/price — aktualna cena M5 i ATR H1\n"
         "Uwaga: bot nie składa zleceń u brokera. SL/TP trzeba wpisać ręcznie w aplikacji brokera, chyba że podłączysz API brokera."
     )
 
@@ -998,7 +1402,7 @@ def handle_command(text: str, chat_id: str) -> str:
     parts = raw.split()
     if not parts:
         return command_help()
-    cmd = parts[0].lower()
+    cmd = parts[0].lower().split("@")[0]
 
     # Accept plain "SELL 4097" and "BUY 4097" as shortcut.
     if cmd in ("buy", "sell") and len(parts) >= 2:
@@ -1064,6 +1468,32 @@ def handle_command(text: str, chat_id: str) -> str:
         s = build_signal()
         return format_signal(s)
 
+    if cmd == "/entry":
+        s = build_signal()
+        e = evaluate_entry_signal(s)
+        if e.get("valid"):
+            return format_entry_signal_alert(e)
+        return "Brak aktualnego sygnału wejścia. Status: " + str(e.get("status")) + "\nPowód: " + str(e.get("reason"))
+
+    if cmd == "/exit":
+        s = build_signal() if EXIT_ON_OPPOSITE_SIGNAL or EXIT_ON_H1_INVALIDATION else None
+        events = evaluate_exit_signals(s)
+        if not events:
+            return "Brak aktywnych sygnałów wyjścia/prowadzenia pozycji."
+        return "📌 Sygnały wyjścia/prowadzenia:\n\n" + "\n\n".join(format_exit_event_alert(e) for e in events[:5])
+
+    if cmd == "/signal-now":
+        s = build_signal()
+        e = evaluate_entry_signal(s)
+        events = evaluate_exit_signals(s)
+        return (
+            format_signal(s)
+            + "\n\n--- ENTRY ENGINE ---\n"
+            + (format_entry_signal_alert(e) if e.get("valid") else f"Brak entry. Status: {e.get('status')} | Powód: {e.get('reason')}")
+            + "\n\n--- EXIT ENGINE ---\n"
+            + ("Brak aktywnych sygnałów exit." if not events else "\n\n".join(format_exit_event_alert(x) for x in events[:5]))
+        )
+
     if cmd == "/price":
         price, atr_value = current_price_and_atr()
         return f"Cena {SYMBOL}: {round(price, 2)}\nATR H1: {round(atr_value, 2)}"
@@ -1098,6 +1528,10 @@ def ensure_telegram_polling_mode() -> None:
 
 
 def telegram_poll_job() -> None:
+    """
+    Pobiera update'y z Telegrama.
+    Pojedyncza błędna komenda nie blokuje całej kolejki i offset jest przesuwany dalej.
+    """
     TELEGRAM_STATUS["last_run_utc"] = now_utc()
     TELEGRAM_STATUS["last_updates_count"] = 0
 
@@ -1118,6 +1552,8 @@ def telegram_poll_job() -> None:
     }
     if state.get("offset") is not None:
         params["offset"] = int(state["offset"])
+
+    command_errors: List[str] = []
 
     try:
         webhook = telegram_api_get("getWebhookInfo")
@@ -1150,11 +1586,16 @@ def telegram_poll_job() -> None:
                 response = handle_command(text_value, chat_id)
                 send_telegram(response, chat_id=chat_id)
             except Exception as command_error:
+                err = f"update_id={update_id}: {type(command_error).__name__}: {command_error}"
+                command_errors.append(err)
                 try:
-                    send_telegram(f"❌ Błąd obsługi komendy: {command_error}", chat_id=chat_id)
+                    send_telegram(
+                        f"❌ Błąd obsługi komendy: {type(command_error).__name__}: {command_error}",
+                        chat_id=chat_id,
+                    )
                 except Exception:
                     pass
-                raise
+                continue
 
         if max_update_id is not None:
             save_json(
@@ -1163,12 +1604,11 @@ def telegram_poll_job() -> None:
             )
 
         TELEGRAM_STATUS["last_success_utc"] = now_utc()
-        TELEGRAM_STATUS["last_error"] = None
+        TELEGRAM_STATUS["last_error"] = " | ".join(command_errors[-3:]) if command_errors else None
 
     except Exception as e:
         TELEGRAM_STATUS["last_error"] = f"{type(e).__name__}: {e}"
         print(f"TELEGRAM POLL ERROR: {type(e).__name__}: {e}")
-
 
 
 def job() -> None:
@@ -1410,6 +1850,93 @@ def tick_endpoint():
         return jsonify(result), 200
 
 
+@app.get("/entry-status")
+def entry_status_endpoint():
+    try:
+        s = build_signal()
+        e = evaluate_entry_signal(s)
+        return jsonify({
+            "status": "ok",
+            "version": APP_VERSION,
+            "entry": e,
+            "signal": {
+                "signal": s.get("signal"),
+                "score": s.get("score"),
+                "price": s.get("price"),
+                "trend": s.get("trend"),
+            },
+            "api_runtime": api_runtime_snapshot(),
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "version": APP_VERSION,
+            "error": f"{type(e).__name__}: {e}",
+            "api_runtime": api_runtime_snapshot(),
+        }), 200
+
+
+@app.get("/exit-status")
+def exit_status_endpoint():
+    try:
+        s = build_signal() if EXIT_ON_OPPOSITE_SIGNAL or EXIT_ON_H1_INVALIDATION else None
+        events = evaluate_exit_signals(s)
+        return jsonify({
+            "status": "ok",
+            "version": APP_VERSION,
+            "positions_count": len(load_positions()),
+            "events_count": len(events),
+            "events": events,
+            "signal": {
+                "signal": s.get("signal") if s else None,
+                "score": s.get("score") if s else None,
+                "price": s.get("price") if s else None,
+                "trend": s.get("trend") if s else None,
+            },
+            "api_runtime": api_runtime_snapshot(),
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "version": APP_VERSION,
+            "error": f"{type(e).__name__}: {e}",
+            "api_runtime": api_runtime_snapshot(),
+        }), 200
+
+
+@app.get("/signal-now")
+def signal_now_endpoint():
+    try:
+        s = build_signal()
+        e = evaluate_entry_signal(s)
+        events = evaluate_exit_signals(s)
+        return jsonify({
+            "status": "ok",
+            "version": APP_VERSION,
+            "signal": s,
+            "entry": e,
+            "exit_events": events,
+            "api_runtime": api_runtime_snapshot(),
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "version": APP_VERSION,
+            "error": f"{type(e).__name__}: {e}",
+            "api_runtime": api_runtime_snapshot(),
+        }), 200
+
+
+@app.post("/entry-exit-run-now")
+def entry_exit_run_now_endpoint():
+    entry_exit_signal_job()
+    return jsonify({
+        "status": "ok",
+        "version": APP_VERSION,
+        "entry_exit_status": LAST_ENTRY_EXIT_STATUS,
+    })
+
+
 @app.get("/signal")
 def signal_endpoint():
     job()
@@ -1503,6 +2030,15 @@ if SCHEDULER_ENABLED:
         "interval",
         minutes=max(1, TELEGRAM_POLL_INTERVAL_MINUTES),
         id="telegram_poll",
+        replace_existing=True,
+    )
+
+    # Entry / Exit Signal Engine.
+    scheduler.add_job(
+        entry_exit_signal_job,
+        "interval",
+        minutes=max(1, ENTRY_SIGNAL_CHECK_INTERVAL_MINUTES),
+        id="entry_exit_signal_engine",
         replace_existing=True,
     )
 
