@@ -11,7 +11,7 @@ import numpy as np
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.5.7-early-watch-entry-execution-guard"
+APP_VERSION = "6.5.8-support-resistance-retest-guard"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -120,6 +120,26 @@ MAX_TP1_PROGRESS_BEFORE_ENTRY = float(os.getenv("MAX_TP1_PROGRESS_BEFORE_ENTRY",
 MISSED_TRADE_ALERT_ENABLED = env_bool("MISSED_TRADE_ALERT_ENABLED", True)
 MISSED_TRADE_COOLDOWN_MINUTES = int(os.getenv("MISSED_TRADE_COOLDOWN_MINUTES", "30"))
 
+# Support / Resistance & Retest Guard
+MAJOR_LEVEL_GUARD_ENABLED = env_bool("MAJOR_LEVEL_GUARD_ENABLED", True)
+ROUND_LEVEL_GUARD_ENABLED = env_bool("ROUND_LEVEL_GUARD_ENABLED", True)
+RETEST_REQUIRED_AFTER_BREAKOUT = env_bool("RETEST_REQUIRED_AFTER_BREAKOUT", True)
+WAIT_RETEST_ALERT_ENABLED = env_bool("WAIT_RETEST_ALERT_ENABLED", True)
+WAIT_RETEST_COOLDOWN_MINUTES = int(os.getenv("WAIT_RETEST_COOLDOWN_MINUTES", "30"))
+
+NO_SELL_NEAR_SUPPORT = env_bool("NO_SELL_NEAR_SUPPORT", True)
+NO_BUY_NEAR_RESISTANCE = env_bool("NO_BUY_NEAR_RESISTANCE", True)
+ROUND_LEVEL_STEP_POINTS = float(os.getenv("ROUND_LEVEL_STEP_POINTS", "50"))
+STRONG_ROUND_LEVEL_STEP_POINTS = float(os.getenv("STRONG_ROUND_LEVEL_STEP_POINTS", "100"))
+MAJOR_LEVEL_ZONE_POINTS = float(os.getenv("MAJOR_LEVEL_ZONE_POINTS", "12"))
+MIN_DISTANCE_FROM_SUPPORT_POINTS = float(os.getenv("MIN_DISTANCE_FROM_SUPPORT_POINTS", "12"))
+MIN_DISTANCE_FROM_RESISTANCE_POINTS = float(os.getenv("MIN_DISTANCE_FROM_RESISTANCE_POINTS", "12"))
+
+MAX_IMPULSE_ATR_BEFORE_ENTRY = float(os.getenv("MAX_IMPULSE_ATR_BEFORE_ENTRY", "1.2"))
+IMPULSE_GUARD_INTERVAL = os.getenv("IMPULSE_GUARD_INTERVAL", "1h")
+RETEST_ZONE_POINTS = float(os.getenv("RETEST_ZONE_POINTS", "10"))
+RETEST_LOOKBACK_CANDLES = int(os.getenv("RETEST_LOOKBACK_CANDLES", "48"))
+
 app = Flask(__name__)
 LAST_SIGNAL: Dict[str, Any] = {"status": "starting", "version": APP_VERSION}
 LAST_ALERT_KEY: Optional[str] = None
@@ -143,6 +163,8 @@ LAST_EARLY_ALERT_KEY: Optional[str] = None
 LAST_EARLY_ALERT_TS: float = 0.0
 LAST_MISSED_ALERT_KEY: Optional[str] = None
 LAST_MISSED_ALERT_TS: float = 0.0
+LAST_WAIT_RETEST_ALERT_KEY: Optional[str] = None
+LAST_WAIT_RETEST_ALERT_TS: float = 0.0
 LAST_EXIT_ALERT_KEYS: Dict[str, float] = {}
 LAST_ENTRY_EXIT_STATUS: Dict[str, Any] = {
     "version": APP_VERSION,
@@ -478,6 +500,16 @@ def fast_check_status_snapshot() -> Dict[str, Any]:
         "max_entry_drift_r_multiplier": MAX_ENTRY_DRIFT_R_MULTIPLIER,
         "min_live_rr_to_tp1": MIN_LIVE_RR_TO_TP1,
         "max_tp1_progress_before_entry": MAX_TP1_PROGRESS_BEFORE_ENTRY,
+        "major_level_guard_enabled": MAJOR_LEVEL_GUARD_ENABLED,
+        "round_level_guard_enabled": ROUND_LEVEL_GUARD_ENABLED,
+        "retest_required_after_breakout": RETEST_REQUIRED_AFTER_BREAKOUT,
+        "round_level_step_points": ROUND_LEVEL_STEP_POINTS,
+        "strong_round_level_step_points": STRONG_ROUND_LEVEL_STEP_POINTS,
+        "major_level_zone_points": MAJOR_LEVEL_ZONE_POINTS,
+        "retest_zone_points": RETEST_ZONE_POINTS,
+        "max_impulse_atr_before_entry": MAX_IMPULSE_ATR_BEFORE_ENTRY,
+        "no_sell_near_support": NO_SELL_NEAR_SUPPORT,
+        "no_buy_near_resistance": NO_BUY_NEAR_RESISTANCE,
         "last_entry_exit_error": LAST_ENTRY_EXIT_STATUS.get("last_error"),
         "last_entry_exit_success_utc": LAST_ENTRY_EXIT_STATUS.get("last_success_utc"),
         "cache_cleanup_interval_minutes": CACHE_CLEANUP_INTERVAL_MINUTES,
@@ -1090,6 +1122,353 @@ def rr_for_plan(side: str, entry: float, sl: float, tp: float) -> Optional[float
         return None
 
 
+
+def nearest_round_level(price: float, step: Optional[float] = None) -> Optional[float]:
+    try:
+        step_value = float(step or ROUND_LEVEL_STEP_POINTS)
+        if step_value <= 0:
+            return None
+        return round(round(float(price) / step_value) * step_value, 2)
+    except Exception:
+        return None
+
+
+def lower_round_level(price: float, step: Optional[float] = None) -> Optional[float]:
+    try:
+        step_value = float(step or ROUND_LEVEL_STEP_POINTS)
+        if step_value <= 0:
+            return None
+        return round(np.floor(float(price) / step_value) * step_value, 2)
+    except Exception:
+        return None
+
+
+def upper_round_level(price: float, step: Optional[float] = None) -> Optional[float]:
+    try:
+        step_value = float(step or ROUND_LEVEL_STEP_POINTS)
+        if step_value <= 0:
+            return None
+        return round(np.ceil(float(price) / step_value) * step_value, 2)
+    except Exception:
+        return None
+
+
+def _swing_levels_from_signal(signal: Optional[Dict[str, Any]]) -> Dict[str, List[float]]:
+    supports: List[float] = []
+    resistances: List[float] = []
+
+    try:
+        inst = (signal or {}).get("institutional") or {}
+        for key in ["market_structure_h1", "market_structure_h4"]:
+            swings = ((inst.get(key) or {}).get("swings") or {})
+            for low in swings.get("lows", [])[-6:]:
+                value = safe_float(low.get("price"))
+                if value is not None:
+                    supports.append(float(value))
+            for high in swings.get("highs", [])[-6:]:
+                value = safe_float(high.get("price"))
+                if value is not None:
+                    resistances.append(float(value))
+    except Exception:
+        pass
+
+    # Deduplicate with rounding to avoid noisy repeated levels.
+    supports = sorted(set(round(x, 2) for x in supports))
+    resistances = sorted(set(round(x, 2) for x in resistances))
+    return {"supports": supports, "resistances": resistances}
+
+
+def retest_confirmed(side: str, level: float) -> Dict[str, Any]:
+    """
+    Confirms that a breakout has already been retested.
+    SELL: close below level, then later candle revisits near level and rejects below.
+    BUY: close above level, then later candle revisits near level and holds above.
+    """
+    result: Dict[str, Any] = {
+        "confirmed": False,
+        "level": round(float(level), 2),
+        "zone_points": RETEST_ZONE_POINTS,
+        "reason": "no retest detected",
+    }
+
+    try:
+        df = add_indicators(fetch_ohlc("5min", max(80, RETEST_LOOKBACK_CANDLES + 10)))
+        if df is None or len(df) < 8:
+            result["reason"] = "not enough M5 data"
+            return result
+
+        recent = df.tail(RETEST_LOOKBACK_CANDLES).reset_index(drop=True)
+        side = side.upper()
+        break_idx = None
+
+        for i in range(1, len(recent)):
+            prev_close = float(recent.close.iloc[i - 1])
+            cur_close = float(recent.close.iloc[i])
+            if side == "SELL" and prev_close >= level and cur_close < level:
+                break_idx = i
+                break
+            if side == "BUY" and prev_close <= level and cur_close > level:
+                break_idx = i
+                break
+
+        if break_idx is None:
+            # If the market is already beyond the level, use the first beyond-level close.
+            for i in range(len(recent)):
+                cur_close = float(recent.close.iloc[i])
+                if side == "SELL" and cur_close < level:
+                    break_idx = i
+                    break
+                if side == "BUY" and cur_close > level:
+                    break_idx = i
+                    break
+
+        if break_idx is None or break_idx >= len(recent) - 2:
+            result["reason"] = "breakout too fresh or not found"
+            return result
+
+        for j in range(break_idx + 1, len(recent)):
+            row = recent.iloc[j]
+            o, h, l, c = float(row.open), float(row.high), float(row.low), float(row.close)
+            if side == "SELL":
+                # Retest from below: wick/body comes back near level, but closes below it.
+                if h >= level - RETEST_ZONE_POINTS and c < level and c <= o:
+                    result.update({
+                        "confirmed": True,
+                        "reason": "sell retest/rejection confirmed",
+                        "break_index": int(break_idx),
+                        "retest_index": int(j),
+                        "retest_datetime": str(row.datetime),
+                        "retest_close": round(c, 2),
+                    })
+                    return result
+            else:
+                # Retest from above: wick/body comes back near level, but closes above it.
+                if l <= level + RETEST_ZONE_POINTS and c > level and c >= o:
+                    result.update({
+                        "confirmed": True,
+                        "reason": "buy retest/hold confirmed",
+                        "break_index": int(break_idx),
+                        "retest_index": int(j),
+                        "retest_datetime": str(row.datetime),
+                        "retest_close": round(c, 2),
+                    })
+                    return result
+
+        return result
+
+    except Exception as e:
+        result.update({
+            "confirmed": False,
+            "reason": f"{type(e).__name__}: {e}",
+        })
+        return result
+
+
+def impulse_guard(side: str) -> Dict[str, Any]:
+    """
+    Prevents chasing a large same-direction candle after the move has already happened.
+    """
+    result: Dict[str, Any] = {
+        "ok": True,
+        "status": "ok",
+        "enabled": MAJOR_LEVEL_GUARD_ENABLED,
+    }
+
+    if not MAJOR_LEVEL_GUARD_ENABLED:
+        return result
+
+    try:
+        df = add_indicators(fetch_ohlc(IMPULSE_GUARD_INTERVAL, 80))
+        if df is None or len(df) < 20:
+            return result
+
+        last = df.iloc[-1]
+        atr_value = float(last.atr14)
+        if atr_value <= 0:
+            return result
+
+        body = float(last.close - last.open)
+        rng = float(last.high - last.low)
+        body_atr = abs(body) / atr_value
+        range_atr = rng / atr_value if rng > 0 else 0.0
+        same_direction = (side.upper() == "SELL" and body < 0) or (side.upper() == "BUY" and body > 0)
+
+        result.update({
+            "interval": IMPULSE_GUARD_INTERVAL,
+            "body_atr": round(body_atr, 2),
+            "range_atr": round(range_atr, 2),
+            "same_direction": same_direction,
+            "last_candle_datetime": str(last.datetime),
+        })
+
+        if same_direction and body_atr >= MAX_IMPULSE_ATR_BEFORE_ENTRY:
+            result.update({
+                "ok": False,
+                "status": "blocked_no_chase_after_impulse",
+                "reason": (
+                    f"Last {IMPULSE_GUARD_INTERVAL} candle body/ATR={round(body_atr, 2)} "
+                    f"is above {MAX_IMPULSE_ATR_BEFORE_ENTRY}; wait for retest."
+                ),
+            })
+
+        return result
+
+    except Exception as e:
+        result.update({
+            "ok": True,
+            "status": "guard_error_non_blocking",
+            "reason": f"{type(e).__name__}: {e}",
+        })
+        return result
+
+
+def support_resistance_retest_guard(side: str, entry: float, signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Blocks weak entries:
+    - SELL into major support / just below round level without retest,
+    - BUY into major resistance / just above round level without retest,
+    - chase after large same-direction impulse.
+    """
+    result: Dict[str, Any] = {
+        "enabled": MAJOR_LEVEL_GUARD_ENABLED,
+        "ok": True,
+        "status": "ok",
+        "reason": None,
+        "side": side.upper(),
+        "entry": round(float(entry), 2),
+    }
+
+    if not MAJOR_LEVEL_GUARD_ENABLED:
+        return result
+
+    side = side.upper()
+    price = float(entry)
+
+    try:
+        levels = _swing_levels_from_signal(signal)
+        supports = list(levels.get("supports", []))
+        resistances = list(levels.get("resistances", []))
+
+        round_nearest = nearest_round_level(price, ROUND_LEVEL_STEP_POINTS)
+        round_lower = lower_round_level(price, ROUND_LEVEL_STEP_POINTS)
+        round_upper = upper_round_level(price, ROUND_LEVEL_STEP_POINTS)
+        strong_nearest = nearest_round_level(price, STRONG_ROUND_LEVEL_STEP_POINTS)
+
+        result.update({
+            "round_nearest": round_nearest,
+            "round_lower": round_lower,
+            "round_upper": round_upper,
+            "strong_round_nearest": strong_nearest,
+            "supports_checked": supports[-6:],
+            "resistances_checked": resistances[-6:],
+        })
+
+        # 1) Hard round-level breakout retest logic.
+        candidate_levels: List[float] = []
+        if ROUND_LEVEL_GUARD_ENABLED:
+            for value in [round_nearest, round_lower, round_upper, strong_nearest]:
+                if value is not None and abs(price - value) <= max(MAJOR_LEVEL_ZONE_POINTS, RETEST_ZONE_POINTS):
+                    candidate_levels.append(float(value))
+            candidate_levels = sorted(set(candidate_levels), key=lambda x: abs(price - x))
+
+        for level in candidate_levels:
+            if side == "SELL" and price < level and abs(price - level) <= max(MAJOR_LEVEL_ZONE_POINTS, RETEST_ZONE_POINTS):
+                rt = retest_confirmed("SELL", level) if RETEST_REQUIRED_AFTER_BREAKOUT else {"confirmed": True}
+                result["retest_check"] = rt
+                if not rt.get("confirmed"):
+                    result.update({
+                        "ok": False,
+                        "status": "wait_for_retest",
+                        "guard_type": "sell_breakout_without_retest",
+                        "level": round(level, 2),
+                        "reason": (
+                            f"SELL is below major/round level {round(level, 2)} but no retest/rejection is confirmed."
+                        ),
+                        "instruction": f"Wait for retest {round(level, 2)}±{RETEST_ZONE_POINTS} and rejection before SELL.",
+                    })
+                    return result
+
+            if side == "BUY" and price > level and abs(price - level) <= max(MAJOR_LEVEL_ZONE_POINTS, RETEST_ZONE_POINTS):
+                rt = retest_confirmed("BUY", level) if RETEST_REQUIRED_AFTER_BREAKOUT else {"confirmed": True}
+                result["retest_check"] = rt
+                if not rt.get("confirmed"):
+                    result.update({
+                        "ok": False,
+                        "status": "wait_for_retest",
+                        "guard_type": "buy_breakout_without_retest",
+                        "level": round(level, 2),
+                        "reason": (
+                            f"BUY is above major/round level {round(level, 2)} but no retest/hold is confirmed."
+                        ),
+                        "instruction": f"Wait for retest {round(level, 2)}±{RETEST_ZONE_POINTS} and hold before BUY.",
+                    })
+                    return result
+
+        # 2) Do not sell directly into nearby support.
+        if NO_SELL_NEAR_SUPPORT and side == "SELL":
+            nearby_supports = []
+            for level in supports:
+                # support at or below entry, or slightly above because of recent break
+                dist = abs(price - float(level))
+                if dist <= MIN_DISTANCE_FROM_SUPPORT_POINTS:
+                    nearby_supports.append((float(level), dist))
+            if nearby_supports:
+                level, dist = sorted(nearby_supports, key=lambda x: x[1])[0]
+                result.update({
+                    "ok": False,
+                    "status": "blocked_sell_near_support",
+                    "guard_type": "sell_into_support",
+                    "level": round(level, 2),
+                    "distance_points": round(dist, 2),
+                    "reason": f"SELL too close to support {round(level, 2)}; distance {round(dist, 2)} pts.",
+                    "instruction": "Wait for a clean break and retest, or for a better pullback entry.",
+                })
+                return result
+
+        # 3) Do not buy directly into nearby resistance.
+        if NO_BUY_NEAR_RESISTANCE and side == "BUY":
+            nearby_resistances = []
+            for level in resistances:
+                dist = abs(price - float(level))
+                if dist <= MIN_DISTANCE_FROM_RESISTANCE_POINTS:
+                    nearby_resistances.append((float(level), dist))
+            if nearby_resistances:
+                level, dist = sorted(nearby_resistances, key=lambda x: x[1])[0]
+                result.update({
+                    "ok": False,
+                    "status": "blocked_buy_near_resistance",
+                    "guard_type": "buy_into_resistance",
+                    "level": round(level, 2),
+                    "distance_points": round(dist, 2),
+                    "reason": f"BUY too close to resistance {round(level, 2)}; distance {round(dist, 2)} pts.",
+                    "instruction": "Wait for a clean break and retest, or for a better pullback entry.",
+                })
+                return result
+
+        # 4) No chase after impulse.
+        ig = impulse_guard(side)
+        result["impulse_guard"] = ig
+        if not ig.get("ok"):
+            result.update({
+                "ok": False,
+                "status": ig.get("status", "blocked_no_chase_after_impulse"),
+                "guard_type": "no_chase_after_impulse",
+                "reason": ig.get("reason"),
+                "instruction": "Wait for retest/pullback. Do not enter directly after the large impulse candle.",
+            })
+            return result
+
+        return result
+
+    except Exception as e:
+        result.update({
+            "ok": True,
+            "status": "guard_error_non_blocking",
+            "reason": f"{type(e).__name__}: {e}",
+        })
+        return result
+
+
 def live_execution_guard(side: str, entry: float, sl: float, tp1: float, risk_distance: Optional[float] = None) -> Dict[str, Any]:
     """
     Blocks late/escaped entries.
@@ -1256,6 +1635,21 @@ def evaluate_entry_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     if not base_valid:
         return result
 
+    # First check market structure quality: no chasing, no selling into support, no buying into resistance.
+    sr_guard = support_resistance_retest_guard(side, entry, signal)
+    result["structure_guard"] = sr_guard
+
+    if not sr_guard.get("ok"):
+        result.update({
+            "valid": False,
+            "status": sr_guard.get("status", "structure_blocked"),
+            "reason": sr_guard.get("reason"),
+            "wait_for_retest": sr_guard.get("status") == "wait_for_retest",
+            "blocked_by_structure": sr_guard.get("status") != "wait_for_retest",
+        })
+        return result
+
+    # Then check real execution quality: price did not escape and live RR is still valid.
     guard = live_execution_guard(side, entry, sl, tp1, risk_distance)
     result["execution_guard"] = guard
 
@@ -1433,6 +1827,40 @@ def format_early_watch_alert(w: Dict[str, Any]) -> str:
     )
 
 
+def format_wait_retest_alert(e: Dict[str, Any]) -> str:
+    side = e.get("signal")
+    sg = e.get("structure_guard") or {}
+    level = sg.get("level")
+    return (
+        f"⏳ GOLD WAIT FOR RETEST — {side}\n\n"
+        f"Sygnał kierunkowo jest możliwy, ale wejście market zostało zablokowane.\n\n"
+        f"Planowane entry: {e.get('entry')}\n"
+        f"Poziom retestu: {level if level is not None else '-'}\n"
+        f"SL z planu: {e.get('sl')}\n"
+        f"TP1 z planu: {e.get('tp1')}\n\n"
+        f"Powód: {sg.get('reason')}\n"
+        f"Instrukcja: {sg.get('instruction')}\n\n"
+        f"Decyzja: nie gonić wybicia. Czekać na retest/odrzucenie albo nowy setup."
+    )
+
+
+def format_blocked_structure_alert(e: Dict[str, Any]) -> str:
+    side = e.get("signal")
+    sg = e.get("structure_guard") or {}
+    return (
+        f"⚠️ GOLD ENTRY BLOCKED — {side}\n\n"
+        f"Bot zablokował wejście mimo spełnionego score/RR.\n\n"
+        f"Planowane entry: {e.get('entry')}\n"
+        f"SL z planu: {e.get('sl')}\n"
+        f"TP1 z planu: {e.get('tp1')}\n\n"
+        f"Typ blokady: {sg.get('guard_type') or sg.get('status')}\n"
+        f"Poziom: {sg.get('level', '-')}\n"
+        f"Powód: {sg.get('reason')}\n"
+        f"Instrukcja: {sg.get('instruction')}\n\n"
+        f"Decyzja: odpuścić wejście market. Czekać na lepsze miejsce."
+    )
+
+
 def should_send_entry_alert(entry_signal: Dict[str, Any]) -> bool:
     global LAST_ENTRY_ALERT_KEY, LAST_ENTRY_ALERT_TS
     if not entry_signal.get("valid"):
@@ -1470,6 +1898,30 @@ def should_send_early_watch_alert(watch: Dict[str, Any]) -> bool:
         return False
     LAST_EARLY_ALERT_KEY = key
     LAST_EARLY_ALERT_TS = now_ts
+    return True
+
+
+def should_send_wait_retest_alert(entry_signal: Dict[str, Any]) -> bool:
+    global LAST_WAIT_RETEST_ALERT_KEY, LAST_WAIT_RETEST_ALERT_TS
+    if not WAIT_RETEST_ALERT_ENABLED:
+        return False
+    if not (entry_signal.get("wait_for_retest") or entry_signal.get("blocked_by_structure")):
+        return False
+
+    sg = entry_signal.get("structure_guard") or {}
+    key = (
+        f"{entry_signal.get('signal')}:"
+        f"{entry_signal.get('status')}:"
+        f"{sg.get('level')}:"
+        f"{entry_signal.get('entry')}:"
+        f"{entry_signal.get('score')}"
+    )
+    now_ts = _utc_ts()
+    cooldown = max(60, WAIT_RETEST_COOLDOWN_MINUTES * 60)
+    if key == LAST_WAIT_RETEST_ALERT_KEY and (now_ts - LAST_WAIT_RETEST_ALERT_TS) < cooldown:
+        return False
+    LAST_WAIT_RETEST_ALERT_KEY = key
+    LAST_WAIT_RETEST_ALERT_TS = now_ts
     return True
 
 
@@ -1686,6 +2138,14 @@ def entry_exit_signal_job() -> None:
             send_telegram(format_missed_trade_alert(entry_signal))
             missed_sent = True
 
+        wait_retest_sent = False
+        if (entry_signal.get("wait_for_retest") or entry_signal.get("blocked_by_structure")) and should_send_wait_retest_alert(entry_signal):
+            if entry_signal.get("wait_for_retest"):
+                send_telegram(format_wait_retest_alert(entry_signal))
+            else:
+                send_telegram(format_blocked_structure_alert(entry_signal))
+            wait_retest_sent = True
+
         entry_sent = False
         if entry_signal.get("valid") and should_send_entry_alert(entry_signal):
             send_telegram(format_entry_signal_alert(entry_signal))
@@ -1706,6 +2166,7 @@ def entry_exit_signal_job() -> None:
             "last_entry_signal": entry_signal,
             "last_entry_sent": entry_sent,
             "last_missed_sent": missed_sent,
+            "last_wait_retest_sent": wait_retest_sent,
             "last_exit_events_count": len(exit_events),
             "last_exit_sent_count": exit_sent_count,
         })
@@ -1731,7 +2192,7 @@ def command_help() -> str:
         "/early — pokaż wcześniejsze ostrzeżenie SETUP FORMING\n"
         "/entry — pokaż aktualny sygnał wejścia BUY/SELL albo MISSED TRADE\n"
         "/exit — pokaż sygnały wyjścia/prowadzenia pozycji\n"
-        "/signal-now — pełna diagnostyka early + entry + exit\n"
+        "/signal-now — pełna diagnostyka early + entry + retest guard + exit\n"
         "/price — aktualna cena M5 i ATR H1\n"
         "Uwaga: bot nie składa zleceń u brokera. SL/TP trzeba wpisać ręcznie w aplikacji brokera, chyba że podłączysz API brokera."
     )
@@ -1821,6 +2282,10 @@ def handle_command(text: str, chat_id: str) -> str:
         e = evaluate_entry_signal(s)
         if e.get("valid"):
             return format_entry_signal_alert(e)
+        if e.get("wait_for_retest"):
+            return format_wait_retest_alert(e)
+        if e.get("blocked_by_structure"):
+            return format_blocked_structure_alert(e)
         if e.get("missed_trade"):
             return format_missed_trade_alert(e)
         return "Brak aktualnego sygnału wejścia. Status: " + str(e.get("status")) + "\nPowód: " + str(e.get("reason"))
@@ -1838,9 +2303,16 @@ def handle_command(text: str, chat_id: str) -> str:
         w = evaluate_early_watch(s, e)
         events = evaluate_exit_signals(s)
 
-        entry_text = format_entry_signal_alert(e) if e.get("valid") else (
-            format_missed_trade_alert(e) if e.get("missed_trade") else f"Brak entry. Status: {e.get('status')} | Powód: {e.get('reason')}"
-        )
+        if e.get("valid"):
+            entry_text = format_entry_signal_alert(e)
+        elif e.get("wait_for_retest"):
+            entry_text = format_wait_retest_alert(e)
+        elif e.get("blocked_by_structure"):
+            entry_text = format_blocked_structure_alert(e)
+        elif e.get("missed_trade"):
+            entry_text = format_missed_trade_alert(e)
+        else:
+            entry_text = f"Brak entry. Status: {e.get('status')} | Powód: {e.get('reason')}"
         early_text = format_early_watch_alert(w) if w.get("valid") else f"Brak early watch. Status: {w.get('status')} | Powód: {w.get('reason')}"
 
         return (
@@ -2207,6 +2679,41 @@ def tick_endpoint():
         })
         # Diagnostic endpoint deliberately returns JSON body even on provider failure.
         return jsonify(result), 200
+
+
+@app.get("/structure-guard-status")
+def structure_guard_status_endpoint():
+    try:
+        s = build_signal()
+        e = evaluate_entry_signal(s)
+        rp = s.get("risk_plan") or {}
+        side = str(s.get("signal", "NO_TRADE")).upper()
+        entry = safe_float(rp.get("entry"))
+        guard = None
+        if side in ("BUY", "SELL") and entry is not None:
+            guard = support_resistance_retest_guard(side, entry, s)
+        return jsonify({
+            "status": "ok",
+            "version": APP_VERSION,
+            "signal": {
+                "signal": s.get("signal"),
+                "score": s.get("score"),
+                "directional_scores": s.get("directional_scores"),
+                "price": s.get("price"),
+                "trend": s.get("trend"),
+                "risk_plan": rp,
+            },
+            "entry": e,
+            "structure_guard": guard,
+            "api_runtime": api_runtime_snapshot(),
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "version": APP_VERSION,
+            "error": f"{type(e).__name__}: {e}",
+            "api_runtime": api_runtime_snapshot(),
+        }), 200
 
 
 @app.get("/early-status")
