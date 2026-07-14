@@ -11,7 +11,7 @@ import numpy as np
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.5.9-reversal-momentum-watch"
+APP_VERSION = "6.5.10-move-alert-live-price-delay-guard"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -59,6 +59,15 @@ MOVE_ALERT_INTERVALS = [x.strip() for x in os.getenv("MOVE_ALERT_INTERVALS", "5m
 MOVE_BODY_ATR_MIN = float(os.getenv("MOVE_BODY_ATR_MIN", "0.85"))
 MOVE_RANGE_ATR_MIN = float(os.getenv("MOVE_RANGE_ATR_MIN", "1.00"))
 MOVE_BODY_RATIO_MIN = float(os.getenv("MOVE_BODY_RATIO_MIN", "0.55"))
+
+# Move Alert Live Price / Delay Guard
+LIVE_PRICE_IN_MOVE_ALERT = env_bool("LIVE_PRICE_IN_MOVE_ALERT", True)
+MOVE_ALERT_DELAY_GUARD_ENABLED = env_bool("MOVE_ALERT_DELAY_GUARD_ENABLED", True)
+MOVE_ALERT_EXECUTION_WARNING = env_bool("MOVE_ALERT_EXECUTION_WARNING", True)
+MOVE_ALERT_LIVE_PRICE_INTERVAL = os.getenv("MOVE_ALERT_LIVE_PRICE_INTERVAL", "5min")
+MAX_MOVE_ALERT_DRIFT_POINTS = float(os.getenv("MAX_MOVE_ALERT_DRIFT_POINTS", "6"))
+MOVE_ALERT_RETEST_ZONE_POINTS = float(os.getenv("MOVE_ALERT_RETEST_ZONE_POINTS", "10"))
+MOVE_ALERT_NO_CHASE_H1 = env_bool("MOVE_ALERT_NO_CHASE_H1", True)
 
 
 # Smart Multi-Timeframe Cache / Quota Guard
@@ -180,6 +189,15 @@ TELEGRAM_STATUS: Dict[str, Any] = {
     "bot_username": None,
 }
 LAST_MOVE_ALERT_KEYS: set = set()
+LAST_MOVE_ALERT_STATUS: Dict[str, Any] = {
+    "version": APP_VERSION,
+    "last_run_utc": None,
+    "last_success_utc": None,
+    "last_error": None,
+    "last_alerts_count": 0,
+    "last_sent_count": 0,
+    "last_moves": [],
+}
 
 LAST_ENTRY_ALERT_KEY: Optional[str] = None
 LAST_ENTRY_ALERT_TS: float = 0.0
@@ -520,6 +538,15 @@ def fast_check_status_snapshot() -> Dict[str, Any]:
         "enabled": FAST_CHECK_ENABLED,
         "fast_check_interval_minutes": FAST_CHECK_INTERVAL_MINUTES,
         "move_alert_check_interval_minutes": MOVE_ALERT_CHECK_INTERVAL_MINUTES,
+        "live_price_in_move_alert": LIVE_PRICE_IN_MOVE_ALERT,
+        "move_alert_delay_guard_enabled": MOVE_ALERT_DELAY_GUARD_ENABLED,
+        "move_alert_live_price_interval": MOVE_ALERT_LIVE_PRICE_INTERVAL,
+        "max_move_alert_drift_points": MAX_MOVE_ALERT_DRIFT_POINTS,
+        "move_alert_execution_warning": MOVE_ALERT_EXECUTION_WARNING,
+        "last_move_alert_error": LAST_MOVE_ALERT_STATUS.get("last_error"),
+        "last_move_alert_success_utc": LAST_MOVE_ALERT_STATUS.get("last_success_utc"),
+        "last_move_alerts_count": LAST_MOVE_ALERT_STATUS.get("last_alerts_count"),
+        "last_move_alert_sent_count": LAST_MOVE_ALERT_STATUS.get("last_sent_count"),
         "cache_ttl_seconds": dict(CACHE_TTL_SECONDS),
         "cache_max_rows_per_interval": CACHE_MAX_ROWS_PER_INTERVAL,
         "entry_signal_enabled": ENTRY_SIGNAL_ENABLED,
@@ -909,6 +936,154 @@ def build_signal() -> Dict[str, Any]:
     }
 
 
+def move_alert_live_price() -> Dict[str, Any]:
+    """
+    Fast live reference for move alerts.
+    Uses last closed M5 candle by default, protected by Smart Cache / Quota Guard.
+    """
+    result: Dict[str, Any] = {
+        "enabled": LIVE_PRICE_IN_MOVE_ALERT,
+        "interval": MOVE_ALERT_LIVE_PRICE_INTERVAL,
+        "ok": False,
+        "price": None,
+        "datetime": None,
+        "source": "unavailable",
+        "error": None,
+    }
+
+    if not LIVE_PRICE_IN_MOVE_ALERT:
+        result["source"] = "disabled"
+        return result
+
+    try:
+        df = fetch_ohlc(MOVE_ALERT_LIVE_PRICE_INTERVAL, 80)
+        if df is None or df.empty:
+            raise RuntimeError("No live price rows returned")
+        last = df.iloc[-1]
+        result.update({
+            "ok": True,
+            "price": round(float(last.close), 2),
+            "datetime": str(last.datetime),
+            "source": f"last_closed_{MOVE_ALERT_LIVE_PRICE_INTERVAL}",
+        })
+        return result
+    except Exception as e:
+        result.update({
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+        })
+        return result
+
+
+def move_alert_delay_guard(move: Dict[str, Any], live: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Adds execution context:
+    - alert candle close price,
+    - current/live M5 price,
+    - drift from alert,
+    - instruction whether not to chase the move.
+    """
+    result: Dict[str, Any] = {
+        "enabled": MOVE_ALERT_DELAY_GUARD_ENABLED,
+        "status": "ok",
+        "no_chase": False,
+        "reason": None,
+        "instruction": None,
+    }
+
+    if not MOVE_ALERT_DELAY_GUARD_ENABLED:
+        result["status"] = "disabled"
+        return result
+
+    try:
+        live = live or move_alert_live_price()
+        result["live_price"] = live
+
+        alert_price = safe_float(move.get("price"))
+        live_price = safe_float(live.get("price")) if live else None
+
+        if alert_price is None or live_price is None:
+            result.update({
+                "status": "no_live_price",
+                "reason": "Brak live price do porównania.",
+                "instruction": "Traktuj alert jako kontekst zmienności, nie jako sygnał wejścia.",
+            })
+            return result
+
+        drift = float(live_price) - float(alert_price)
+        direction = str(move.get("direction", "")).upper()
+        interval = str(move.get("interval", ""))
+
+        favorable_drift = 0.0
+        if direction == "DÓŁ":
+            favorable_drift = float(alert_price) - float(live_price)
+        elif direction == "GÓRĘ":
+            favorable_drift = float(live_price) - float(alert_price)
+
+        result.update({
+            "alert_price": round(float(alert_price), 2),
+            "live_price_value": round(float(live_price), 2),
+            "drift_points": round(float(drift), 2),
+            "favorable_drift_points": round(float(favorable_drift), 2),
+            "max_allowed_drift_points": MAX_MOVE_ALERT_DRIFT_POINTS,
+        })
+
+        if favorable_drift >= MAX_MOVE_ALERT_DRIFT_POINTS:
+            if direction == "DÓŁ":
+                retest_low = round(float(live_price), 2)
+                retest_high = round(float(alert_price) + MOVE_ALERT_RETEST_ZONE_POINTS, 2)
+                instruction = (
+                    f"Ruch spadkowy jest już rozwinięty. Nie gonić SELL market. "
+                    f"Czekać na retest ok. {round(float(alert_price), 2)}–{retest_high} "
+                    f"i odrzucenie albo na nowy setup."
+                )
+            else:
+                retest_low = round(float(alert_price) - MOVE_ALERT_RETEST_ZONE_POINTS, 2)
+                retest_high = round(float(live_price), 2)
+                instruction = (
+                    f"Ruch wzrostowy jest już rozwinięty. Nie gonić BUY market. "
+                    f"Czekać na retest ok. {retest_low}–{round(float(alert_price), 2)} "
+                    f"i utrzymanie albo na nowy setup."
+                )
+
+            result.update({
+                "status": "delayed_no_chase",
+                "no_chase": True,
+                "reason": (
+                    f"Cena oddaliła się od poziomu alertu o {round(float(favorable_drift), 2)} pkt, "
+                    f"więcej niż limit {MAX_MOVE_ALERT_DRIFT_POINTS} pkt."
+                ),
+                "instruction": instruction,
+            })
+            return result
+
+        # H1 alerts are slower by design. Mark them as confirmation rather than trigger.
+        if MOVE_ALERT_NO_CHASE_H1 and interval == "1h":
+            result.update({
+                "status": "h1_context_confirmation",
+                "no_chase": True,
+                "reason": "Alert H1 jest potwierdzeniem momentum po zamknięciu świecy, nie szybkim triggerem wejścia.",
+                "instruction": "Dla wejścia poczekaj na retest albo potwierdzenie na M5/M15.",
+            })
+            return result
+
+        result.update({
+            "status": "fresh_enough",
+            "no_chase": False,
+            "reason": "Cena nie uciekła istotnie od poziomu alertu.",
+            "instruction": "Nadal traktuj to jako alert zmienności, nie automatyczny sygnał BUY/SELL.",
+        })
+        return result
+
+    except Exception as e:
+        result.update({
+            "status": "guard_error",
+            "reason": f"{type(e).__name__}: {e}",
+            "instruction": "Traktuj alert jako kontekst zmienności, nie jako sygnał wejścia.",
+        })
+        return result
+
+
 def detect_big_move(interval: str) -> Optional[Dict[str, Any]]:
     df = add_indicators(fetch_ohlc(interval, 80))
     if len(df) < 20:
@@ -925,7 +1100,8 @@ def detect_big_move(interval: str) -> Optional[Dict[str, Any]]:
     if body_atr >= MOVE_BODY_ATR_MIN or (range_atr >= MOVE_RANGE_ATR_MIN and body_ratio >= MOVE_BODY_RATIO_MIN):
         direction = "GÓRĘ" if body > 0 else "DÓŁ"
         quality = "EXTREME" if body_atr >= 1.4 or range_atr >= 1.6 else "ELEVATED"
-        return {
+        live = move_alert_live_price()
+        move = {
             "interval": interval,
             "direction": direction,
             "price": round(float(last.close), 2),
@@ -935,37 +1111,88 @@ def detect_big_move(interval: str) -> Optional[Dict[str, Any]]:
             "body_ratio": round(body_ratio, 2),
             "quality": quality,
             "datetime": str(last.datetime),
+            "live_price": live,
         }
+        move["delay_guard"] = move_alert_delay_guard(move, live)
+        return move
     return None
 
 
 def format_move_alert(m: Dict[str, Any]) -> str:
+    live = m.get("live_price") or {}
+    dg = m.get("delay_guard") or {}
+
+    live_text = ""
+    if LIVE_PRICE_IN_MOVE_ALERT:
+        live_text = (
+            f"\nCena aktualna ({live.get('source', MOVE_ALERT_LIVE_PRICE_INTERVAL)}): {live.get('price')}\n"
+            f"Różnica live vs alert: {dg.get('drift_points')} pkt | "
+            f"Ruch po alercie w kierunku świecy: {dg.get('favorable_drift_points')} pkt\n"
+        )
+
+    execution_text = ""
+    if MOVE_ALERT_EXECUTION_WARNING:
+        if dg.get("no_chase"):
+            execution_text = (
+                f"\n🚫 Execution Guard: {dg.get('status')}\n"
+                f"Powód: {dg.get('reason')}\n"
+                f"Instrukcja: {dg.get('instruction')}\n"
+            )
+        else:
+            execution_text = (
+                f"\n🟡 Execution Guard: {dg.get('status')}\n"
+                f"Instrukcja: {dg.get('instruction')}\n"
+            )
+
     return (
         f"💥 GOLD MOVE ALERT — MOCNY RUCH W {m['direction']}\n"
         f"Symbol: {SYMBOL} | Interwał: {m['interval']}\n"
-        f"Poziom: {m['price']} | Zmiana świecy: {m['candle_change']} pkt\n"
+        f"Poziom świecy alertowej: {m['price']} | Zmiana świecy: {m['candle_change']} pkt\n"
         f"Body/ATR: {m['body_atr']} | Range/ATR: {m['range_atr']}\n"
-        f"Jakość ruchu: {m['quality']} | Body ratio: {m['body_ratio']}\n\n"
+        f"Jakość ruchu: {m['quality']} | Body ratio: {m['body_ratio']}\n"
+        f"Świeca alertowa: {m.get('datetime')}"
+        f"{live_text}"
+        f"{execution_text}\n"
         f"⚠️ To jest alert zmienności, nie automatyczny sygnał BUY/SELL."
     )
 
 
 def check_move_alerts() -> None:
-    global LAST_MOVE_ALERT_KEYS
+    global LAST_MOVE_ALERT_KEYS, LAST_MOVE_ALERT_STATUS
+    LAST_MOVE_ALERT_STATUS["last_run_utc"] = now_utc()
+
     if not MOVE_ALERT_ENABLED:
+        LAST_MOVE_ALERT_STATUS["last_error"] = "MOVE_ALERT_ENABLED=false"
         return
+
+    moves: List[Dict[str, Any]] = []
+    sent_count = 0
+
     for interval in MOVE_ALERT_INTERVALS:
         try:
             move = detect_big_move(interval)
             if not move:
                 continue
+
+            moves.append(move)
             key = f"{interval}:{move['datetime']}:{move['direction']}"
             if key not in LAST_MOVE_ALERT_KEYS:
                 send_telegram(format_move_alert(move))
+                sent_count += 1
                 LAST_MOVE_ALERT_KEYS.add(key)
                 LAST_MOVE_ALERT_KEYS = set(list(LAST_MOVE_ALERT_KEYS)[-50:])
         except Exception as e:
+            LAST_MOVE_ALERT_STATUS["last_error"] = f"MOVE ALERT ERROR {interval}: {type(e).__name__}: {e}"
             print(f"MOVE ALERT ERROR {interval}: {e}")
+
+    LAST_MOVE_ALERT_STATUS.update({
+        "version": APP_VERSION,
+        "last_success_utc": now_utc(),
+        "last_alerts_count": len(moves),
+        "last_sent_count": sent_count,
+        "last_moves": moves[-5:],
+        "last_error": LAST_MOVE_ALERT_STATUS.get("last_error") if not moves and sent_count == 0 else None,
+    })
 
 
 def format_signal(s: Dict[str, Any]) -> str:
@@ -3098,6 +3325,7 @@ def quota_status_endpoint():
     })
 
 
+@app.get("/quota-reset")
 @app.post("/quota-reset")
 def quota_reset_endpoint():
     API_RUNTIME["blocked_until_ts"] = 0.0
@@ -3202,6 +3430,38 @@ def tick_endpoint():
         return jsonify(result), 200
 
 
+@app.get("/move-alert-status")
+def move_alert_status_endpoint():
+    return jsonify({
+        "status": "ok",
+        "version": APP_VERSION,
+        "move_alert_config": {
+            "enabled": MOVE_ALERT_ENABLED,
+            "intervals": MOVE_ALERT_INTERVALS,
+            "live_price_in_move_alert": LIVE_PRICE_IN_MOVE_ALERT,
+            "delay_guard_enabled": MOVE_ALERT_DELAY_GUARD_ENABLED,
+            "live_price_interval": MOVE_ALERT_LIVE_PRICE_INTERVAL,
+            "max_drift_points": MAX_MOVE_ALERT_DRIFT_POINTS,
+            "retest_zone_points": MOVE_ALERT_RETEST_ZONE_POINTS,
+            "no_chase_h1": MOVE_ALERT_NO_CHASE_H1,
+        },
+        "last_move_alert_status": LAST_MOVE_ALERT_STATUS,
+        "api_runtime": api_runtime_snapshot(),
+    })
+
+
+@app.get("/move-alert-run-now")
+@app.post("/move-alert-run-now")
+def move_alert_run_now_endpoint():
+    check_move_alerts()
+    return jsonify({
+        "status": "ok",
+        "version": APP_VERSION,
+        "last_move_alert_status": LAST_MOVE_ALERT_STATUS,
+        "api_runtime": api_runtime_snapshot(),
+    })
+
+
 @app.get("/reversal-status")
 def reversal_status_endpoint():
     try:
@@ -3223,6 +3483,7 @@ def reversal_status_endpoint():
         }), 200
 
 
+@app.get("/reversal-run-now")
 @app.post("/reversal-run-now")
 def reversal_run_now_endpoint():
     try:
@@ -3391,6 +3652,7 @@ def signal_now_endpoint():
         }), 200
 
 
+@app.get("/entry-exit-run-now")
 @app.post("/entry-exit-run-now")
 def entry_exit_run_now_endpoint():
     entry_exit_signal_job()
