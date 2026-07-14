@@ -11,7 +11,7 @@ import numpy as np
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.5.8-support-resistance-retest-guard"
+APP_VERSION = "6.5.9-reversal-momentum-watch"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -140,6 +140,30 @@ IMPULSE_GUARD_INTERVAL = os.getenv("IMPULSE_GUARD_INTERVAL", "1h")
 RETEST_ZONE_POINTS = float(os.getenv("RETEST_ZONE_POINTS", "10"))
 RETEST_LOOKBACK_CANDLES = int(os.getenv("RETEST_LOOKBACK_CANDLES", "48"))
 
+# Reversal / Momentum Watch
+REVERSAL_WATCH_ENABLED = env_bool("REVERSAL_WATCH_ENABLED", True)
+MOMENTUM_WATCH_ENABLED = env_bool("MOMENTUM_WATCH_ENABLED", True)
+REVERSAL_MOMENTUM_CHECK_INTERVAL_MINUTES = int(os.getenv("REVERSAL_MOMENTUM_CHECK_INTERVAL_MINUTES", "1"))
+REVERSAL_ALERT_COOLDOWN_MINUTES = int(os.getenv("REVERSAL_ALERT_COOLDOWN_MINUTES", "20"))
+
+MOMENTUM_BODY_ATR_MIN = float(os.getenv("MOMENTUM_BODY_ATR_MIN", "0.70"))
+MOMENTUM_RANGE_ATR_MIN = float(os.getenv("MOMENTUM_RANGE_ATR_MIN", "1.00"))
+MOMENTUM_BODY_RATIO_MIN = float(os.getenv("MOMENTUM_BODY_RATIO_MIN", "0.55"))
+MOMENTUM_INTERVALS = [
+    x.strip() for x in os.getenv("MOMENTUM_INTERVALS", "5min,15min").split(",") if x.strip()
+]
+
+REVERSAL_FROM_ROUND_LEVEL_ENABLED = env_bool("REVERSAL_FROM_ROUND_LEVEL_ENABLED", True)
+REVERSAL_ROUND_LEVEL_ZONE_POINTS = float(os.getenv("REVERSAL_ROUND_LEVEL_ZONE_POINTS", "15"))
+REVERSAL_MIN_BOUNCE_POINTS = float(os.getenv("REVERSAL_MIN_BOUNCE_POINTS", "18"))
+REVERSAL_LOOKBACK_CANDLES = int(os.getenv("REVERSAL_LOOKBACK_CANDLES", "36"))
+
+ALERT_WHEN_M15_FLIPS = env_bool("ALERT_WHEN_M15_FLIPS", True)
+ALERT_ON_STRONG_MOVE_WITH_NO_ENTRY = env_bool("ALERT_ON_STRONG_MOVE_WITH_NO_ENTRY", True)
+SELL_INVALIDATION_ON_BULLISH_REVERSAL = env_bool("SELL_INVALIDATION_ON_BULLISH_REVERSAL", True)
+BUY_INVALIDATION_ON_BEARISH_REVERSAL = env_bool("BUY_INVALIDATION_ON_BEARISH_REVERSAL", True)
+REVERSAL_WARN_OPEN_POSITIONS = env_bool("REVERSAL_WARN_OPEN_POSITIONS", True)
+
 app = Flask(__name__)
 LAST_SIGNAL: Dict[str, Any] = {"status": "starting", "version": APP_VERSION}
 LAST_ALERT_KEY: Optional[str] = None
@@ -165,6 +189,16 @@ LAST_MISSED_ALERT_KEY: Optional[str] = None
 LAST_MISSED_ALERT_TS: float = 0.0
 LAST_WAIT_RETEST_ALERT_KEY: Optional[str] = None
 LAST_WAIT_RETEST_ALERT_TS: float = 0.0
+LAST_REVERSAL_ALERT_KEYS: Dict[str, float] = {}
+LAST_REVERSAL_STATUS: Dict[str, Any] = {
+    "version": APP_VERSION,
+    "last_run_utc": None,
+    "last_success_utc": None,
+    "last_error": None,
+    "last_events_count": 0,
+    "last_sent_count": 0,
+    "last_events": [],
+}
 LAST_EXIT_ALERT_KEYS: Dict[str, float] = {}
 LAST_ENTRY_EXIT_STATUS: Dict[str, Any] = {
     "version": APP_VERSION,
@@ -510,6 +544,16 @@ def fast_check_status_snapshot() -> Dict[str, Any]:
         "max_impulse_atr_before_entry": MAX_IMPULSE_ATR_BEFORE_ENTRY,
         "no_sell_near_support": NO_SELL_NEAR_SUPPORT,
         "no_buy_near_resistance": NO_BUY_NEAR_RESISTANCE,
+        "reversal_watch_enabled": REVERSAL_WATCH_ENABLED,
+        "momentum_watch_enabled": MOMENTUM_WATCH_ENABLED,
+        "reversal_momentum_check_interval_minutes": REVERSAL_MOMENTUM_CHECK_INTERVAL_MINUTES,
+        "momentum_body_atr_min": MOMENTUM_BODY_ATR_MIN,
+        "momentum_range_atr_min": MOMENTUM_RANGE_ATR_MIN,
+        "reversal_alert_cooldown_minutes": REVERSAL_ALERT_COOLDOWN_MINUTES,
+        "last_reversal_error": LAST_REVERSAL_STATUS.get("last_error"),
+        "last_reversal_success_utc": LAST_REVERSAL_STATUS.get("last_success_utc"),
+        "last_reversal_events_count": LAST_REVERSAL_STATUS.get("last_events_count"),
+        "last_reversal_sent_count": LAST_REVERSAL_STATUS.get("last_sent_count"),
         "last_entry_exit_error": LAST_ENTRY_EXIT_STATUS.get("last_error"),
         "last_entry_exit_success_utc": LAST_ENTRY_EXIT_STATUS.get("last_success_utc"),
         "cache_cleanup_interval_minutes": CACHE_CLEANUP_INTERVAL_MINUTES,
@@ -2116,6 +2160,461 @@ def should_send_exit_alert(event: Dict[str, Any]) -> bool:
     return True
 
 
+
+def _last_candle_momentum(interval: str) -> Optional[Dict[str, Any]]:
+    try:
+        df = add_indicators(fetch_ohlc(interval, 80))
+        if df is None or len(df) < 20:
+            return None
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        body = float(last.close - last.open)
+        rng = float(last.high - last.low)
+        atr_value = float(last.atr14)
+
+        if atr_value <= 0 or rng <= 0:
+            return None
+
+        body_atr = abs(body) / atr_value
+        range_atr = rng / atr_value
+        body_ratio = abs(body) / rng
+        direction = "BUY" if body > 0 else "SELL"
+
+        strong = (
+            body_atr >= MOMENTUM_BODY_ATR_MIN
+            or (range_atr >= MOMENTUM_RANGE_ATR_MIN and body_ratio >= MOMENTUM_BODY_RATIO_MIN)
+        )
+
+        return {
+            "interval": interval,
+            "strong": bool(strong),
+            "direction": direction,
+            "datetime": str(last.datetime),
+            "open": round(float(last.open), 2),
+            "high": round(float(last.high), 2),
+            "low": round(float(last.low), 2),
+            "close": round(float(last.close), 2),
+            "prev_close": round(float(prev.close), 2),
+            "candle_change": round(float(body), 2),
+            "body_atr": round(float(body_atr), 2),
+            "range_atr": round(float(range_atr), 2),
+            "body_ratio": round(float(body_ratio), 2),
+            "atr": round(float(atr_value), 2),
+        }
+    except Exception as e:
+        return {
+            "interval": interval,
+            "strong": False,
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
+def _detect_reversal_from_round_level(direction: str) -> Dict[str, Any]:
+    """
+    Detects bounce/rejection near a major round level using M5 data.
+    BUY reversal: recent low near round support, price bounced enough.
+    SELL reversal: recent high near round resistance, price dropped enough.
+    """
+    result: Dict[str, Any] = {
+        "enabled": REVERSAL_FROM_ROUND_LEVEL_ENABLED,
+        "detected": False,
+        "direction": direction,
+        "reason": None,
+    }
+
+    if not REVERSAL_FROM_ROUND_LEVEL_ENABLED:
+        result["reason"] = "disabled"
+        return result
+
+    try:
+        lookback = max(20, REVERSAL_LOOKBACK_CANDLES)
+        df = add_indicators(fetch_ohlc("5min", lookback + 20))
+        recent = df.tail(lookback).reset_index(drop=True)
+        if recent is None or len(recent) < 10:
+            result["reason"] = "not enough M5 data"
+            return result
+
+        last_close = float(recent.close.iloc[-1])
+
+        if direction == "BUY":
+            idx_low = int(recent.low.idxmin())
+            low_row = recent.loc[idx_low]
+            extreme = float(low_row.low)
+            round_level = nearest_round_level(extreme, STRONG_ROUND_LEVEL_STEP_POINTS) or nearest_round_level(extreme, ROUND_LEVEL_STEP_POINTS)
+            dist = abs(extreme - float(round_level)) if round_level is not None else None
+            bounce = last_close - extreme
+
+            result.update({
+                "extreme": round(extreme, 2),
+                "round_level": round(float(round_level), 2) if round_level is not None else None,
+                "distance_to_round_level": round(float(dist), 2) if dist is not None else None,
+                "bounce_points": round(float(bounce), 2),
+                "extreme_datetime": str(low_row.datetime),
+                "last_close": round(last_close, 2),
+            })
+
+            if round_level is not None and dist <= REVERSAL_ROUND_LEVEL_ZONE_POINTS and bounce >= REVERSAL_MIN_BOUNCE_POINTS:
+                result.update({
+                    "detected": True,
+                    "reason": (
+                        f"Strong bounce {round(bounce, 2)} pts from round/support level "
+                        f"{round(float(round_level), 2)}."
+                    ),
+                })
+            else:
+                result["reason"] = "no strong bounce from round level"
+
+        else:
+            idx_high = int(recent.high.idxmax())
+            high_row = recent.loc[idx_high]
+            extreme = float(high_row.high)
+            round_level = nearest_round_level(extreme, STRONG_ROUND_LEVEL_STEP_POINTS) or nearest_round_level(extreme, ROUND_LEVEL_STEP_POINTS)
+            dist = abs(extreme - float(round_level)) if round_level is not None else None
+            drop = extreme - last_close
+
+            result.update({
+                "extreme": round(extreme, 2),
+                "round_level": round(float(round_level), 2) if round_level is not None else None,
+                "distance_to_round_level": round(float(dist), 2) if dist is not None else None,
+                "drop_points": round(float(drop), 2),
+                "extreme_datetime": str(high_row.datetime),
+                "last_close": round(last_close, 2),
+            })
+
+            if round_level is not None and dist <= REVERSAL_ROUND_LEVEL_ZONE_POINTS and drop >= REVERSAL_MIN_BOUNCE_POINTS:
+                result.update({
+                    "detected": True,
+                    "reason": (
+                        f"Strong rejection {round(drop, 2)} pts from round/resistance level "
+                        f"{round(float(round_level), 2)}."
+                    ),
+                })
+            else:
+                result["reason"] = "no strong rejection from round level"
+
+        return result
+
+    except Exception as e:
+        result.update({
+            "detected": False,
+            "reason": f"{type(e).__name__}: {e}",
+        })
+        return result
+
+
+def _m15_flip_event(current_signal: Dict[str, Any], direction: str) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "enabled": ALERT_WHEN_M15_FLIPS,
+        "detected": False,
+        "direction": direction,
+        "reason": None,
+    }
+
+    if not ALERT_WHEN_M15_FLIPS:
+        result["reason"] = "disabled"
+        return result
+
+    try:
+        m15 = add_indicators(fetch_ohlc("15min", 80))
+        if len(m15) < 25:
+            result["reason"] = "not enough M15 data"
+            return result
+
+        # Current trend from existing signal + simple earlier trend sample.
+        current_trend = (current_signal.get("trend") or {}).get("M15")
+        prior = m15.iloc[:-3].copy()
+        prior_trend = trend(prior) if len(prior) > 20 else "NEUTRAL"
+
+        result.update({
+            "current_trend": current_trend,
+            "prior_trend": prior_trend,
+        })
+
+        if direction == "BUY" and current_trend == "UP" and prior_trend != "UP":
+            result.update({
+                "detected": True,
+                "reason": f"M15 flipped from {prior_trend} to UP.",
+            })
+        elif direction == "SELL" and current_trend == "DOWN" and prior_trend != "DOWN":
+            result.update({
+                "detected": True,
+                "reason": f"M15 flipped from {prior_trend} to DOWN.",
+            })
+        else:
+            result["reason"] = "no M15 flip"
+
+        return result
+
+    except Exception as e:
+        result.update({
+            "detected": False,
+            "reason": f"{type(e).__name__}: {e}",
+        })
+        return result
+
+
+def _open_position_warnings(direction: str, price: float) -> List[Dict[str, Any]]:
+    warnings: List[Dict[str, Any]] = []
+    if not REVERSAL_WARN_OPEN_POSITIONS:
+        return warnings
+
+    try:
+        positions = load_positions()
+        for p in positions:
+            side = str(p.get("side", "")).upper()
+            pid = p.get("id")
+            entry = safe_float(p.get("entry"))
+            if direction == "BUY" and side == "SELL" and SELL_INVALIDATION_ON_BULLISH_REVERSAL:
+                warnings.append({
+                    "type": "SELL_INVALIDATED_BY_BULLISH_REVERSAL",
+                    "position_id": pid,
+                    "side": side,
+                    "entry": entry,
+                    "price": round(float(price), 2),
+                    "message": "Masz zapisaną pozycję SELL, a rynek wykazuje silne momentum BUY.",
+                })
+            if direction == "SELL" and side == "BUY" and BUY_INVALIDATION_ON_BEARISH_REVERSAL:
+                warnings.append({
+                    "type": "BUY_INVALIDATED_BY_BEARISH_REVERSAL",
+                    "position_id": pid,
+                    "side": side,
+                    "entry": entry,
+                    "price": round(float(price), 2),
+                    "message": "Masz zapisaną pozycję BUY, a rynek wykazuje silne momentum SELL.",
+                })
+    except Exception:
+        pass
+
+    return warnings
+
+
+def detect_reversal_momentum_watch(current_signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Warning layer independent of final ENTRY SIGNAL.
+    It can trigger even when main signal is NO_TRADE.
+    """
+    current_signal = current_signal or build_signal()
+    result: Dict[str, Any] = {
+        "enabled": REVERSAL_WATCH_ENABLED or MOMENTUM_WATCH_ENABLED,
+        "valid": False,
+        "status": "no_reversal_watch",
+        "events": [],
+        "reason": None,
+        "signal_context": {
+            "signal": current_signal.get("signal"),
+            "score": current_signal.get("score"),
+            "directional_scores": current_signal.get("directional_scores"),
+            "price": current_signal.get("price"),
+            "trend": current_signal.get("trend"),
+        },
+    }
+
+    if not result["enabled"]:
+        result.update({"status": "disabled", "reason": "REVERSAL/MOMENTUM watch disabled"})
+        return result
+
+    try:
+        trends = current_signal.get("trend") or {}
+        main_signal = str(current_signal.get("signal", "NO_TRADE")).upper()
+        price = safe_float(current_signal.get("price"))
+
+        momentum_candidates: List[Dict[str, Any]] = []
+        for interval in MOMENTUM_INTERVALS:
+            mom = _last_candle_momentum(interval)
+            if mom:
+                momentum_candidates.append(mom)
+
+        result["momentum_candidates"] = momentum_candidates
+
+        strong_momentum = [m for m in momentum_candidates if m.get("strong")]
+        events: List[Dict[str, Any]] = []
+
+        for mom in strong_momentum:
+            direction = mom.get("direction")
+            if direction not in ("BUY", "SELL"):
+                continue
+
+            # Avoid duplicating a final clean entry signal. This module is mainly warning/no-chase.
+            if main_signal == direction and not ALERT_ON_STRONG_MOVE_WITH_NO_ENTRY:
+                continue
+
+            reversal_round = _detect_reversal_from_round_level(direction)
+            m15_flip = _m15_flip_event(current_signal, direction)
+
+            event_type = "MOMENTUM_SPIKE"
+            if reversal_round.get("detected"):
+                event_type = "REVERSAL_WATCH"
+            elif m15_flip.get("detected"):
+                event_type = "MOMENTUM_WATCH_M15_FLIP"
+
+            event_price = safe_float(mom.get("close")) or price
+            warnings = _open_position_warnings(direction, float(event_price or 0))
+
+            # Suggested plan: no market chase; wait for retest.
+            if direction == "BUY":
+                retest_low = round(float(event_price) - RETEST_ZONE_POINTS, 2) if event_price is not None else None
+                retest_high = round(float(event_price), 2) if event_price is not None else None
+                instruction = (
+                    f"Nie gonić BUY po impulsie. Czekać na retest/utrzymanie ok. "
+                    f"{retest_low}-{retest_high} albo wybicie kolejnego oporu."
+                )
+            else:
+                retest_low = round(float(event_price), 2) if event_price is not None else None
+                retest_high = round(float(event_price) + RETEST_ZONE_POINTS, 2) if event_price is not None else None
+                instruction = (
+                    f"Nie gonić SELL po impulsie. Czekać na retest/odrzucenie ok. "
+                    f"{retest_low}-{retest_high} albo wybicie kolejnego wsparcia."
+                )
+
+            events.append({
+                "type": event_type,
+                "direction": direction,
+                "interval": mom.get("interval"),
+                "datetime": mom.get("datetime"),
+                "price": round(float(event_price), 2) if event_price is not None else None,
+                "body_atr": mom.get("body_atr"),
+                "range_atr": mom.get("range_atr"),
+                "body_ratio": mom.get("body_ratio"),
+                "candle_change": mom.get("candle_change"),
+                "trend": trends,
+                "main_signal": main_signal,
+                "reversal_from_round_level": reversal_round,
+                "m15_flip": m15_flip,
+                "open_position_warnings": warnings,
+                "instruction": instruction,
+                "dedupe_key": (
+                    f"{event_type}:{direction}:{mom.get('interval')}:{mom.get('datetime')}:"
+                    f"{round(float(event_price), 2) if event_price is not None else 'na'}"
+                ),
+            })
+
+        if events:
+            result.update({
+                "valid": True,
+                "status": "reversal_momentum_watch",
+                "events": events,
+                "reason": f"{len(events)} reversal/momentum event(s) detected",
+            })
+        else:
+            result.update({
+                "valid": False,
+                "status": "no_reversal_watch",
+                "reason": "no strong momentum/reversal event detected",
+            })
+
+        return result
+
+    except Exception as e:
+        result.update({
+            "valid": False,
+            "status": "error",
+            "reason": f"{type(e).__name__}: {e}",
+        })
+        return result
+
+
+def format_reversal_momentum_alert(event: Dict[str, Any]) -> str:
+    direction = event.get("direction")
+    icon = "🟠" if event.get("type") == "REVERSAL_WATCH" else "🚀"
+    title_direction = "BUY PRESSURE" if direction == "BUY" else "SELL PRESSURE"
+
+    warnings = event.get("open_position_warnings") or []
+    warnings_text = ""
+    if warnings:
+        warnings_lines = []
+        for w in warnings[:3]:
+            warnings_lines.append(
+                f"⚠️ {w.get('type')} | pozycja #{w.get('position_id')} {w.get('side')} "
+                f"entry {w.get('entry')} | {w.get('message')}"
+            )
+        warnings_text = "\n\nOtwarte pozycje:\n" + "\n".join(warnings_lines)
+
+    rr = event.get("reversal_from_round_level") or {}
+    m15 = event.get("m15_flip") or {}
+
+    return (
+        f"{icon} GOLD {event.get('type')} — {title_direction}\n\n"
+        f"Symbol: {SYMBOL}\n"
+        f"Interwał: {event.get('interval')}\n"
+        f"Cena: {event.get('price')}\n"
+        f"Zmiana świecy: {event.get('candle_change')} pkt\n"
+        f"Body/ATR: {event.get('body_atr')} | Range/ATR: {event.get('range_atr')} | Body ratio: {event.get('body_ratio')}\n\n"
+        f"Trend M15/H1/H4/D1: "
+        f"{(event.get('trend') or {}).get('M15')} / {(event.get('trend') or {}).get('H1')} / "
+        f"{(event.get('trend') or {}).get('H4')} / {(event.get('trend') or {}).get('D1')}\n"
+        f"Główny sygnał: {event.get('main_signal')}\n"
+        f"Round-level reversal: {rr.get('detected')} — {rr.get('reason')}\n"
+        f"M15 flip: {m15.get('detected')} — {m15.get('reason')}\n\n"
+        f"Instrukcja: {event.get('instruction')}\n"
+        f"To jest alert ostrzegawczy, nie automatyczne wejście."
+        f"{warnings_text}"
+    )
+
+
+def should_send_reversal_momentum_alert(event: Dict[str, Any]) -> bool:
+    if not (REVERSAL_WATCH_ENABLED or MOMENTUM_WATCH_ENABLED):
+        return False
+
+    key = str(event.get("dedupe_key") or f"{event.get('type')}:{event.get('direction')}:{event.get('price')}")
+    now_ts = _utc_ts()
+    cooldown = max(60, REVERSAL_ALERT_COOLDOWN_MINUTES * 60)
+    last_ts = float(LAST_REVERSAL_ALERT_KEYS.get(key, 0) or 0)
+
+    if now_ts - last_ts < cooldown:
+        return False
+
+    LAST_REVERSAL_ALERT_KEYS[key] = now_ts
+
+    if len(LAST_REVERSAL_ALERT_KEYS) > 200:
+        oldest = sorted(LAST_REVERSAL_ALERT_KEYS.items(), key=lambda x: x[1])[:50]
+        for old_key, _ in oldest:
+            LAST_REVERSAL_ALERT_KEYS.pop(old_key, None)
+
+    return True
+
+
+def reversal_momentum_watch_job(current_signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    global LAST_REVERSAL_STATUS
+
+    LAST_REVERSAL_STATUS["last_run_utc"] = now_utc()
+
+    try:
+        watch = detect_reversal_momentum_watch(current_signal)
+        sent_count = 0
+
+        for event in watch.get("events", []):
+            if should_send_reversal_momentum_alert(event):
+                send_telegram(format_reversal_momentum_alert(event))
+                sent_count += 1
+
+        LAST_REVERSAL_STATUS.update({
+            "version": APP_VERSION,
+            "last_success_utc": now_utc(),
+            "last_error": None,
+            "last_events_count": len(watch.get("events", [])),
+            "last_sent_count": sent_count,
+            "last_events": watch.get("events", [])[:5],
+            "last_status": watch.get("status"),
+        })
+        return watch
+
+    except Exception as e:
+        LAST_REVERSAL_STATUS.update({
+            "version": APP_VERSION,
+            "last_error": f"{type(e).__name__}: {e}",
+            "last_events_count": 0,
+            "last_sent_count": 0,
+        })
+        print(f"REVERSAL/MOMENTUM WATCH ERROR: {type(e).__name__}: {e}")
+        return {
+            "valid": False,
+            "status": "error",
+            "reason": f"{type(e).__name__}: {e}",
+            "events": [],
+        }
+
+
 def entry_exit_signal_job() -> None:
     global LAST_SIGNAL, LAST_ENTRY_EXIT_STATUS
 
@@ -2151,6 +2650,9 @@ def entry_exit_signal_job() -> None:
             send_telegram(format_entry_signal_alert(entry_signal))
             entry_sent = True
 
+        # Independent warning layer: detects reversal/momentum even when main signal is NO_TRADE.
+        reversal_watch = reversal_momentum_watch_job(current_signal)
+
         exit_events = evaluate_exit_signals(current_signal)
         exit_sent_count = 0
         for event in exit_events:
@@ -2167,6 +2669,8 @@ def entry_exit_signal_job() -> None:
             "last_entry_sent": entry_sent,
             "last_missed_sent": missed_sent,
             "last_wait_retest_sent": wait_retest_sent,
+            "last_reversal_watch_status": reversal_watch.get("status"),
+            "last_reversal_events_count": len(reversal_watch.get("events", [])),
             "last_exit_events_count": len(exit_events),
             "last_exit_sent_count": exit_sent_count,
         })
@@ -2190,6 +2694,7 @@ def command_help() -> str:
         "/settp 1 3969 3892 3814 — zmień TP1/TP2/TP3 pozycji #1\n"
         "/signal — wygeneruj aktualny sygnał\n"
         "/early — pokaż wcześniejsze ostrzeżenie SETUP FORMING\n"
+        "/reversal — pokaż alerty reversal/momentum watch\n"
         "/entry — pokaż aktualny sygnał wejścia BUY/SELL albo MISSED TRADE\n"
         "/exit — pokaż sygnały wyjścia/prowadzenia pozycji\n"
         "/signal-now — pełna diagnostyka early + entry + retest guard + exit\n"
@@ -2290,6 +2795,13 @@ def handle_command(text: str, chat_id: str) -> str:
             return format_missed_trade_alert(e)
         return "Brak aktualnego sygnału wejścia. Status: " + str(e.get("status")) + "\nPowód: " + str(e.get("reason"))
 
+    if cmd == "/reversal":
+        s = build_signal()
+        w = detect_reversal_momentum_watch(s)
+        if not w.get("events"):
+            return "Brak aktywnego reversal/momentum watch. Status: " + str(w.get("status")) + "\nPowód: " + str(w.get("reason"))
+        return "📌 Reversal/Momentum Watch:\n\n" + "\n\n".join(format_reversal_momentum_alert(e) for e in w.get("events", [])[:3])
+
     if cmd == "/exit":
         s = build_signal() if EXIT_ON_OPPOSITE_SIGNAL or EXIT_ON_H1_INVALIDATION else None
         events = evaluate_exit_signals(s)
@@ -2315,10 +2827,19 @@ def handle_command(text: str, chat_id: str) -> str:
             entry_text = f"Brak entry. Status: {e.get('status')} | Powód: {e.get('reason')}"
         early_text = format_early_watch_alert(w) if w.get("valid") else f"Brak early watch. Status: {w.get('status')} | Powód: {w.get('reason')}"
 
+        rw = detect_reversal_momentum_watch(s)
+        reversal_text = (
+            "Brak reversal/momentum watch. Status: " + str(rw.get("status")) + " | Powód: " + str(rw.get("reason"))
+            if not rw.get("events")
+            else "\n\n".join(format_reversal_momentum_alert(x) for x in rw.get("events", [])[:3])
+        )
+
         return (
             format_signal(s)
             + "\n\n--- EARLY WATCH ---\n"
             + early_text
+            + "\n\n--- REVERSAL / MOMENTUM WATCH ---\n"
+            + reversal_text
             + "\n\n--- ENTRY ENGINE ---\n"
             + entry_text
             + "\n\n--- EXIT ENGINE ---\n"
@@ -2681,6 +3202,48 @@ def tick_endpoint():
         return jsonify(result), 200
 
 
+@app.get("/reversal-status")
+def reversal_status_endpoint():
+    try:
+        s = build_signal()
+        watch = detect_reversal_momentum_watch(s)
+        return jsonify({
+            "status": "ok",
+            "version": APP_VERSION,
+            "reversal_momentum_watch": watch,
+            "last_reversal_status": LAST_REVERSAL_STATUS,
+            "api_runtime": api_runtime_snapshot(),
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "version": APP_VERSION,
+            "error": f"{type(e).__name__}: {e}",
+            "api_runtime": api_runtime_snapshot(),
+        }), 200
+
+
+@app.post("/reversal-run-now")
+def reversal_run_now_endpoint():
+    try:
+        s = build_signal()
+        watch = reversal_momentum_watch_job(s)
+        return jsonify({
+            "status": "ok",
+            "version": APP_VERSION,
+            "reversal_momentum_watch": watch,
+            "last_reversal_status": LAST_REVERSAL_STATUS,
+            "api_runtime": api_runtime_snapshot(),
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "version": APP_VERSION,
+            "error": f"{type(e).__name__}: {e}",
+            "api_runtime": api_runtime_snapshot(),
+        }), 200
+
+
 @app.get("/structure-guard-status")
 def structure_guard_status_endpoint():
     try:
@@ -2807,12 +3370,14 @@ def signal_now_endpoint():
         s = build_signal()
         e = evaluate_entry_signal(s)
         w = evaluate_early_watch(s, e)
+        rw = detect_reversal_momentum_watch(s)
         events = evaluate_exit_signals(s)
         return jsonify({
             "status": "ok",
             "version": APP_VERSION,
             "signal": s,
             "early_watch": w,
+            "reversal_momentum_watch": rw,
             "entry": e,
             "exit_events": events,
             "api_runtime": api_runtime_snapshot(),
@@ -2938,6 +3503,15 @@ if SCHEDULER_ENABLED:
         "interval",
         minutes=max(1, ENTRY_SIGNAL_CHECK_INTERVAL_MINUTES),
         id="entry_exit_signal_engine",
+        replace_existing=True,
+    )
+
+    # Reversal/Momentum Watch niezależnie od finalnego ENTRY SIGNAL.
+    scheduler.add_job(
+        reversal_momentum_watch_job,
+        "interval",
+        minutes=max(1, REVERSAL_MOMENTUM_CHECK_INTERVAL_MINUTES),
+        id="reversal_momentum_watch",
         replace_existing=True,
     )
 
