@@ -11,7 +11,7 @@ import numpy as np
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.5.10-move-alert-live-price-delay-guard"
+APP_VERSION = "6.5.12-precision-signal-alignment"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -56,9 +56,9 @@ TP_WARNING_DISTANCE_ATR = float(os.getenv("TP_WARNING_DISTANCE_ATR", "0.35"))
 # Big candle / volatility alerts
 MOVE_ALERT_ENABLED = env_bool("MOVE_ALERT_ENABLED", True)
 MOVE_ALERT_INTERVALS = [x.strip() for x in os.getenv("MOVE_ALERT_INTERVALS", "5min,15min,1h").split(",") if x.strip()]
-MOVE_BODY_ATR_MIN = float(os.getenv("MOVE_BODY_ATR_MIN", "0.85"))
-MOVE_RANGE_ATR_MIN = float(os.getenv("MOVE_RANGE_ATR_MIN", "1.00"))
-MOVE_BODY_RATIO_MIN = float(os.getenv("MOVE_BODY_RATIO_MIN", "0.55"))
+MOVE_BODY_ATR_MIN = float(os.getenv("MOVE_BODY_ATR_MIN", "1.20"))
+MOVE_RANGE_ATR_MIN = float(os.getenv("MOVE_RANGE_ATR_MIN", "1.50"))
+MOVE_BODY_RATIO_MIN = float(os.getenv("MOVE_BODY_RATIO_MIN", "0.60"))
 
 # Move Alert Live Price / Delay Guard
 LIVE_PRICE_IN_MOVE_ALERT = env_bool("LIVE_PRICE_IN_MOVE_ALERT", True)
@@ -68,6 +68,20 @@ MOVE_ALERT_LIVE_PRICE_INTERVAL = os.getenv("MOVE_ALERT_LIVE_PRICE_INTERVAL", "5m
 MAX_MOVE_ALERT_DRIFT_POINTS = float(os.getenv("MAX_MOVE_ALERT_DRIFT_POINTS", "6"))
 MOVE_ALERT_RETEST_ZONE_POINTS = float(os.getenv("MOVE_ALERT_RETEST_ZONE_POINTS", "10"))
 MOVE_ALERT_NO_CHASE_H1 = env_bool("MOVE_ALERT_NO_CHASE_H1", True)
+
+# Move Alert Strict Filter — mniej alertów, tylko większe świece
+MOVE_ALERT_STRICT_FILTER_ENABLED = env_bool("MOVE_ALERT_STRICT_FILTER_ENABLED", True)
+MOVE_ALERT_MIN_QUALITY = os.getenv("MOVE_ALERT_MIN_QUALITY", "EXTREME").upper()  # ELEVATED albo EXTREME
+MOVE_ALERT_MIN_BODY_POINTS_5MIN = float(os.getenv("MOVE_ALERT_MIN_BODY_POINTS_5MIN", "5"))
+MOVE_ALERT_MIN_BODY_POINTS_15MIN = float(os.getenv("MOVE_ALERT_MIN_BODY_POINTS_15MIN", "8"))
+MOVE_ALERT_MIN_BODY_POINTS_1H = float(os.getenv("MOVE_ALERT_MIN_BODY_POINTS_1H", "15"))
+MOVE_ALERT_MIN_BODY_POINTS_DEFAULT = float(os.getenv("MOVE_ALERT_MIN_BODY_POINTS_DEFAULT", "8"))
+MOVE_ALERT_MIN_RANGE_POINTS_5MIN = float(os.getenv("MOVE_ALERT_MIN_RANGE_POINTS_5MIN", "7"))
+MOVE_ALERT_MIN_RANGE_POINTS_15MIN = float(os.getenv("MOVE_ALERT_MIN_RANGE_POINTS_15MIN", "12"))
+MOVE_ALERT_MIN_RANGE_POINTS_1H = float(os.getenv("MOVE_ALERT_MIN_RANGE_POINTS_1H", "20"))
+MOVE_ALERT_MIN_RANGE_POINTS_DEFAULT = float(os.getenv("MOVE_ALERT_MIN_RANGE_POINTS_DEFAULT", "12"))
+MOVE_ALERT_REQUIRE_ABSOLUTE_POINTS = env_bool("MOVE_ALERT_REQUIRE_ABSOLUTE_POINTS", True)
+MOVE_ALERT_FILTER_STATUS_ENABLED = env_bool("MOVE_ALERT_FILTER_STATUS_ENABLED", True)
 
 
 # Smart Multi-Timeframe Cache / Quota Guard
@@ -173,6 +187,22 @@ SELL_INVALIDATION_ON_BULLISH_REVERSAL = env_bool("SELL_INVALIDATION_ON_BULLISH_R
 BUY_INVALIDATION_ON_BEARISH_REVERSAL = env_bool("BUY_INVALIDATION_ON_BEARISH_REVERSAL", True)
 REVERSAL_WARN_OPEN_POSITIONS = env_bool("REVERSAL_WARN_OPEN_POSITIONS", True)
 
+# Precision Signal Alignment
+PRECISION_ALIGNMENT_ENABLED = env_bool("PRECISION_ALIGNMENT_ENABLED", True)
+PRECISION_BLOCK_EARLY_AGAINST_M15 = env_bool("PRECISION_BLOCK_EARLY_AGAINST_M15", True)
+PRECISION_BLOCK_ENTRY_AGAINST_M15 = env_bool("PRECISION_BLOCK_ENTRY_AGAINST_M15", True)
+PRECISION_REQUIRE_M5_M15_ALIGNMENT_FOR_EARLY = env_bool("PRECISION_REQUIRE_M5_M15_ALIGNMENT_FOR_EARLY", True)
+PRECISION_BLOCK_ON_STRONG_OPPOSITE_MOMENTUM = env_bool("PRECISION_BLOCK_ON_STRONG_OPPOSITE_MOMENTUM", True)
+PRECISION_STRONG_OPPOSITE_BODY_ATR_MIN = float(os.getenv("PRECISION_STRONG_OPPOSITE_BODY_ATR_MIN", "0.55"))
+PRECISION_STRONG_OPPOSITE_RANGE_ATR_MIN = float(os.getenv("PRECISION_STRONG_OPPOSITE_RANGE_ATR_MIN", "0.80"))
+PRECISION_STRONG_OPPOSITE_BODY_RATIO_MIN = float(os.getenv("PRECISION_STRONG_OPPOSITE_BODY_RATIO_MIN", "0.50"))
+PRECISION_MOMENTUM_INTERVALS = [
+    x.strip() for x in os.getenv("PRECISION_MOMENTUM_INTERVALS", "5min,15min").split(",") if x.strip()
+]
+PRECISION_STATUS_SHOW_CONTEXT = env_bool("PRECISION_STATUS_SHOW_CONTEXT", True)
+PRECISION_SKIP_ALERT_ENABLED = env_bool("PRECISION_SKIP_ALERT_ENABLED", False)
+PRECISION_SKIP_ALERT_COOLDOWN_MINUTES = int(os.getenv("PRECISION_SKIP_ALERT_COOLDOWN_MINUTES", "30"))
+
 app = Flask(__name__)
 LAST_SIGNAL: Dict[str, Any] = {"status": "starting", "version": APP_VERSION}
 LAST_ALERT_KEY: Optional[str] = None
@@ -197,6 +227,8 @@ LAST_MOVE_ALERT_STATUS: Dict[str, Any] = {
     "last_alerts_count": 0,
     "last_sent_count": 0,
     "last_moves": [],
+    "last_filtered_count": 0,
+    "last_filtered_moves": [],
 }
 
 LAST_ENTRY_ALERT_KEY: Optional[str] = None
@@ -208,6 +240,7 @@ LAST_MISSED_ALERT_TS: float = 0.0
 LAST_WAIT_RETEST_ALERT_KEY: Optional[str] = None
 LAST_WAIT_RETEST_ALERT_TS: float = 0.0
 LAST_REVERSAL_ALERT_KEYS: Dict[str, float] = {}
+LAST_PRECISION_SKIP_ALERT_KEYS: Dict[str, float] = {}
 LAST_REVERSAL_STATUS: Dict[str, Any] = {
     "version": APP_VERSION,
     "last_run_utc": None,
@@ -543,6 +576,14 @@ def fast_check_status_snapshot() -> Dict[str, Any]:
         "move_alert_live_price_interval": MOVE_ALERT_LIVE_PRICE_INTERVAL,
         "max_move_alert_drift_points": MAX_MOVE_ALERT_DRIFT_POINTS,
         "move_alert_execution_warning": MOVE_ALERT_EXECUTION_WARNING,
+        "move_alert_strict_filter_enabled": MOVE_ALERT_STRICT_FILTER_ENABLED,
+        "move_alert_min_quality": MOVE_ALERT_MIN_QUALITY,
+        "move_alert_min_body_points_5min": MOVE_ALERT_MIN_BODY_POINTS_5MIN,
+        "move_alert_min_body_points_15min": MOVE_ALERT_MIN_BODY_POINTS_15MIN,
+        "move_alert_min_body_points_1h": MOVE_ALERT_MIN_BODY_POINTS_1H,
+        "move_alert_min_range_points_5min": MOVE_ALERT_MIN_RANGE_POINTS_5MIN,
+        "move_alert_min_range_points_15min": MOVE_ALERT_MIN_RANGE_POINTS_15MIN,
+        "move_alert_min_range_points_1h": MOVE_ALERT_MIN_RANGE_POINTS_1H,
         "last_move_alert_error": LAST_MOVE_ALERT_STATUS.get("last_error"),
         "last_move_alert_success_utc": LAST_MOVE_ALERT_STATUS.get("last_success_utc"),
         "last_move_alerts_count": LAST_MOVE_ALERT_STATUS.get("last_alerts_count"),
@@ -581,6 +622,14 @@ def fast_check_status_snapshot() -> Dict[str, Any]:
         "last_reversal_success_utc": LAST_REVERSAL_STATUS.get("last_success_utc"),
         "last_reversal_events_count": LAST_REVERSAL_STATUS.get("last_events_count"),
         "last_reversal_sent_count": LAST_REVERSAL_STATUS.get("last_sent_count"),
+        "precision_alignment_enabled": PRECISION_ALIGNMENT_ENABLED,
+        "precision_block_early_against_m15": PRECISION_BLOCK_EARLY_AGAINST_M15,
+        "precision_block_entry_against_m15": PRECISION_BLOCK_ENTRY_AGAINST_M15,
+        "precision_require_m5_m15_alignment_for_early": PRECISION_REQUIRE_M5_M15_ALIGNMENT_FOR_EARLY,
+        "precision_block_on_strong_opposite_momentum": PRECISION_BLOCK_ON_STRONG_OPPOSITE_MOMENTUM,
+        "precision_strong_opposite_body_atr_min": PRECISION_STRONG_OPPOSITE_BODY_ATR_MIN,
+        "precision_strong_opposite_range_atr_min": PRECISION_STRONG_OPPOSITE_RANGE_ATR_MIN,
+        "precision_skip_alert_enabled": PRECISION_SKIP_ALERT_ENABLED,
         "last_entry_exit_error": LAST_ENTRY_EXIT_STATUS.get("last_error"),
         "last_entry_exit_success_utc": LAST_ENTRY_EXIT_STATUS.get("last_success_utc"),
         "cache_cleanup_interval_minutes": CACHE_CLEANUP_INTERVAL_MINUTES,
@@ -1084,6 +1133,109 @@ def move_alert_delay_guard(move: Dict[str, Any], live: Optional[Dict[str, Any]] 
         return result
 
 
+
+def move_alert_min_body_points(interval: str) -> float:
+    interval = str(interval).lower()
+    if interval in ("5min", "5m"):
+        return MOVE_ALERT_MIN_BODY_POINTS_5MIN
+    if interval in ("15min", "15m"):
+        return MOVE_ALERT_MIN_BODY_POINTS_15MIN
+    if interval in ("1h", "60min", "1hour"):
+        return MOVE_ALERT_MIN_BODY_POINTS_1H
+    return MOVE_ALERT_MIN_BODY_POINTS_DEFAULT
+
+
+def move_alert_min_range_points(interval: str) -> float:
+    interval = str(interval).lower()
+    if interval in ("5min", "5m"):
+        return MOVE_ALERT_MIN_RANGE_POINTS_5MIN
+    if interval in ("15min", "15m"):
+        return MOVE_ALERT_MIN_RANGE_POINTS_15MIN
+    if interval in ("1h", "60min", "1hour"):
+        return MOVE_ALERT_MIN_RANGE_POINTS_1H
+    return MOVE_ALERT_MIN_RANGE_POINTS_DEFAULT
+
+
+def move_quality_rank(quality: str) -> int:
+    quality = str(quality or "").upper()
+    if quality == "EXTREME":
+        return 2
+    if quality == "ELEVATED":
+        return 1
+    return 0
+
+
+def evaluate_move_alert_strict_filter(move: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Prevents sending alerts for small candles.
+    The old logic could trigger on e.g. 5min +2.5 pts if Body/ATR was high.
+    This filter adds absolute minimum body/range points and optional quality level.
+    """
+    result: Dict[str, Any] = {
+        "enabled": MOVE_ALERT_STRICT_FILTER_ENABLED,
+        "pass": True,
+        "status": "pass",
+        "reason": None,
+    }
+
+    if not MOVE_ALERT_STRICT_FILTER_ENABLED:
+        result["status"] = "disabled"
+        return result
+
+    interval = str(move.get("interval", ""))
+    body_points = abs(float(move.get("candle_change", 0) or 0))
+    # Range points are available in raw_move_metrics; fallback to 0.
+    raw = move.get("raw_move_metrics") or {}
+    range_points = float(raw.get("range_points", 0) or 0)
+    min_body = move_alert_min_body_points(interval)
+    min_range = move_alert_min_range_points(interval)
+    quality = str(move.get("quality", "")).upper()
+    min_quality = MOVE_ALERT_MIN_QUALITY
+
+    body_ok = body_points >= min_body
+    range_ok = range_points >= min_range
+    quality_ok = move_quality_rank(quality) >= move_quality_rank(min_quality)
+
+    result.update({
+        "interval": interval,
+        "body_points": round(body_points, 2),
+        "range_points": round(range_points, 2),
+        "min_body_points": min_body,
+        "min_range_points": min_range,
+        "quality": quality,
+        "min_quality": min_quality,
+        "body_ok": body_ok,
+        "range_ok": range_ok,
+        "quality_ok": quality_ok,
+    })
+
+    if not quality_ok:
+        result.update({
+            "pass": False,
+            "status": "blocked_quality",
+            "reason": f"Quality {quality} is below required {min_quality}.",
+        })
+        return result
+
+    if MOVE_ALERT_REQUIRE_ABSOLUTE_POINTS and not (body_ok or range_ok):
+        result.update({
+            "pass": False,
+            "status": "blocked_too_small",
+            "reason": (
+                f"Move too small for {interval}: body {round(body_points, 2)} pts "
+                f"(min {min_body}) and range {round(range_points, 2)} pts (min {min_range})."
+            ),
+        })
+        return result
+
+    result.update({
+        "pass": True,
+        "status": "pass",
+        "reason": "Move passed strict filter.",
+    })
+    return result
+
+
 def detect_big_move(interval: str) -> Optional[Dict[str, Any]]:
     df = add_indicators(fetch_ohlc(interval, 80))
     if len(df) < 20:
@@ -1094,28 +1246,56 @@ def detect_big_move(interval: str) -> Optional[Dict[str, Any]]:
     atr_value = float(last.atr14)
     if atr_value <= 0 or rng <= 0:
         return None
+
     body_atr = abs(body) / atr_value
     range_atr = rng / atr_value
     body_ratio = abs(body) / rng
-    if body_atr >= MOVE_BODY_ATR_MIN or (range_atr >= MOVE_RANGE_ATR_MIN and body_ratio >= MOVE_BODY_RATIO_MIN):
-        direction = "GÓRĘ" if body > 0 else "DÓŁ"
-        quality = "EXTREME" if body_atr >= 1.4 or range_atr >= 1.6 else "ELEVATED"
-        live = move_alert_live_price()
-        move = {
-            "interval": interval,
-            "direction": direction,
-            "price": round(float(last.close), 2),
-            "candle_change": round(body, 2),
-            "body_atr": round(body_atr, 2),
-            "range_atr": round(range_atr, 2),
-            "body_ratio": round(body_ratio, 2),
-            "quality": quality,
-            "datetime": str(last.datetime),
-            "live_price": live,
-        }
-        move["delay_guard"] = move_alert_delay_guard(move, live)
+
+    # First technical trigger: volatility is elevated relative to ATR.
+    technical_trigger = (
+        body_atr >= MOVE_BODY_ATR_MIN
+        or (range_atr >= MOVE_RANGE_ATR_MIN and body_ratio >= MOVE_BODY_RATIO_MIN)
+    )
+    if not technical_trigger:
+        return None
+
+    direction = "GÓRĘ" if body > 0 else "DÓŁ"
+    quality = "EXTREME" if body_atr >= 1.4 or range_atr >= 1.6 else "ELEVATED"
+
+    live = move_alert_live_price()
+    move = {
+        "interval": interval,
+        "direction": direction,
+        "price": round(float(last.close), 2),
+        "candle_change": round(body, 2),
+        "body_atr": round(body_atr, 2),
+        "range_atr": round(range_atr, 2),
+        "body_ratio": round(body_ratio, 2),
+        "quality": quality,
+        "datetime": str(last.datetime),
+        "live_price": live,
+        "raw_move_metrics": {
+            "body_points": round(abs(body), 2),
+            "range_points": round(rng, 2),
+            "atr": round(atr_value, 2),
+            "open": round(float(last.open), 2),
+            "high": round(float(last.high), 2),
+            "low": round(float(last.low), 2),
+            "close": round(float(last.close), 2),
+        },
+    }
+
+    strict_filter = evaluate_move_alert_strict_filter(move)
+    move["strict_filter"] = strict_filter
+
+    if not strict_filter.get("pass"):
+        # Return filtered move as metadata for diagnostics, but caller should not send it.
+        move["filtered"] = True
         return move
-    return None
+
+    move["delay_guard"] = move_alert_delay_guard(move, live)
+    move["filtered"] = False
+    return move
 
 
 def format_move_alert(m: Dict[str, Any]) -> str:
@@ -1150,6 +1330,9 @@ def format_move_alert(m: Dict[str, Any]) -> str:
         f"Poziom świecy alertowej: {m['price']} | Zmiana świecy: {m['candle_change']} pkt\n"
         f"Body/ATR: {m['body_atr']} | Range/ATR: {m['range_atr']}\n"
         f"Jakość ruchu: {m['quality']} | Body ratio: {m['body_ratio']}\n"
+        f"Filtr jakości: {((m.get('strict_filter') or {}).get('status'))} | "
+        f"min body/range: {((m.get('strict_filter') or {}).get('min_body_points'))}/"
+        f"{((m.get('strict_filter') or {}).get('min_range_points'))} pkt\n"
         f"Świeca alertowa: {m.get('datetime')}"
         f"{live_text}"
         f"{execution_text}\n"
@@ -1166,12 +1349,18 @@ def check_move_alerts() -> None:
         return
 
     moves: List[Dict[str, Any]] = []
+    filtered_moves: List[Dict[str, Any]] = []
     sent_count = 0
 
     for interval in MOVE_ALERT_INTERVALS:
         try:
             move = detect_big_move(interval)
             if not move:
+                continue
+
+            if move.get("filtered"):
+                if MOVE_ALERT_FILTER_STATUS_ENABLED:
+                    filtered_moves.append(move)
                 continue
 
             moves.append(move)
@@ -1191,8 +1380,12 @@ def check_move_alerts() -> None:
         "last_alerts_count": len(moves),
         "last_sent_count": sent_count,
         "last_moves": moves[-5:],
-        "last_error": LAST_MOVE_ALERT_STATUS.get("last_error") if not moves and sent_count == 0 else None,
+        "last_filtered_count": len(filtered_moves),
+        "last_filtered_moves": filtered_moves[-5:],
+        "last_error": LAST_MOVE_ALERT_STATUS.get("last_error") if not moves and sent_count == 0 and not filtered_moves else None,
     })
+
+
 
 
 def format_signal(s: Dict[str, Any]) -> str:
@@ -1740,6 +1933,311 @@ def support_resistance_retest_guard(side: str, entry: float, signal: Optional[Di
         return result
 
 
+
+def _direction_opposite(side: str) -> str:
+    side = str(side).upper()
+    return "BUY" if side == "SELL" else "SELL"
+
+
+def _side_to_trend(side: str) -> str:
+    side = str(side).upper()
+    return "UP" if side == "BUY" else "DOWN"
+
+
+def _trend_to_side(trend_value: str) -> Optional[str]:
+    trend_value = str(trend_value).upper()
+    if trend_value == "UP":
+        return "BUY"
+    if trend_value == "DOWN":
+        return "SELL"
+    return None
+
+
+def _momentum_from_df(df: pd.DataFrame, interval: str) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "interval": interval,
+        "ok": False,
+        "direction": None,
+        "strong": False,
+        "reason": None,
+    }
+
+    try:
+        if df is None or len(df) < 20:
+            result["reason"] = "not enough data"
+            return result
+
+        with_ind = add_indicators(df)
+        last = with_ind.iloc[-1]
+        body = float(last.close - last.open)
+        rng = float(last.high - last.low)
+        atr_value = float(last.atr14)
+
+        if atr_value <= 0 or rng <= 0:
+            result["reason"] = "invalid ATR/range"
+            return result
+
+        direction = "BUY" if body > 0 else "SELL"
+        body_atr = abs(body) / atr_value
+        range_atr = rng / atr_value
+        body_ratio = abs(body) / rng
+
+        strong = (
+            body_atr >= PRECISION_STRONG_OPPOSITE_BODY_ATR_MIN
+            or (
+                range_atr >= PRECISION_STRONG_OPPOSITE_RANGE_ATR_MIN
+                and body_ratio >= PRECISION_STRONG_OPPOSITE_BODY_RATIO_MIN
+            )
+        )
+
+        result.update({
+            "ok": True,
+            "direction": direction,
+            "strong": bool(strong),
+            "datetime": str(last.datetime),
+            "open": round(float(last.open), 2),
+            "high": round(float(last.high), 2),
+            "low": round(float(last.low), 2),
+            "close": round(float(last.close), 2),
+            "body_points": round(float(body), 2),
+            "range_points": round(float(rng), 2),
+            "body_atr": round(float(body_atr), 2),
+            "range_atr": round(float(range_atr), 2),
+            "body_ratio": round(float(body_ratio), 2),
+            "atr": round(float(atr_value), 2),
+        })
+        return result
+
+    except Exception as e:
+        result.update({
+            "ok": False,
+            "reason": f"{type(e).__name__}: {e}",
+        })
+        return result
+
+
+def execution_context_snapshot(signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Separates HTF context from execution context.
+    HTF = D1/H4; Execution = M15/M5 + last momentum candles.
+    """
+    signal = signal or {}
+    trends = signal.get("trend") or {}
+
+    result: Dict[str, Any] = {
+        "htf_context": {
+            "D1": trends.get("D1"),
+            "H4": trends.get("H4"),
+            "bias": "NEUTRAL",
+        },
+        "execution_context": {
+            "M15": trends.get("M15"),
+            "M5": None,
+            "bias": "NEUTRAL",
+        },
+        "momentum": {},
+        "price": signal.get("price"),
+    }
+
+    # HTF bias
+    d1 = trends.get("D1")
+    h4 = trends.get("H4")
+    if d1 == "UP" and h4 == "UP":
+        result["htf_context"]["bias"] = "BUY"
+    elif d1 == "DOWN" and h4 == "DOWN":
+        result["htf_context"]["bias"] = "SELL"
+    elif d1 == "UP" or h4 == "UP":
+        result["htf_context"]["bias"] = "LEAN_BUY"
+    elif d1 == "DOWN" or h4 == "DOWN":
+        result["htf_context"]["bias"] = "LEAN_SELL"
+
+    try:
+        m5 = add_indicators(fetch_ohlc("5min", 80))
+        result["execution_context"]["M5"] = trend(m5)
+        result["momentum"]["5min"] = _momentum_from_df(m5, "5min")
+    except Exception as e:
+        result["execution_context"]["M5_error"] = f"{type(e).__name__}: {e}"
+
+    try:
+        m15 = add_indicators(fetch_ohlc("15min", 80))
+        result["execution_context"]["M15"] = trend(m15)
+        result["momentum"]["15min"] = _momentum_from_df(m15, "15min")
+    except Exception as e:
+        result["execution_context"]["M15_error"] = f"{type(e).__name__}: {e}"
+
+    m5_trend = result["execution_context"].get("M5")
+    m15_trend = result["execution_context"].get("M15")
+    m5_side = _trend_to_side(m5_trend)
+    m15_side = _trend_to_side(m15_trend)
+
+    if m5_side and m15_side and m5_side == m15_side:
+        result["execution_context"]["bias"] = m5_side
+    elif m15_side and not m5_side:
+        result["execution_context"]["bias"] = f"LEAN_{m15_side}"
+    elif m5_side and not m15_side:
+        result["execution_context"]["bias"] = f"LEAN_{m5_side}"
+    elif m5_side and m15_side and m5_side != m15_side:
+        result["execution_context"]["bias"] = "MIXED"
+
+    return result
+
+
+def precision_signal_alignment_guard(side: str, signal: Optional[Dict[str, Any]] = None, mode: str = "entry") -> Dict[str, Any]:
+    """
+    Blocks signals that are opposite to current execution trend/momentum.
+    Goal: avoid possible SELL while M5/M15 are already flipping UP, and vice versa.
+    """
+    side = str(side).upper()
+    mode = str(mode or "entry").lower()
+
+    result: Dict[str, Any] = {
+        "enabled": PRECISION_ALIGNMENT_ENABLED,
+        "ok": True,
+        "status": "aligned",
+        "reason": None,
+        "side": side,
+        "mode": mode,
+    }
+
+    context = execution_context_snapshot(signal)
+    result["context"] = context if PRECISION_STATUS_SHOW_CONTEXT else {
+        "htf_context": context.get("htf_context"),
+        "execution_context": context.get("execution_context"),
+    }
+
+    if not PRECISION_ALIGNMENT_ENABLED:
+        result["status"] = "disabled"
+        return result
+
+    if side not in ("BUY", "SELL"):
+        result.update({
+            "ok": False,
+            "status": "invalid_side",
+            "reason": "side must be BUY or SELL",
+        })
+        return result
+
+    opposite = _direction_opposite(side)
+    required_trend = _side_to_trend(side)
+    opposite_trend = _side_to_trend(opposite)
+
+    exec_ctx = context.get("execution_context") or {}
+    m15_trend = exec_ctx.get("M15")
+    m5_trend = exec_ctx.get("M5")
+    exec_bias = str(exec_ctx.get("bias") or "NEUTRAL")
+
+    # 1. Hard block if M15 is clearly opposite.
+    if mode == "early" and PRECISION_BLOCK_EARLY_AGAINST_M15 and m15_trend == opposite_trend:
+        result.update({
+            "ok": False,
+            "status": "blocked_m15_opposite",
+            "reason": f"{mode.upper()} {side} blocked: M15 trend is {m15_trend}, opposite to {side}.",
+        })
+        return result
+
+    if mode == "entry" and PRECISION_BLOCK_ENTRY_AGAINST_M15 and m15_trend == opposite_trend:
+        result.update({
+            "ok": False,
+            "status": "blocked_m15_opposite",
+            "reason": f"ENTRY {side} blocked: M15 trend is {m15_trend}, opposite to {side}.",
+        })
+        return result
+
+    # 2. For early-watch require short execution to agree or at least not conflict.
+    if mode == "early" and PRECISION_REQUIRE_M5_M15_ALIGNMENT_FOR_EARLY:
+        if m15_trend not in (required_trend, "NEUTRAL", None):
+            result.update({
+                "ok": False,
+                "status": "blocked_execution_not_aligned",
+                "reason": f"Early {side} blocked: M15={m15_trend}, required {required_trend} or NEUTRAL.",
+            })
+            return result
+        if m5_trend == opposite_trend and m15_trend != required_trend:
+            result.update({
+                "ok": False,
+                "status": "blocked_m5_opposite_without_m15_confirmation",
+                "reason": f"Early {side} blocked: M5={m5_trend} and M15 is not confirming {required_trend}.",
+            })
+            return result
+
+    # 3. Strong opposite momentum on M5/M15 blocks both entry and early-watch.
+    if PRECISION_BLOCK_ON_STRONG_OPPOSITE_MOMENTUM:
+        for interval, mom in (context.get("momentum") or {}).items():
+            if not mom or not mom.get("ok"):
+                continue
+            if mom.get("strong") and mom.get("direction") == opposite:
+                result.update({
+                    "ok": False,
+                    "status": "blocked_strong_opposite_momentum",
+                    "reason": (
+                        f"{side} blocked: strong opposite {opposite} momentum on {interval} "
+                        f"(body/ATR={mom.get('body_atr')}, range/ATR={mom.get('range_atr')})."
+                    ),
+                    "opposite_momentum": mom,
+                })
+                return result
+
+    # 4. If HTF says one thing but execution says the opposite, do not send directional early-watch.
+    if mode == "early" and exec_bias in (opposite, f"LEAN_{opposite}"):
+        result.update({
+            "ok": False,
+            "status": "blocked_execution_bias_opposite",
+            "reason": f"Early {side} blocked: execution bias is {exec_bias}.",
+        })
+        return result
+
+    result.update({
+        "ok": True,
+        "status": "aligned",
+        "reason": (
+            f"{side} allowed: HTF={context.get('htf_context', {}).get('bias')}, "
+            f"execution={exec_bias}, M5={m5_trend}, M15={m15_trend}."
+        ),
+    })
+    return result
+
+
+def format_precision_alignment_block(e: Dict[str, Any]) -> str:
+    side = e.get("signal") or e.get("side")
+    pg = e.get("precision_alignment") or {}
+    ctx = pg.get("context") or {}
+    htf = ctx.get("htf_context") or {}
+    exe = ctx.get("execution_context") or {}
+    return (
+        f"⚠️ GOLD SETUP SKIPPED — PRECISION ALIGNMENT\n\n"
+        f"Kierunek zablokowany: {side}\n"
+        f"Status: {pg.get('status')}\n"
+        f"Powód: {pg.get('reason')}\n\n"
+        f"HTF context D1/H4: {htf.get('D1')} / {htf.get('H4')} | bias: {htf.get('bias')}\n"
+        f"Execution M5/M15: {exe.get('M5')} / {exe.get('M15')} | bias: {exe.get('bias')}\n\n"
+        f"Decyzja: nie wysyłać kierunkowego sygnału przeciwko bieżącemu momentum M5/M15."
+    )
+
+
+def should_send_precision_skip_alert(entry_or_watch: Dict[str, Any]) -> bool:
+    if not PRECISION_SKIP_ALERT_ENABLED:
+        return False
+    pg = entry_or_watch.get("precision_alignment") or {}
+    if not pg or pg.get("ok"):
+        return False
+
+    key = f"{entry_or_watch.get('signal')}:{pg.get('status')}:{pg.get('reason')}"
+    now_ts = _utc_ts()
+    cooldown = max(60, PRECISION_SKIP_ALERT_COOLDOWN_MINUTES * 60)
+    last_ts = float(LAST_PRECISION_SKIP_ALERT_KEYS.get(key, 0) or 0)
+
+    if now_ts - last_ts < cooldown:
+        return False
+
+    LAST_PRECISION_SKIP_ALERT_KEYS[key] = now_ts
+    if len(LAST_PRECISION_SKIP_ALERT_KEYS) > 200:
+        oldest = sorted(LAST_PRECISION_SKIP_ALERT_KEYS.items(), key=lambda x: x[1])[:50]
+        for old_key, _ in oldest:
+            LAST_PRECISION_SKIP_ALERT_KEYS.pop(old_key, None)
+
+    return True
+
+
 def live_execution_guard(side: str, entry: float, sl: float, tp1: float, risk_distance: Optional[float] = None) -> Dict[str, Any]:
     """
     Blocks late/escaped entries.
@@ -1906,6 +2404,18 @@ def evaluate_entry_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     if not base_valid:
         return result
 
+    precision_guard = precision_signal_alignment_guard(side, signal, mode="entry")
+    result["precision_alignment"] = precision_guard
+
+    if not precision_guard.get("ok"):
+        result.update({
+            "valid": False,
+            "status": "blocked_by_precision_alignment",
+            "reason": precision_guard.get("reason"),
+            "blocked_by_precision_alignment": True,
+        })
+        return result
+
     # First check market structure quality: no chasing, no selling into support, no buying into resistance.
     sr_guard = support_resistance_retest_guard(side, entry, signal)
     result["structure_guard"] = sr_guard
@@ -1990,6 +2500,20 @@ def evaluate_early_watch(signal: Dict[str, Any], entry_signal: Optional[Dict[str
         })
         return result
 
+    precision_guard = precision_signal_alignment_guard(side, signal, mode="early")
+    if not precision_guard.get("ok"):
+        result.update({
+            "valid": False,
+            "status": "blocked_by_precision_alignment",
+            "reason": precision_guard.get("reason"),
+            "signal": side,
+            "score": int(score),
+            "opposite_score": int(opposite),
+            "trend": trends,
+            "precision_alignment": precision_guard,
+        })
+        return result
+
     price = safe_float(signal.get("price"))
     atr_value = None
     try:
@@ -2026,6 +2550,7 @@ def evaluate_early_watch(signal: Dict[str, Any], entry_signal: Optional[Dict[str
         "watch_tp2": rp.get("tp2"),
         "watch_tp3": rp.get("tp3"),
         "trend": trends,
+        "precision_alignment": precision_guard,
         "reasons": signal.get("reasons", []),
         "time_utc": now_utc(),
         "instruction": (
@@ -2051,6 +2576,7 @@ def format_entry_signal_alert(e: Dict[str, Any]) -> str:
         f"Trend M15/H1/H4/D1: "
         f"{(e.get('trend') or {}).get('M15')} / {(e.get('trend') or {}).get('H1')} / "
         f"{(e.get('trend') or {}).get('H4')} / {(e.get('trend') or {}).get('D1')}\n"
+        f"Precision: {((e.get('precision_alignment') or {}).get('status')) or '-'}\n"
         f"Powody: {', '.join(e.get('reasons') or []) or '-'}\n\n"
         f"Zasady: ryzyko max 1–2%, nie dokładaj do straty, SL wpisz ręcznie u brokera."
     )
@@ -2093,7 +2619,8 @@ def format_early_watch_alert(w: Dict[str, Any]) -> str:
         f"Entry robocze: {w.get('watch_entry')}\n"
         f"SL roboczy: {w.get('watch_sl')}\n"
         f"TP1 roboczy: {w.get('watch_tp1')}\n\n"
-        f"Warunek aktywacji: {condition}\n\n"
+        f"Warunek aktywacji: {condition}\n"
+        f"Precision: {((w.get('precision_alignment') or {}).get('status')) or '-'}\n\n"
         f"To jest wcześniejsze ostrzeżenie. Nie jest to jeszcze sygnał wejścia."
     )
 
@@ -2854,6 +3381,13 @@ def entry_exit_signal_job() -> None:
         entry_signal = evaluate_entry_signal(current_signal)
         early_watch = evaluate_early_watch(current_signal, entry_signal)
 
+        precision_skip_sent = False
+        for candidate in [entry_signal, early_watch]:
+            if candidate.get("blocked_by_precision_alignment") or candidate.get("status") == "blocked_by_precision_alignment":
+                if should_send_precision_skip_alert(candidate):
+                    send_telegram(format_precision_alignment_block(candidate))
+                    precision_skip_sent = True
+
         early_sent = False
         if early_watch.get("valid") and should_send_early_watch_alert(early_watch):
             send_telegram(format_early_watch_alert(early_watch))
@@ -2892,6 +3426,7 @@ def entry_exit_signal_job() -> None:
             "last_error": None,
             "last_early_watch": early_watch,
             "last_early_sent": early_sent,
+            "last_precision_skip_sent": precision_skip_sent,
             "last_entry_signal": entry_signal,
             "last_entry_sent": entry_sent,
             "last_missed_sent": missed_sent,
@@ -2922,6 +3457,7 @@ def command_help() -> str:
         "/signal — wygeneruj aktualny sygnał\n"
         "/early — pokaż wcześniejsze ostrzeżenie SETUP FORMING\n"
         "/reversal — pokaż alerty reversal/momentum watch\n"
+        "/precision — pokaż zgodność HTF context z M5/M15 execution\n"
         "/entry — pokaż aktualny sygnał wejścia BUY/SELL albo MISSED TRADE\n"
         "/exit — pokaż sygnały wyjścia/prowadzenia pozycji\n"
         "/signal-now — pełna diagnostyka early + entry + retest guard + exit\n"
@@ -3014,6 +3550,8 @@ def handle_command(text: str, chat_id: str) -> str:
         e = evaluate_entry_signal(s)
         if e.get("valid"):
             return format_entry_signal_alert(e)
+        if e.get("blocked_by_precision_alignment"):
+            return format_precision_alignment_block(e)
         if e.get("wait_for_retest"):
             return format_wait_retest_alert(e)
         if e.get("blocked_by_structure"):
@@ -3021,6 +3559,22 @@ def handle_command(text: str, chat_id: str) -> str:
         if e.get("missed_trade"):
             return format_missed_trade_alert(e)
         return "Brak aktualnego sygnału wejścia. Status: " + str(e.get("status")) + "\nPowód: " + str(e.get("reason"))
+
+    if cmd == "/precision":
+        s = build_signal()
+        buy = precision_signal_alignment_guard("BUY", s, mode="manual")
+        sell = precision_signal_alignment_guard("SELL", s, mode="manual")
+        ctx = execution_context_snapshot(s)
+        return (
+            "🎯 GOLD PRECISION SIGNAL ALIGNMENT\n\n"
+            f"Signal: {s.get('signal')} | Score: {s.get('score')} | Price: {s.get('price')}\n"
+            f"HTF D1/H4: {(ctx.get('htf_context') or {}).get('D1')} / {(ctx.get('htf_context') or {}).get('H4')} | "
+            f"bias: {(ctx.get('htf_context') or {}).get('bias')}\n"
+            f"Execution M5/M15: {(ctx.get('execution_context') or {}).get('M5')} / {(ctx.get('execution_context') or {}).get('M15')} | "
+            f"bias: {(ctx.get('execution_context') or {}).get('bias')}\n\n"
+            f"BUY alignment: {buy.get('status')} | {buy.get('reason')}\n"
+            f"SELL alignment: {sell.get('status')} | {sell.get('reason')}"
+        )
 
     if cmd == "/reversal":
         s = build_signal()
@@ -3044,6 +3598,8 @@ def handle_command(text: str, chat_id: str) -> str:
 
         if e.get("valid"):
             entry_text = format_entry_signal_alert(e)
+        elif e.get("blocked_by_precision_alignment"):
+            entry_text = format_precision_alignment_block(e)
         elif e.get("wait_for_retest"):
             entry_text = format_wait_retest_alert(e)
         elif e.get("blocked_by_structure"):
@@ -3444,6 +4000,21 @@ def move_alert_status_endpoint():
             "max_drift_points": MAX_MOVE_ALERT_DRIFT_POINTS,
             "retest_zone_points": MOVE_ALERT_RETEST_ZONE_POINTS,
             "no_chase_h1": MOVE_ALERT_NO_CHASE_H1,
+            "strict_filter_enabled": MOVE_ALERT_STRICT_FILTER_ENABLED,
+            "min_quality": MOVE_ALERT_MIN_QUALITY,
+            "require_absolute_points": MOVE_ALERT_REQUIRE_ABSOLUTE_POINTS,
+            "min_body_points": {
+                "5min": MOVE_ALERT_MIN_BODY_POINTS_5MIN,
+                "15min": MOVE_ALERT_MIN_BODY_POINTS_15MIN,
+                "1h": MOVE_ALERT_MIN_BODY_POINTS_1H,
+                "default": MOVE_ALERT_MIN_BODY_POINTS_DEFAULT,
+            },
+            "min_range_points": {
+                "5min": MOVE_ALERT_MIN_RANGE_POINTS_5MIN,
+                "15min": MOVE_ALERT_MIN_RANGE_POINTS_15MIN,
+                "1h": MOVE_ALERT_MIN_RANGE_POINTS_1H,
+                "default": MOVE_ALERT_MIN_RANGE_POINTS_DEFAULT,
+            },
         },
         "last_move_alert_status": LAST_MOVE_ALERT_STATUS,
         "api_runtime": api_runtime_snapshot(),
@@ -3460,6 +4031,41 @@ def move_alert_run_now_endpoint():
         "last_move_alert_status": LAST_MOVE_ALERT_STATUS,
         "api_runtime": api_runtime_snapshot(),
     })
+
+
+@app.get("/precision-status")
+def precision_status_endpoint():
+    try:
+        s = build_signal()
+        ctx = execution_context_snapshot(s)
+        buy_guard = precision_signal_alignment_guard("BUY", s, mode="manual")
+        sell_guard = precision_signal_alignment_guard("SELL", s, mode="manual")
+        entry = evaluate_entry_signal(s)
+        early = evaluate_early_watch(s, entry)
+        return jsonify({
+            "status": "ok",
+            "version": APP_VERSION,
+            "signal": {
+                "signal": s.get("signal"),
+                "score": s.get("score"),
+                "directional_scores": s.get("directional_scores"),
+                "price": s.get("price"),
+                "trend": s.get("trend"),
+            },
+            "context": ctx,
+            "buy_alignment": buy_guard,
+            "sell_alignment": sell_guard,
+            "entry": entry,
+            "early_watch": early,
+            "api_runtime": api_runtime_snapshot(),
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "version": APP_VERSION,
+            "error": f"{type(e).__name__}: {e}",
+            "api_runtime": api_runtime_snapshot(),
+        }), 200
 
 
 @app.get("/reversal-status")
@@ -3639,6 +4245,7 @@ def signal_now_endpoint():
             "signal": s,
             "early_watch": w,
             "reversal_momentum_watch": rw,
+            "precision_context": execution_context_snapshot(s),
             "entry": e,
             "exit_events": events,
             "api_runtime": api_runtime_snapshot(),
