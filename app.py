@@ -13,7 +13,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.7.0-adaptive-trade-memory"
+APP_VERSION = "6.8.0-a-plus-quality-filter"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -57,6 +57,30 @@ TRAIL_LOCK_R_3 = float(os.getenv("TRAIL_LOCK_R_3", "1.5"))
 TRADE_HISTORY_ENABLED = env_bool("TRADE_HISTORY_ENABLED", True)
 DATABASE_REQUIRED = env_bool("DATABASE_REQUIRED", True)
 DATABASE_CONNECT_TIMEOUT_SECONDS = int(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "10"))
+
+# v6.8 A+ Quality Filter — fewer, higher-quality Telegram alerts
+A_PLUS_FILTER_ENABLED = env_bool("A_PLUS_FILTER_ENABLED", True)
+A_PLUS_MIN_SCORE = int(os.getenv("A_PLUS_MIN_SCORE", "90"))
+A_GRADE_MIN_SCORE = int(os.getenv("A_GRADE_MIN_SCORE", "80"))
+A_PLUS_MIN_CONDITIONS = int(os.getenv("A_PLUS_MIN_CONDITIONS", "9"))
+A_GRADE_MIN_CONDITIONS = int(os.getenv("A_GRADE_MIN_CONDITIONS", "8"))
+A_PLUS_TELEGRAM_MIN_GRADE = os.getenv("A_PLUS_TELEGRAM_MIN_GRADE", "A").upper()
+A_PLUS_COOLDOWN_MINUTES = int(os.getenv("A_PLUS_COOLDOWN_MINUTES", "60"))
+A_PLUS_STATE_FILE = os.getenv("A_PLUS_STATE_FILE", "a_plus_alert_state.json")
+A_PLUS_LOG_INFO_TO_DB = env_bool("A_PLUS_LOG_INFO_TO_DB", True)
+A_PLUS_DISABLE_EARLY_TELEGRAM = env_bool("A_PLUS_DISABLE_EARLY_TELEGRAM", True)
+A_PLUS_DISABLE_MISSED_TELEGRAM = env_bool("A_PLUS_DISABLE_MISSED_TELEGRAM", True)
+A_PLUS_DISABLE_WAIT_RETEST_TELEGRAM = env_bool("A_PLUS_DISABLE_WAIT_RETEST_TELEGRAM", True)
+A_PLUS_FILTER_MOMENTUM_ALERTS = env_bool("A_PLUS_FILTER_MOMENTUM_ALERTS", True)
+A_PLUS_RSI_BUY_MAX = float(os.getenv("A_PLUS_RSI_BUY_MAX", "70"))
+A_PLUS_RSI_SELL_MIN = float(os.getenv("A_PLUS_RSI_SELL_MIN", "30"))
+A_PLUS_MIN_CANDLE_ATR = float(os.getenv("A_PLUS_MIN_CANDLE_ATR", "1.0"))
+A_PLUS_MIN_RR = float(os.getenv("A_PLUS_MIN_RR", "2.0"))
+SPREAD_FILTER_ENABLED = env_bool("SPREAD_FILTER_ENABLED", False)
+try:
+    CURRENT_SPREAD_POINTS = float(os.getenv("CURRENT_SPREAD_POINTS", ""))
+except Exception:
+    CURRENT_SPREAD_POINTS = None
 DB_STATUS: Dict[str, Any] = {
     "configured": bool(DATABASE_URL),
     "connected": False,
@@ -2635,6 +2659,138 @@ def live_execution_guard(side: str, entry: float, sl: float, tp1: float, risk_di
         return result
 
 
+def _a_plus_grade_rank(grade: str) -> int:
+    return {"INFO": 0, "A": 1, "A+": 2}.get(str(grade or "INFO").upper(), 0)
+
+
+def evaluate_a_plus_quality(
+    current_signal: Dict[str, Any],
+    candidate: Optional[Dict[str, Any]] = None,
+    event: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Evaluate 10 quality gates. Score is transparent and rule-based, not a probability."""
+    candidate = candidate or {}
+    event = event or {}
+    side = str(candidate.get("signal") or event.get("direction") or current_signal.get("signal") or "NO_TRADE").upper()
+    trends = current_signal.get("trend") or event.get("trend") or {}
+    inst = current_signal.get("institutional") or {}
+    ms_h1 = inst.get("market_structure_h1") or {}
+    fvg = (inst.get("fair_value_gap_h1") or {}).get("latest") or {}
+    ob = (inst.get("order_block_h1") or {}).get("latest") or {}
+    structure = candidate.get("structure_guard") or {}
+
+    def aligned(value: Any) -> bool:
+        return value == ("UP" if side == "BUY" else "DOWN")
+
+    h1_h4 = aligned(trends.get("H1")) and aligned(trends.get("H4"))
+    m15 = aligned(trends.get("M15"))
+    retest = bool(structure.get("ok")) and structure.get("status") not in ("wait_for_retest", "structure_blocked")
+    if event:
+        retest = bool((event.get("reversal_from_round_level") or {}).get("detected")) or bool((event.get("m15_flip") or {}).get("detected"))
+
+    rsi_value = None
+    try:
+        h1_df = add_indicators(fetch_ohlc("1h", 80))
+        rsi_value = float(h1_df.rsi14.iloc[-1])
+    except Exception:
+        pass
+    rsi_ok = rsi_value is not None and ((side == "BUY" and rsi_value < A_PLUS_RSI_BUY_MAX) or (side == "SELL" and rsi_value > A_PLUS_RSI_SELL_MIN))
+
+    bos = str(ms_h1.get("bos") or "")
+    choch = str(ms_h1.get("choch") or "")
+    structure_confirmation = (side == "BUY" and ("BULLISH" in bos or "BULLISH" in choch)) or (side == "SELL" and ("BEARISH" in bos or "BEARISH" in choch))
+    ob_fvg = (side == "BUY" and (fvg.get("type") == "BULLISH_FVG" or ob.get("type") == "BULLISH_OB")) or (side == "SELL" and (fvg.get("type") == "BEARISH_FVG" or ob.get("type") == "BEARISH_OB"))
+
+    candle_atr = safe_float(event.get("body_atr"))
+    if candle_atr is None:
+        try:
+            m15_df = add_indicators(fetch_ohlc("15min", 80))
+            last = m15_df.iloc[-1]
+            candle_atr = abs(float(last.close - last.open)) / max(float(last.atr14), 1e-9)
+        except Exception:
+            candle_atr = None
+    candle_ok = candle_atr is not None and candle_atr >= A_PLUS_MIN_CANDLE_ATR
+
+    rr = safe_float(candidate.get("rr_to_tp1"))
+    if rr is None and side in ("BUY", "SELL"):
+        rr = rr_for_plan(side, safe_float(candidate.get("entry")), safe_float(candidate.get("sl")), safe_float(candidate.get("tp1")))
+    rr_ok = rr is not None and rr >= A_PLUS_MIN_RR
+
+    no_near_level = bool(structure.get("ok")) if candidate else bool((event.get("reversal_from_round_level") or {}).get("detected"))
+    spread_ok = True if not SPREAD_FILTER_ENABLED else (CURRENT_SPREAD_POINTS is not None and CURRENT_SPREAD_POINTS <= MAX_SPREAD_POINTS)
+
+    checks = [
+        ("H1 i H4 zgodne", h1_h4, f"H1={trends.get('H1')}, H4={trends.get('H4')}"),
+        ("M15 potwierdza", m15, f"M15={trends.get('M15')}"),
+        ("Retest/potwierdzenie", retest, structure.get("status") or event.get("type") or "brak"),
+        ("RSI bez skrajności", rsi_ok, round(rsi_value, 1) if rsi_value is not None else None),
+        ("BOS lub CHOCH", structure_confirmation, bos or choch or None),
+        ("Order Block lub FVG", ob_fvg, ob.get("type") or fvg.get("type") or None),
+        ("Świeca > 1 ATR", candle_ok, round(candle_atr, 2) if candle_atr is not None else None),
+        ("RR do TP1 >= 2", rr_ok, round(rr, 2) if rr is not None else None),
+        ("Brak bliskiego S/R", no_near_level, structure.get("reason") or None),
+        ("Spread w limicie", spread_ok, "filter_disabled" if not SPREAD_FILTER_ENABLED else CURRENT_SPREAD_POINTS),
+    ]
+    passed = sum(1 for _, ok, _ in checks if ok)
+    quality_score = passed * 10
+    if quality_score >= A_PLUS_MIN_SCORE and passed >= A_PLUS_MIN_CONDITIONS:
+        grade = "A+"
+    elif quality_score >= A_GRADE_MIN_SCORE and passed >= A_GRADE_MIN_CONDITIONS:
+        grade = "A"
+    else:
+        grade = "INFO"
+    return {
+        "enabled": A_PLUS_FILTER_ENABLED,
+        "side": side,
+        "grade": grade,
+        "quality_score": quality_score,
+        "conditions_passed": passed,
+        "conditions_total": len(checks),
+        "telegram_eligible": _a_plus_grade_rank(grade) >= _a_plus_grade_rank(A_PLUS_TELEGRAM_MIN_GRADE),
+        "checks": [{"name": name, "passed": ok, "value": value} for name, ok, value in checks],
+        "rsi_h1": round(rsi_value, 1) if rsi_value is not None else None,
+        "candle_body_atr": round(candle_atr, 2) if candle_atr is not None else None,
+        "rr_to_tp1": round(rr, 2) if rr is not None else None,
+        "spread_filter_enabled": SPREAD_FILTER_ENABLED,
+        "spread_points": CURRENT_SPREAD_POINTS,
+        "note": "Ocena regułowa, nie prawdopodobieństwo sukcesu.",
+    }
+
+
+def should_send_a_plus_alert(quality: Dict[str, Any], side: str, interval: str = "ENTRY", structure_key: str = "") -> bool:
+    if not A_PLUS_FILTER_ENABLED:
+        return True
+    if not quality.get("telegram_eligible"):
+        return False
+    state = load_json(A_PLUS_STATE_FILE, {"alerts": {}})
+    alerts = state.get("alerts", {}) if isinstance(state, dict) else {}
+    key = f"{side}:{interval}:{structure_key or quality.get('grade')}"
+    now_ts = _utc_ts()
+    last_ts = float(alerts.get(key, 0) or 0)
+    if now_ts - last_ts < max(60, A_PLUS_COOLDOWN_MINUTES * 60):
+        return False
+    alerts[key] = now_ts
+    save_json(A_PLUS_STATE_FILE, {"updated_utc": now_utc(), "alerts": alerts})
+    return True
+
+
+def format_a_plus_entry_alert(e: Dict[str, Any]) -> str:
+    q = e.get("a_plus_quality") or {}
+    side = e.get("signal")
+    icon = "🟢" if q.get("grade") == "A+" else "🟡"
+    passed = [c.get("name") for c in q.get("checks", []) if c.get("passed")]
+    failed = [c.get("name") for c in q.get("checks", []) if not c.get("passed")]
+    return (
+        f"{icon} GOLD {q.get('grade')} SETUP — {side}\n\n"
+        f"Jakość: {q.get('quality_score')}/100 | Warunki: {q.get('conditions_passed')}/{q.get('conditions_total')}\n"
+        f"Score kierunkowy: {e.get('score')}/100 | RR do TP1: {e.get('rr_to_tp1')}\n\n"
+        f"Entry: {e.get('entry')}\nSL: {e.get('sl')}\nTP1: {e.get('tp1')}\nTP2: {e.get('tp2')}\nTP3: {e.get('tp3')}\n\n"
+        f"Spełnione: {', '.join(passed) or '-'}\n"
+        f"Braki: {', '.join(failed) or '-'}\n\n"
+        f"Ryzyko max 1–2%. SL ustaw ręcznie u brokera. Ocena jest regułowa, nie stanowi gwarancji wyniku."
+    )
+
+
 def evaluate_entry_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "enabled": ENTRY_SIGNAL_ENABLED,
@@ -3635,7 +3791,13 @@ def reversal_momentum_watch_job(current_signal: Optional[Dict[str, Any]] = None)
         sent_count = 0
 
         for event in watch.get("events", []):
-            if should_send_reversal_momentum_alert(event):
+            quality = evaluate_a_plus_quality(current_signal or build_signal(), event=event)
+            event["a_plus_quality"] = quality
+            if A_PLUS_LOG_INFO_TO_DB:
+                record_signal_history("MOMENTUM_QUALITY_EVALUATION", event)
+            structure_key = str((event.get("reversal_from_round_level") or {}).get("round_level") or (event.get("m15_flip") or {}).get("reason") or event.get("datetime") or "")
+            quality_ok = (not A_PLUS_FILTER_MOMENTUM_ALERTS) or should_send_a_plus_alert(quality, event.get("direction"), event.get("interval") or "MOMENTUM", structure_key)
+            if quality_ok and should_send_reversal_momentum_alert(event):
                 send_telegram(format_reversal_momentum_alert(event))
                 sent_count += 1
 
@@ -3678,7 +3840,11 @@ def entry_exit_signal_job() -> None:
         entry_signal = evaluate_entry_signal(current_signal)
         early_watch = evaluate_early_watch(current_signal, entry_signal)
         active_setup = update_active_setup(entry_signal)
+        a_plus_quality = evaluate_a_plus_quality(current_signal, entry_signal)
+        entry_signal["a_plus_quality"] = a_plus_quality
         record_signal_history("ENTRY_EVALUATION", entry_signal)
+        if A_PLUS_LOG_INFO_TO_DB:
+            record_signal_history("A_PLUS_QUALITY_EVALUATION", {"entry_signal": entry_signal, "quality": a_plus_quality})
 
         precision_skip_sent = False
         for candidate in [entry_signal, early_watch]:
@@ -3688,17 +3854,17 @@ def entry_exit_signal_job() -> None:
                     precision_skip_sent = True
 
         early_sent = False
-        if early_watch.get("valid") and should_send_early_watch_alert(early_watch):
+        if (not A_PLUS_DISABLE_EARLY_TELEGRAM) and early_watch.get("valid") and should_send_early_watch_alert(early_watch):
             send_telegram(format_early_watch_alert(early_watch))
             early_sent = True
 
         missed_sent = False
-        if entry_signal.get("missed_trade") and should_send_missed_trade_alert(entry_signal):
+        if (not A_PLUS_DISABLE_MISSED_TELEGRAM) and entry_signal.get("missed_trade") and should_send_missed_trade_alert(entry_signal):
             send_telegram(format_missed_trade_alert(entry_signal))
             missed_sent = True
 
         wait_retest_sent = False
-        if (entry_signal.get("wait_for_retest") or entry_signal.get("blocked_by_structure")) and should_send_wait_retest_alert(entry_signal):
+        if (not A_PLUS_DISABLE_WAIT_RETEST_TELEGRAM) and (entry_signal.get("wait_for_retest") or entry_signal.get("blocked_by_structure")) and should_send_wait_retest_alert(entry_signal):
             if entry_signal.get("wait_for_retest"):
                 send_telegram(format_wait_retest_alert(entry_signal))
             else:
@@ -3706,8 +3872,9 @@ def entry_exit_signal_job() -> None:
             wait_retest_sent = True
 
         entry_sent = False
-        if entry_signal.get("valid") and should_send_entry_alert(entry_signal):
-            send_telegram(format_entry_signal_alert(entry_signal))
+        structure_key = str(((entry_signal.get("structure_guard") or {}).get("level")) or ((current_signal.get("institutional") or {}).get("market_structure_h1") or {}).get("bos") or "")
+        if entry_signal.get("valid") and should_send_entry_alert(entry_signal) and should_send_a_plus_alert(a_plus_quality, entry_signal.get("signal"), "ENTRY", structure_key):
+            send_telegram(format_a_plus_entry_alert(entry_signal))
             entry_sent = True
 
         # Independent warning layer: detects reversal/momentum even when main signal is NO_TRADE.
@@ -4061,7 +4228,7 @@ def job() -> None:
 
 @app.get("/")
 def root():
-    return jsonify({"app": "Gold AI Bot v6.7 Adaptive Trade Memory", "version": APP_VERSION, "status": "ok"})
+    return jsonify({"app": "Gold AI Bot v6.8 A+ Quality Filter", "version": APP_VERSION, "status": "ok"})
 
 
 @app.get("/health")
@@ -4110,6 +4277,13 @@ def health():
         "move_alert_check_interval_minutes": MOVE_ALERT_CHECK_INTERVAL_MINUTES,
         "cache_cleanup_interval_minutes": CACHE_CLEANUP_INTERVAL_MINUTES,
         "cache_max_rows_per_interval": CACHE_MAX_ROWS_PER_INTERVAL,
+        "a_plus_filter_enabled": A_PLUS_FILTER_ENABLED,
+        "a_plus_min_score": A_PLUS_MIN_SCORE,
+        "a_grade_min_score": A_GRADE_MIN_SCORE,
+        "a_plus_telegram_min_grade": A_PLUS_TELEGRAM_MIN_GRADE,
+        "a_plus_cooldown_minutes": A_PLUS_COOLDOWN_MINUTES,
+        "spread_filter_enabled": SPREAD_FILTER_ENABLED,
+        "current_spread_points": CURRENT_SPREAD_POINTS,
     })
 
 
