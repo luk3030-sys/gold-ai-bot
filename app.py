@@ -13,7 +13,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.6.0-neon-postgresql"
+APP_VERSION = "6.7.0-adaptive-trade-memory"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -40,6 +40,21 @@ MAX_SPREAD_POINTS = float(os.getenv("MAX_SPREAD_POINTS", "2.0"))
 
 # Neon / PostgreSQL persistence
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+# v6.7 Adaptive Trade Memory
+ACTIVE_SETUP_ENABLED = env_bool("ACTIVE_SETUP_ENABLED", True)
+ACTIVE_SETUP_FILE = os.getenv("ACTIVE_SETUP_FILE", "active_setup.json")
+SETUP_MAX_AGE_MINUTES = int(os.getenv("SETUP_MAX_AGE_MINUTES", "180"))
+SETUP_CANCEL_DRIFT_POINTS = float(os.getenv("SETUP_CANCEL_DRIFT_POINTS", "25"))
+SETUP_REACTIVATION_ZONE_POINTS = float(os.getenv("SETUP_REACTIVATION_ZONE_POINTS", "8"))
+TRAILING_STOP_ENABLED = env_bool("TRAILING_STOP_ENABLED", True)
+TRAIL_AT_RR_1 = float(os.getenv("TRAIL_AT_RR_1", "1.0"))
+TRAIL_AT_RR_2 = float(os.getenv("TRAIL_AT_RR_2", "1.75"))
+TRAIL_AT_RR_3 = float(os.getenv("TRAIL_AT_RR_3", "2.5"))
+TRAIL_LOCK_R_1 = float(os.getenv("TRAIL_LOCK_R_1", "0.0"))
+TRAIL_LOCK_R_2 = float(os.getenv("TRAIL_LOCK_R_2", "0.75"))
+TRAIL_LOCK_R_3 = float(os.getenv("TRAIL_LOCK_R_3", "1.5"))
+TRADE_HISTORY_ENABLED = env_bool("TRADE_HISTORY_ENABLED", True)
 DATABASE_REQUIRED = env_bool("DATABASE_REQUIRED", True)
 DATABASE_CONNECT_TIMEOUT_SECONDS = int(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "10"))
 DB_STATUS: Dict[str, Any] = {
@@ -314,7 +329,7 @@ def _db_connect():
     return psycopg2.connect(
         DATABASE_URL,
         connect_timeout=max(1, DATABASE_CONNECT_TIMEOUT_SECONDS),
-        application_name="gold-ai-bot-v6.6",
+        application_name="gold-ai-bot-v6.7",
     )
 
 
@@ -345,6 +360,41 @@ def init_db() -> None:
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_app_state_updated_at ON app_state(updated_at DESC)"
                 )
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS signal_history (
+                        id BIGSERIAL PRIMARY KEY,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        signal_type TEXT NOT NULL,
+                        side TEXT,
+                        score INTEGER,
+                        entry NUMERIC,
+                        sl NUMERIC,
+                        tp1 NUMERIC,
+                        status TEXT NOT NULL,
+                        payload JSONB NOT NULL
+                    )
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_history_created_at ON signal_history(created_at DESC)")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS trade_history (
+                        id BIGSERIAL PRIMARY KEY,
+                        position_id INTEGER,
+                        opened_at TIMESTAMPTZ,
+                        closed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        symbol TEXT,
+                        side TEXT,
+                        entry NUMERIC,
+                        exit_price NUMERIC,
+                        initial_sl NUMERIC,
+                        final_sl NUMERIC,
+                        result_points NUMERIC,
+                        result_r NUMERIC,
+                        outcome TEXT,
+                        close_reason TEXT,
+                        payload JSONB NOT NULL
+                    )
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_history_closed_at ON trade_history(closed_at DESC)")
         DB_STATUS.update({
             "configured": True,
             "connected": True,
@@ -438,6 +488,104 @@ def save_json(path: str, data: Any) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
+
+def record_signal_history(signal_type: str, payload: Dict[str, Any]) -> None:
+    if not (TRADE_HISTORY_ENABLED and DATABASE_URL):
+        return
+    try:
+        side = payload.get("side") or payload.get("signal")
+        plan = payload.get("risk_plan") or {}
+        with _db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO signal_history(signal_type, side, score, entry, sl, tp1, status, payload)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (signal_type, side, payload.get("score"), plan.get("entry") or payload.get("entry"),
+                     plan.get("sl") or payload.get("sl"), plan.get("tp1") or payload.get("tp1"),
+                     payload.get("status", "unknown"), Json(payload)),
+                )
+    except Exception as e:
+        print(f"SIGNAL HISTORY ERROR: {type(e).__name__}: {e}")
+
+
+def load_active_setup() -> Dict[str, Any]:
+    return load_json(ACTIVE_SETUP_FILE, {}) if ACTIVE_SETUP_ENABLED else {}
+
+
+def save_active_setup(setup: Dict[str, Any]) -> None:
+    if ACTIVE_SETUP_ENABLED:
+        save_json(ACTIVE_SETUP_FILE, setup)
+
+
+def update_active_setup(entry_signal: Dict[str, Any]) -> Dict[str, Any]:
+    if not ACTIVE_SETUP_ENABLED:
+        return {}
+    current = load_active_setup()
+    now_ts = _utc_ts()
+    if entry_signal.get("valid"):
+        side = entry_signal.get("side") or entry_signal.get("signal")
+        entry = safe_float(entry_signal.get("entry") or (entry_signal.get("risk_plan") or {}).get("entry"))
+        if side in ("BUY", "SELL") and entry is not None:
+            setup = {
+                "status": "ACTIVE", "side": side, "entry": entry,
+                "created_ts": now_ts, "created_utc": now_utc(),
+                "last_seen_utc": now_utc(), "payload": entry_signal,
+            }
+            save_active_setup(setup)
+            return setup
+    if not current:
+        return {}
+    created_ts = float(current.get("created_ts", now_ts))
+    if now_ts - created_ts > SETUP_MAX_AGE_MINUTES * 60:
+        current.update({"status": "EXPIRED", "updated_utc": now_utc()})
+        save_active_setup(current)
+        return current
+    try:
+        price, _ = current_price_and_atr()
+        entry = float(current.get("entry"))
+        drift = abs(price-entry)
+        if drift > SETUP_CANCEL_DRIFT_POINTS:
+            current.update({"status": "CANCELLED_DRIFT", "last_price": price, "drift": round(drift,2), "updated_utc": now_utc()})
+        elif current.get("status") == "CANCELLED_DRIFT" and drift <= SETUP_REACTIVATION_ZONE_POINTS:
+            current.update({"status": "REACTIVATED", "last_price": price, "drift": round(drift,2), "updated_utc": now_utc()})
+        else:
+            current.update({"last_price": price, "drift": round(drift,2), "last_seen_utc": now_utc()})
+        save_active_setup(current)
+    except Exception as e:
+        current["last_error"] = f"{type(e).__name__}: {e}"
+    return current
+
+
+def record_closed_trade(p: Dict[str, Any], exit_price: Optional[float], reason: str) -> None:
+    if not (TRADE_HISTORY_ENABLED and DATABASE_URL):
+        return
+    try:
+        entry=float(p.get("entry")); side=str(p.get("side")); initial_sl=safe_float(p.get("initial_sl"), safe_float(p.get("sl")))
+        final_sl=safe_float(p.get("sl")); risk=abs(entry-initial_sl) if initial_sl is not None else None
+        points=None if exit_price is None else ((entry-exit_price) if side=="SELL" else (exit_price-entry))
+        result_r=(points/risk) if points is not None and risk else None
+        outcome="OPEN_UNKNOWN" if points is None else ("WIN" if points>0 else "LOSS" if points<0 else "BE")
+        with _db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO trade_history(position_id,opened_at,symbol,side,entry,exit_price,initial_sl,final_sl,result_points,result_r,outcome,close_reason,payload)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (p.get("id"),p.get("created_utc"),p.get("symbol"),side,entry,exit_price,initial_sl,final_sl,points,result_r,outcome,reason,Json(p)))
+    except Exception as e:
+        print(f"TRADE HISTORY ERROR: {type(e).__name__}: {e}")
+
+
+def trade_statistics() -> Dict[str, Any]:
+    if not DATABASE_URL:
+        return {"configured": False}
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT COUNT(*), COUNT(*) FILTER (WHERE outcome='WIN'), COUNT(*) FILTER (WHERE outcome='LOSS'),
+                COALESCE(AVG(result_r),0), COALESCE(SUM(result_points),0) FROM trade_history""")
+            total,wins,losses,avg_r,total_points=cur.fetchone()
+    return {"configured": True, "trades": total, "wins": wins, "losses": losses,
+            "win_rate": round((wins/total*100),2) if total else 0.0, "avg_r": round(float(avg_r),3),
+            "total_points": round(float(total_points),2)}
 
 
 def load_positions() -> List[Dict[str, Any]]:
@@ -1598,6 +1746,7 @@ def add_position(side: str, entry: float, volume: Optional[float] = None, chat_i
         "entry": round(entry, 2),
         "volume": float(volume or DEFAULT_POSITION_VOLUME),
         "sl": rp["sl"],
+        "initial_sl": rp["sl"],
         "tp1": rp["tp1"],
         "tp2": rp["tp2"],
         "tp3": rp["tp3"],
@@ -1619,11 +1768,14 @@ def add_position(side: str, entry: float, volume: Optional[float] = None, chat_i
     return p
 
 
-def close_position(position_id: int) -> bool:
+def close_position(position_id: int, exit_price: Optional[float] = None, reason: str = "manual") -> bool:
     positions = load_positions()
+    closed = next((p for p in positions if int(p.get("id", -1)) == int(position_id)), None)
     new_positions = [p for p in positions if int(p.get("id", -1)) != int(position_id)]
     save_positions(new_positions)
-    return len(new_positions) != len(positions)
+    if closed:
+        record_closed_trade(closed, exit_price, reason)
+    return closed is not None
 
 
 def update_position(position_id: int, **updates: Any) -> Optional[Dict[str, Any]]:
@@ -1661,6 +1813,23 @@ def position_monitor_job() -> None:
             pnl_points = (entry - price) if side == "SELL" else (price - entry)
             rr = pnl_points / risk if risk else 0
             chat_id = p.get("chat_id") or TELEGRAM_CHAT_ID
+
+            if TRAILING_STOP_ENABLED and risk and rr >= TRAIL_AT_RR_1:
+                lock_r = TRAIL_LOCK_R_1
+                if rr >= TRAIL_AT_RR_3:
+                    lock_r = TRAIL_LOCK_R_3
+                elif rr >= TRAIL_AT_RR_2:
+                    lock_r = TRAIL_LOCK_R_2
+                proposed_sl = entry - risk * lock_r if side == "SELL" else entry + risk * lock_r
+                improves = (side == "SELL" and (sl is None or proposed_sl < sl)) or (side == "BUY" and (sl is None or proposed_sl > sl))
+                if improves:
+                    old_sl = sl
+                    p["sl"] = round(proposed_sl, 2)
+                    p["trailing_updated_utc"] = now_utc()
+                    p["trailing_lock_r"] = lock_r
+                    sl = float(p["sl"])
+                    changed = True
+                    alert_once(f"TRAIL_{lock_r}", f"🔒 Pozycja #{p['id']} {side}: automatyczny SL w pamięci bota {old_sl} → {p['sl']} (zabezpieczone {lock_r}R). Ustaw ten SL ręcznie u brokera.")
 
             def alert_once(key: str, text: str):
                 nonlocal changed
@@ -3508,6 +3677,8 @@ def entry_exit_signal_job() -> None:
 
         entry_signal = evaluate_entry_signal(current_signal)
         early_watch = evaluate_early_watch(current_signal, entry_signal)
+        active_setup = update_active_setup(entry_signal)
+        record_signal_history("ENTRY_EVALUATION", entry_signal)
 
         precision_skip_sent = False
         for candidate in [entry_signal, early_watch]:
@@ -3556,6 +3727,7 @@ def entry_exit_signal_job() -> None:
             "last_early_sent": early_sent,
             "last_precision_skip_sent": precision_skip_sent,
             "last_entry_signal": entry_signal,
+            "active_setup": active_setup,
             "last_entry_sent": entry_sent,
             "last_missed_sent": missed_sent,
             "last_wait_retest_sent": wait_retest_sent,
@@ -3575,7 +3747,7 @@ def entry_exit_signal_job() -> None:
 
 def command_help() -> str:
     return (
-        "Komendy Gold AI Bot v6.6:\n"
+        "Komendy Gold AI Bot v6.7:\n"
         "/position SELL 4097 — dodaj pozycję SELL i automatycznie wylicz SL/TP\n"
         "/position BUY 4097 — dodaj pozycję BUY i automatycznie wylicz SL/TP\n"
         "/positions — pokaż otwarte pozycje\n"
@@ -3889,7 +4061,7 @@ def job() -> None:
 
 @app.get("/")
 def root():
-    return jsonify({"app": "Gold AI Bot v6.6 PostgreSQL Edition", "version": APP_VERSION, "status": "ok"})
+    return jsonify({"app": "Gold AI Bot v6.7 Adaptive Trade Memory", "version": APP_VERSION, "status": "ok"})
 
 
 @app.get("/health")
@@ -4459,6 +4631,40 @@ def telegram_webhook():
     return jsonify({"ok": True})
 
 
+@app.get("/active-setup")
+def active_setup_endpoint():
+    return jsonify({"status": "ok", "version": APP_VERSION, "setup": load_active_setup()})
+
+
+@app.get("/trade-stats")
+def trade_stats_endpoint():
+    try:
+        return jsonify({"status": "ok", "version": APP_VERSION, "statistics": trade_statistics()})
+    except Exception as e:
+        return jsonify({"status": "error", "version": APP_VERSION, "error": f"{type(e).__name__}: {e}"}), 200
+
+
+@app.get("/trade-history")
+def trade_history_endpoint():
+    limit = max(1, min(int(request.args.get("limit", 50)), 500))
+    try:
+        with _db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT position_id, opened_at, closed_at, symbol, side, entry, exit_price, result_points, result_r, outcome, close_reason FROM trade_history ORDER BY closed_at DESC LIMIT %s", (limit,))
+                cols=[d[0] for d in cur.description]
+                rows=[dict(zip(cols,row)) for row in cur.fetchall()]
+        for r in rows:
+            for k,v in list(r.items()):
+                if hasattr(v, "isoformat"): r[k]=v.isoformat()
+                elif isinstance(v, (float,int,str,type(None))): pass
+                else:
+                    try: r[k]=float(v)
+                    except Exception: r[k]=str(v)
+        return jsonify({"status":"ok","version":APP_VERSION,"count":len(rows),"trades":rows})
+    except Exception as e:
+        return jsonify({"status":"error","version":APP_VERSION,"error":f"{type(e).__name__}: {e}"}), 200
+
+
 @app.get("/move-alert-test")
 def move_alert_test():
     results = []
@@ -4487,7 +4693,7 @@ if SCHEDULER_ENABLED:
         job,
         "interval",
         minutes=max(1, RUN_INTERVAL_MINUTES),
-        id="gold_ai_bot_v6_6_signal",
+        id="gold_ai_bot_v6_7_signal",
         replace_existing=True,
     )
 
