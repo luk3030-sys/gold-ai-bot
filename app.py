@@ -8,10 +8,12 @@ from typing import Dict, Any, List, Optional, Tuple
 import requests
 import pandas as pd
 import numpy as np
+import psycopg2
+from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.5.12-precision-signal-alignment"
+APP_VERSION = "6.6.0-neon-postgresql"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -35,6 +37,17 @@ CLOSED_CANDLES_ONLY = env_bool("CLOSED_CANDLES_ONLY", True)
 RUN_INTERVAL_MINUTES = int(os.getenv("RUN_INTERVAL_MINUTES", "15"))
 MIN_SCORE_TO_ALERT = int(os.getenv("MIN_SCORE_TO_ALERT", "75"))
 MAX_SPREAD_POINTS = float(os.getenv("MAX_SPREAD_POINTS", "2.0"))
+
+# Neon / PostgreSQL persistence
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DATABASE_REQUIRED = env_bool("DATABASE_REQUIRED", True)
+DATABASE_CONNECT_TIMEOUT_SECONDS = int(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "10"))
+DB_STATUS: Dict[str, Any] = {
+    "configured": bool(DATABASE_URL),
+    "connected": False,
+    "last_success_utc": None,
+    "last_error": None,
+}
 
 # Position manager settings
 POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json")
@@ -295,7 +308,100 @@ def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
+def _db_connect():
+    if not DATABASE_URL:
+        raise RuntimeError("Brak DATABASE_URL")
+    return psycopg2.connect(
+        DATABASE_URL,
+        connect_timeout=max(1, DATABASE_CONNECT_TIMEOUT_SECONDS),
+        application_name="gold-ai-bot-v6.6",
+    )
+
+
+def init_db() -> None:
+    """Tworzy trwały magazyn JSONB w Neon/PostgreSQL."""
+    if not DATABASE_URL:
+        DB_STATUS.update({
+            "configured": False,
+            "connected": False,
+            "last_error": "Brak DATABASE_URL",
+        })
+        if DATABASE_REQUIRED:
+            raise RuntimeError("DATABASE_REQUIRED=true, ale brak DATABASE_URL")
+        return
+
+    try:
+        with _db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS app_state (
+                        state_key TEXT PRIMARY KEY,
+                        state_value JSONB NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_app_state_updated_at ON app_state(updated_at DESC)"
+                )
+        DB_STATUS.update({
+            "configured": True,
+            "connected": True,
+            "last_success_utc": now_utc(),
+            "last_error": None,
+        })
+        print("DATABASE OK: Neon/PostgreSQL connected; app_state ready")
+    except Exception as e:
+        DB_STATUS.update({
+            "configured": True,
+            "connected": False,
+            "last_error": f"{type(e).__name__}: {e}",
+        })
+        print(f"DATABASE INIT ERROR: {type(e).__name__}: {e}")
+        if DATABASE_REQUIRED:
+            raise
+
+
+def database_healthcheck() -> Dict[str, Any]:
+    result = dict(DB_STATUS)
+    if not DATABASE_URL:
+        return result
+    try:
+        with _db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM app_state")
+                result["state_rows"] = int(cur.fetchone()[0])
+                cur.execute("SELECT NOW()")
+                result["server_time_utc"] = cur.fetchone()[0].isoformat()
+        result.update({"connected": True, "last_success_utc": now_utc(), "last_error": None})
+        DB_STATUS.update(result)
+    except Exception as e:
+        result.update({"connected": False, "last_error": f"{type(e).__name__}: {e}"})
+        DB_STATUS.update(result)
+    return result
+
+
+def _state_key(path: str) -> str:
+    return os.path.basename(str(path)).strip() or "unnamed_state"
+
+
 def load_json(path: str, default: Any) -> Any:
+    """Odczytuje stan z Neon. Przy DATABASE_REQUIRED=false może użyć pliku awaryjnie."""
+    key = _state_key(path)
+    if DATABASE_URL:
+        try:
+            with _db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT state_value FROM app_state WHERE state_key = %s", (key,))
+                    row = cur.fetchone()
+            DB_STATUS.update({"connected": True, "last_success_utc": now_utc(), "last_error": None})
+            return row[0] if row else default
+        except Exception as e:
+            DB_STATUS.update({"connected": False, "last_error": f"load {key}: {type(e).__name__}: {e}"})
+            if DATABASE_REQUIRED:
+                raise
+
     try:
         if not os.path.exists(path):
             return default
@@ -306,6 +412,28 @@ def load_json(path: str, default: Any) -> Any:
 
 
 def save_json(path: str, data: Any) -> None:
+    """Zapisuje stan atomowo do Neon przez UPSERT."""
+    key = _state_key(path)
+    if DATABASE_URL:
+        try:
+            with _db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO app_state(state_key, state_value, updated_at)
+                        VALUES (%s, %s, NOW())
+                        ON CONFLICT (state_key) DO UPDATE
+                        SET state_value = EXCLUDED.state_value, updated_at = NOW()
+                        """,
+                        (key, Json(data)),
+                    )
+            DB_STATUS.update({"connected": True, "last_success_utc": now_utc(), "last_error": None})
+            return
+        except Exception as e:
+            DB_STATUS.update({"connected": False, "last_error": f"save {key}: {type(e).__name__}: {e}"})
+            if DATABASE_REQUIRED:
+                raise
+
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1392,7 +1520,7 @@ def format_signal(s: Dict[str, Any]) -> str:
     rp = s["risk_plan"]
     inst = s["institutional"]
     return (
-        f"🟣 GOLD AI BOT v6.5 — SMART POSITION MANAGER\n"
+        f"🟣 GOLD AI BOT v6.6 — POSTGRESQL SMART POSITION MANAGER\n"
         f"Symbol: {s['symbol']}\nSygnał: {s['signal']}\nScore regułowy: {s['score']}/100\n"
         f"Cena: {s['price']}\nTrend M15/H1/H4/D1: {s['trend']['M15']} / {s['trend']['H1']} / {s['trend']['H4']} / {s['trend']['D1']}\n\n"
         f"Market Structure H1: {inst['market_structure_h1']['direction']} | BOS: {inst['market_structure_h1']['bos']} | CHOCH: {inst['market_structure_h1']['choch']}\n"
@@ -3447,7 +3575,7 @@ def entry_exit_signal_job() -> None:
 
 def command_help() -> str:
     return (
-        "Komendy Gold AI Bot v6.5:\n"
+        "Komendy Gold AI Bot v6.6:\n"
         "/position SELL 4097 — dodaj pozycję SELL i automatycznie wylicz SL/TP\n"
         "/position BUY 4097 — dodaj pozycję BUY i automatycznie wylicz SL/TP\n"
         "/positions — pokaż otwarte pozycje\n"
@@ -3761,7 +3889,7 @@ def job() -> None:
 
 @app.get("/")
 def root():
-    return jsonify({"app": "Gold AI Bot v6.5", "version": APP_VERSION, "status": "ok"})
+    return jsonify({"app": "Gold AI Bot v6.6 PostgreSQL Edition", "version": APP_VERSION, "status": "ok"})
 
 
 @app.get("/health")
@@ -3774,9 +3902,12 @@ def health():
         except Exception:
             scheduler_jobs = []
 
+    db_health = database_healthcheck()
+
     return jsonify({
-        "status": "ok",
+        "status": "ok" if db_health.get("connected") or not DATABASE_REQUIRED else "degraded",
         "version": APP_VERSION,
+        "database": db_health,
         "scheduler_enabled": SCHEDULER_ENABLED,
         "scheduler_running": scheduler_running,
         "scheduler_jobs": scheduler_jobs,
@@ -3847,9 +3978,12 @@ def telegram_poll_now_endpoint():
 
 @app.get("/cache-status")
 def cache_status_endpoint():
+    db_health = database_healthcheck()
+
     return jsonify({
-        "status": "ok",
+        "status": "ok" if db_health.get("connected") or not DATABASE_REQUIRED else "degraded",
         "version": APP_VERSION,
+        "database": db_health,
         "cache": cache_status_snapshot(),
         "fast_check": fast_check_status_snapshot(),
         "runtime": {
@@ -3862,9 +3996,12 @@ def cache_status_endpoint():
 
 @app.get("/fast-check-status")
 def fast_check_status_endpoint():
+    db_health = database_healthcheck()
+
     return jsonify({
-        "status": "ok",
+        "status": "ok" if db_health.get("connected") or not DATABASE_REQUIRED else "degraded",
         "version": APP_VERSION,
+        "database": db_health,
         "fast_check": fast_check_status_snapshot(),
         "cache": cache_status_snapshot(),
         "api_runtime": api_runtime_snapshot(),
@@ -3874,9 +4011,12 @@ def fast_check_status_endpoint():
 
 @app.get("/quota-status")
 def quota_status_endpoint():
+    db_health = database_healthcheck()
+
     return jsonify({
-        "status": "ok",
+        "status": "ok" if db_health.get("connected") or not DATABASE_REQUIRED else "degraded",
         "version": APP_VERSION,
+        "database": db_health,
         "api_runtime": api_runtime_snapshot(),
     })
 
@@ -3988,9 +4128,12 @@ def tick_endpoint():
 
 @app.get("/move-alert-status")
 def move_alert_status_endpoint():
+    db_health = database_healthcheck()
+
     return jsonify({
-        "status": "ok",
+        "status": "ok" if db_health.get("connected") or not DATABASE_REQUIRED else "degraded",
         "version": APP_VERSION,
+        "database": db_health,
         "move_alert_config": {
             "enabled": MOVE_ALERT_ENABLED,
             "intervals": MOVE_ALERT_INTERVALS,
@@ -4025,9 +4168,12 @@ def move_alert_status_endpoint():
 @app.post("/move-alert-run-now")
 def move_alert_run_now_endpoint():
     check_move_alerts()
+    db_health = database_healthcheck()
+
     return jsonify({
-        "status": "ok",
+        "status": "ok" if db_health.get("connected") or not DATABASE_REQUIRED else "degraded",
         "version": APP_VERSION,
+        "database": db_health,
         "last_move_alert_status": LAST_MOVE_ALERT_STATUS,
         "api_runtime": api_runtime_snapshot(),
     })
@@ -4263,9 +4409,12 @@ def signal_now_endpoint():
 @app.post("/entry-exit-run-now")
 def entry_exit_run_now_endpoint():
     entry_exit_signal_job()
+    db_health = database_healthcheck()
+
     return jsonify({
-        "status": "ok",
+        "status": "ok" if db_health.get("connected") or not DATABASE_REQUIRED else "degraded",
         "version": APP_VERSION,
+        "database": db_health,
         "entry_exit_status": LAST_ENTRY_EXIT_STATUS,
     })
 
@@ -4321,6 +4470,9 @@ def move_alert_test():
     return jsonify({"results": results})
 
 
+# Initialize Neon/PostgreSQL before loading persistent state.
+init_db()
+
 # Restore persistent cache before scheduler starts.
 load_ohlc_cache()
 cleanup_cache_job()
@@ -4335,7 +4487,7 @@ if SCHEDULER_ENABLED:
         job,
         "interval",
         minutes=max(1, RUN_INTERVAL_MINUTES),
-        id="gold_ai_bot_v6_5_signal",
+        id="gold_ai_bot_v6_6_signal",
         replace_existing=True,
     )
 
