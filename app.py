@@ -13,7 +13,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.8.2-a-plus-momentum-breakout-cron-safe"
+APP_VERSION = "7.0.0-institutional-signal-intelligence"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -94,6 +94,32 @@ MOMENTUM_BREAKOUT_STATE_FILE = os.getenv("MOMENTUM_BREAKOUT_STATE_FILE", "moment
 MOMENTUM_BREAKOUT_LOG_TO_DB = env_bool("MOMENTUM_BREAKOUT_LOG_TO_DB", True)
 MOMENTUM_BREAKOUT_REQUIRE_H1_H4 = env_bool("MOMENTUM_BREAKOUT_REQUIRE_H1_H4", True)
 MOMENTUM_BREAKOUT_REQUIRE_M15 = env_bool("MOMENTUM_BREAKOUT_REQUIRE_M15", True)
+
+# v7.0 Institutional Signal Intelligence
+# Confidence is a transparent evidence score (0-100), NOT a statistical win probability.
+CONFIDENCE_ENGINE_ENABLED = env_bool("CONFIDENCE_ENGINE_ENABLED", True)
+A_PLUS_2_ENABLED = env_bool("A_PLUS_2_ENABLED", True)
+A_PLUS_MIN_CONFIDENCE = int(os.getenv("A_PLUS_MIN_CONFIDENCE", "80"))
+MOMENTUM_BREAKOUT_MIN_CONFIDENCE = int(os.getenv("MOMENTUM_BREAKOUT_MIN_CONFIDENCE", "76"))
+
+# Extreme Candle Intelligence
+EXTREME_CANDLE_ENABLED = env_bool("EXTREME_CANDLE_ENABLED", True)
+EXTREME_CANDLE_INTERVALS = [
+    x.strip() for x in os.getenv("EXTREME_CANDLE_INTERVALS", "15min,1h").split(",") if x.strip()
+]
+EXTREME_CANDLE_LOOKBACK = int(os.getenv("EXTREME_CANDLE_LOOKBACK", "200"))
+EXTREME_CANDLE_STRUCTURE_LOOKBACK = int(os.getenv("EXTREME_CANDLE_STRUCTURE_LOOKBACK", "20"))
+EXTREME_CANDLE_MIN_BODY_ATR = float(os.getenv("EXTREME_CANDLE_MIN_BODY_ATR", "1.80"))
+EXTREME_CANDLE_MIN_RANGE_ATR = float(os.getenv("EXTREME_CANDLE_MIN_RANGE_ATR", "2.00"))
+EXTREME_CANDLE_MIN_PERCENTILE = float(os.getenv("EXTREME_CANDLE_MIN_PERCENTILE", "95"))
+EXTREME_CANDLE_EXHAUSTION_ATR = float(os.getenv("EXTREME_CANDLE_EXHAUSTION_ATR", "2.40"))
+EXTREME_CANDLE_RSI_HIGH = float(os.getenv("EXTREME_CANDLE_RSI_HIGH", "78"))
+EXTREME_CANDLE_RSI_LOW = float(os.getenv("EXTREME_CANDLE_RSI_LOW", "22"))
+EXTREME_CANDLE_CLOSE_EDGE_MIN = float(os.getenv("EXTREME_CANDLE_CLOSE_EDGE_MIN", "0.70"))
+EXTREME_CANDLE_WICK_RATIO_MIN = float(os.getenv("EXTREME_CANDLE_WICK_RATIO_MIN", "0.25"))
+EXTREME_CANDLE_COOLDOWN_MINUTES = int(os.getenv("EXTREME_CANDLE_COOLDOWN_MINUTES", "120"))
+EXTREME_CANDLE_STATE_FILE = os.getenv("EXTREME_CANDLE_STATE_FILE", "extreme_candle_state.json")
+EXTREME_CANDLE_LOG_TO_DB = env_bool("EXTREME_CANDLE_LOG_TO_DB", True)
 
 SPREAD_FILTER_ENABLED = env_bool("SPREAD_FILTER_ENABLED", False)
 try:
@@ -2682,6 +2708,54 @@ def _a_plus_grade_rank(grade: str) -> int:
     return {"INFO": 0, "A": 1, "A+": 2}.get(str(grade or "INFO").upper(), 0)
 
 
+def evaluate_confidence_score(
+    current_signal: Dict[str, Any],
+    quality: Optional[Dict[str, Any]] = None,
+    side: Optional[str] = None,
+    event: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Transparent v7 evidence score. It is NOT a calibrated probability of profit."""
+    quality = quality or {}
+    event = event or {}
+    resolved_side = str(side or quality.get("side") or event.get("direction") or current_signal.get("signal") or "NO_TRADE").upper()
+    if resolved_side not in ("BUY", "SELL"):
+        return {"enabled": CONFIDENCE_ENGINE_ENABLED, "score": 0, "label": "LOW", "note": "Evidence score, not win probability."}
+
+    q_score = safe_float(event.get("quality_score"), safe_float(quality.get("quality_score"), 0.0)) or 0.0
+    ds = current_signal.get("directional_scores") or {}
+    side_score = safe_float(ds.get(resolved_side), 0.0) or 0.0
+    opposite = "SELL" if resolved_side == "BUY" else "BUY"
+    opposite_score = safe_float(ds.get(opposite), 0.0) or 0.0
+    edge = max(0.0, side_score - opposite_score)
+    edge_scaled = min(100.0, edge * 2.0)
+
+    trends = current_signal.get("trend") or event.get("trend") or {}
+    required = "UP" if resolved_side == "BUY" else "DOWN"
+    mtf_weights = {"M15": 20, "H1": 30, "H4": 30, "D1": 20}
+    mtf_score = sum(w for tf, w in mtf_weights.items() if trends.get(tf) == required)
+
+    score = round(
+        0.45 * min(100.0, q_score)
+        + 0.20 * min(100.0, side_score)
+        + 0.15 * edge_scaled
+        + 0.20 * mtf_score
+    )
+    score = int(max(0, min(100, score)))
+    label = "VERY_HIGH" if score >= 90 else "HIGH" if score >= 80 else "MODERATE" if score >= 70 else "LOW"
+    return {
+        "enabled": CONFIDENCE_ENGINE_ENABLED,
+        "score": score,
+        "label": label,
+        "components": {
+            "rule_quality": round(q_score, 1),
+            "directional_score": round(side_score, 1),
+            "directional_edge": round(edge, 1),
+            "mtf_alignment": mtf_score,
+        },
+        "note": "Heurystyczny evidence score 0-100; nie jest statystycznym prawdopodobieństwem wygranej.",
+    }
+
+
 def evaluate_a_plus_quality(
     current_signal: Dict[str, Any],
     candidate: Optional[Dict[str, Any]] = None,
@@ -2802,6 +2876,7 @@ def format_a_plus_entry_alert(e: Dict[str, Any]) -> str:
     return (
         f"{icon} GOLD {q.get('grade')} SETUP — {side}\n\n"
         f"Jakość: {q.get('quality_score')}/100 | Warunki: {q.get('conditions_passed')}/{q.get('conditions_total')}\n"
+        f"Confidence: {(e.get('confidence') or {}).get('score')}/100 ({(e.get('confidence') or {}).get('label')})\n"
         f"Score kierunkowy: {e.get('score')}/100 | RR do TP1: {e.get('rr_to_tp1')}\n\n"
         f"Entry: {e.get('entry')}\nSL: {e.get('sl')}\nTP1: {e.get('tp1')}\nTP2: {e.get('tp2')}\nTP3: {e.get('tp3')}\n\n"
         f"Spełnione: {', '.join(passed) or '-'}\n"
@@ -3763,11 +3838,180 @@ def format_momentum_breakout_alert(event: Dict[str, Any]) -> str:
         f"Cena zamknięcia: {event.get('price')}\n"
         f"Przełamany poziom: {event.get('breakout_level')}\n"
         f"Jakość: {event.get('quality_score')}/100 ({event.get('checks_passed')}/{event.get('checks_total')})\n"
+        f"Confidence: {(event.get('confidence') or {}).get('score')}/100 ({(event.get('confidence') or {}).get('label')})\n"
         f"Body/ATR: {event.get('body_atr')} | Range/ATR: {event.get('range_atr')} | Body ratio: {event.get('body_ratio')}\n"
         f"Trend M15/H1/H4/D1: {trends.get('M15')} / {trends.get('H1')} / {trends.get('H4')} / {trends.get('D1')}\n\n"
         f"Plan obserwacji: {event.get('instruction')}\n"
         f"Braki: {', '.join(failed) or '-'}\n\n"
         f"To jest wczesny alert o wybiciu, nie automatyczne wejście. Poczekaj na retest lub dalsze potwierdzenie."
+    )
+
+
+def _percentile_rank(value: float, series: pd.Series) -> float:
+    clean = pd.to_numeric(series, errors="coerce").dropna()
+    if clean.empty:
+        return 0.0
+    return float((clean <= value).mean() * 100.0)
+
+
+def _extreme_candle_candidate(interval: str, current_signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Classify an exceptional closed candle as TREND, REVERSAL or EXHAUSTION."""
+    try:
+        lookback = max(50, EXTREME_CANDLE_LOOKBACK)
+        structure_lb = max(10, EXTREME_CANDLE_STRUCTURE_LOOKBACK)
+        df = add_indicators(fetch_ohlc(interval, lookback + 30))
+        if df is None or len(df) < min(60, structure_lb + 10):
+            return None
+
+        last = df.iloc[-1]
+        hist = df.iloc[:-1].tail(lookback)
+        body = float(last.close - last.open)
+        rng = float(last.high - last.low)
+        atrv = float(last.atr14)
+        if atrv <= 0 or rng <= 0 or body == 0:
+            return None
+
+        side = "BUY" if body > 0 else "SELL"
+        body_atr = abs(body) / atrv
+        range_atr = rng / atrv
+        body_ratio = abs(body) / rng
+        range_hist = (hist.high - hist.low).abs()
+        percentile = _percentile_rank(rng, range_hist)
+        rsi_value = safe_float(last.rsi14)
+
+        close_pos = (float(last.close) - float(last.low)) / rng
+        directional_close = close_pos if side == "BUY" else (1.0 - close_pos)
+        upper_wick = float(last.high) - max(float(last.open), float(last.close))
+        lower_wick = min(float(last.open), float(last.close)) - float(last.low)
+        adverse_wick = upper_wick if side == "BUY" else lower_wick
+        adverse_wick_ratio = max(0.0, adverse_wick / rng)
+
+        sh = hist.tail(structure_lb)
+        prior_high = float(sh.high.max())
+        prior_low = float(sh.low.min())
+        structure_break = float(last.close) > prior_high if side == "BUY" else float(last.close) < prior_low
+
+        trends = current_signal.get("trend") or {}
+        req = "UP" if side == "BUY" else "DOWN"
+        opp = "DOWN" if side == "BUY" else "UP"
+        trend_aligned = trends.get("H1") == req and trends.get("H4") == req
+        against_major = trends.get("H1") == opp and trends.get("H4") == opp
+        overextended = (side == "BUY" and rsi_value is not None and rsi_value >= EXTREME_CANDLE_RSI_HIGH) or (
+            side == "SELL" and rsi_value is not None and rsi_value <= EXTREME_CANDLE_RSI_LOW
+        )
+
+        is_extreme = (
+            body_atr >= EXTREME_CANDLE_MIN_BODY_ATR
+            or range_atr >= EXTREME_CANDLE_MIN_RANGE_ATR
+            or percentile >= EXTREME_CANDLE_MIN_PERCENTILE
+        )
+        if not is_extreme:
+            return None
+
+        if (
+            (body_atr >= EXTREME_CANDLE_EXHAUSTION_ATR or range_atr >= EXTREME_CANDLE_EXHAUSTION_ATR or percentile >= 98.0)
+            and overextended
+            and (adverse_wick_ratio >= EXTREME_CANDLE_WICK_RATIO_MIN or not structure_break)
+        ):
+            classification = "EXHAUSTION"
+        elif against_major and structure_break and directional_close >= EXTREME_CANDLE_CLOSE_EDGE_MIN:
+            classification = "REVERSAL"
+        elif trend_aligned and structure_break and directional_close >= EXTREME_CANDLE_CLOSE_EDGE_MIN:
+            classification = "TREND"
+        else:
+            classification = "EXTREME_VOLATILITY"
+
+        quality_points = 0
+        quality_points += 25 if body_atr >= EXTREME_CANDLE_MIN_BODY_ATR else 0
+        quality_points += 20 if range_atr >= EXTREME_CANDLE_MIN_RANGE_ATR else 0
+        quality_points += 20 if percentile >= EXTREME_CANDLE_MIN_PERCENTILE else 0
+        quality_points += 15 if structure_break else 0
+        quality_points += 10 if directional_close >= EXTREME_CANDLE_CLOSE_EDGE_MIN else 0
+        quality_points += 10 if (trend_aligned or against_major) else 0
+        quality_score = min(100, quality_points)
+
+        event = {
+            "type": "EXTREME_CANDLE",
+            "valid": True,
+            "classification": classification,
+            "direction": side,
+            "interval": interval,
+            "datetime": str(last.datetime),
+            "price": round(float(last.close), 2),
+            "open": round(float(last.open), 2),
+            "high": round(float(last.high), 2),
+            "low": round(float(last.low), 2),
+            "body_atr": round(body_atr, 2),
+            "range_atr": round(range_atr, 2),
+            "body_ratio": round(body_ratio, 2),
+            "range_percentile": round(percentile, 1),
+            "rsi": round(rsi_value, 1) if rsi_value is not None else None,
+            "directional_close_position": round(directional_close, 2),
+            "adverse_wick_ratio": round(adverse_wick_ratio, 2),
+            "structure_break": structure_break,
+            "trend_aligned": trend_aligned,
+            "against_major_trend": against_major,
+            "overextended": overextended,
+            "quality_score": int(quality_score),
+            "trend": trends,
+        }
+        event["confidence"] = evaluate_confidence_score(current_signal, side=side, event=event)
+        event["dedupe_key"] = f"{classification}:{side}:{interval}:{last.datetime}"
+        return event
+    except Exception as e:
+        return {"type": "EXTREME_CANDLE", "valid": False, "interval": interval, "error": f"{type(e).__name__}: {e}"}
+
+
+def detect_extreme_candles(current_signal: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    if not EXTREME_CANDLE_ENABLED:
+        return []
+    resolved = current_signal or build_signal()
+    out: List[Dict[str, Any]] = []
+    for interval in EXTREME_CANDLE_INTERVALS:
+        event = _extreme_candle_candidate(interval, resolved)
+        if event and event.get("valid"):
+            out.append(event)
+    return out
+
+
+def should_send_extreme_candle_alert(event: Dict[str, Any]) -> bool:
+    if not EXTREME_CANDLE_ENABLED or not event.get("valid"):
+        return False
+    state = load_json(EXTREME_CANDLE_STATE_FILE, {"alerts": {}})
+    alerts = state.get("alerts", {}) if isinstance(state, dict) else {}
+    key = f"{event.get('classification')}:{event.get('direction')}:{event.get('interval')}"
+    now_ts = _utc_ts()
+    last_ts = float(alerts.get(key, 0) or 0)
+    if now_ts - last_ts < max(60, EXTREME_CANDLE_COOLDOWN_MINUTES * 60):
+        return False
+    alerts[key] = now_ts
+    if len(alerts) > 200:
+        alerts = dict(sorted(alerts.items(), key=lambda x: x[1], reverse=True)[:120])
+    save_json(EXTREME_CANDLE_STATE_FILE, {"updated_utc": now_utc(), "alerts": alerts})
+    return True
+
+
+def format_extreme_candle_alert(event: Dict[str, Any]) -> str:
+    cls = event.get("classification")
+    side = event.get("direction")
+    conf = event.get("confidence") or {}
+    if cls == "TREND":
+        icon, title, action = "🚀", "EXTREME TREND", "Silny impuls zgodny z trendem. Nie gonić ceny; szukaj retestu lub kolejnego potwierdzenia."
+    elif cls == "REVERSAL":
+        icon, title, action = "🔄", "EXTREME REVERSAL", "Możliwa zmiana kierunku. Nie wchodź bez potwierdzenia M15/H1 i retestu struktury."
+    elif cls == "EXHAUSTION":
+        icon, title, action = "⚠️", "EXTREME EXHAUSTION", "Rynek może być przegrzany. Nie gonić ruchu; oczekuj korekty lub konsolidacji."
+    else:
+        icon, title, action = "🚨", "EXTREME VOLATILITY", "Wyjątkowa zmienność. Traktuj jako ostrzeżenie, nie automatyczny sygnał wejścia."
+    return (
+        f"{icon} GOLD {title} — {side}\n\n"
+        f"Interwał: {event.get('interval')} | Cena: {event.get('price')}\n"
+        f"Body/ATR: {event.get('body_atr')} | Range/ATR: {event.get('range_atr')}\n"
+        f"Percentyl zakresu: {event.get('range_percentile')}% | RSI: {event.get('rsi')}\n"
+        f"Jakość: {event.get('quality_score')}/100 | Confidence: {conf.get('score')}/100 ({conf.get('label')})\n"
+        f"Break struktury: {'TAK' if event.get('structure_break') else 'NIE'} | Trend aligned: {'TAK' if event.get('trend_aligned') else 'NIE'}\n\n"
+        f"{action}\n\n"
+        f"Confidence jest heurystycznym evidence score, nie gwarancją ani statystycznym prawdopodobieństwem wyniku."
     )
 
 
@@ -3969,13 +4213,25 @@ def reversal_momentum_watch_job(current_signal: Optional[Dict[str, Any]] = None)
         # Independent breakout lane: catches strong trend continuation before a classical retest exists.
         breakout_events = detect_momentum_breakouts(resolved_signal)
         for breakout in breakout_events:
+            breakout["confidence"] = evaluate_confidence_score(resolved_signal, side=breakout.get("direction"), event=breakout)
             if MOMENTUM_BREAKOUT_LOG_TO_DB:
                 record_signal_history("MOMENTUM_BREAKOUT_EVALUATION", breakout)
-            if should_send_momentum_breakout_alert(breakout):
+            conf_ok = (not CONFIDENCE_ENGINE_ENABLED) or int((breakout.get("confidence") or {}).get("score", 0)) >= MOMENTUM_BREAKOUT_MIN_CONFIDENCE
+            if conf_ok and should_send_momentum_breakout_alert(breakout):
                 send_telegram(format_momentum_breakout_alert(breakout))
                 sent_count += 1
 
         watch["momentum_breakouts"] = breakout_events
+
+        # v7.0 Extreme Candle Intelligence — independent informational lane.
+        extreme_events = detect_extreme_candles(resolved_signal)
+        for extreme in extreme_events:
+            if EXTREME_CANDLE_LOG_TO_DB:
+                record_signal_history("EXTREME_CANDLE_EVALUATION", extreme)
+            if should_send_extreme_candle_alert(extreme):
+                send_telegram(format_extreme_candle_alert(extreme))
+                sent_count += 1
+        watch["extreme_candles"] = extreme_events
 
         for event in watch.get("events", []):
             quality = evaluate_a_plus_quality(current_signal or build_signal(), event=event)
@@ -4029,6 +4285,7 @@ def entry_exit_signal_job() -> None:
         active_setup = update_active_setup(entry_signal)
         a_plus_quality = evaluate_a_plus_quality(current_signal, entry_signal)
         entry_signal["a_plus_quality"] = a_plus_quality
+        entry_signal["confidence"] = evaluate_confidence_score(current_signal, a_plus_quality, side=entry_signal.get("signal"))
         record_signal_history("ENTRY_EVALUATION", entry_signal)
         if A_PLUS_LOG_INFO_TO_DB:
             record_signal_history("A_PLUS_QUALITY_EVALUATION", {"entry_signal": entry_signal, "quality": a_plus_quality})
@@ -4060,7 +4317,8 @@ def entry_exit_signal_job() -> None:
 
         entry_sent = False
         structure_key = str(((entry_signal.get("structure_guard") or {}).get("level")) or ((current_signal.get("institutional") or {}).get("market_structure_h1") or {}).get("bos") or "")
-        if entry_signal.get("valid") and should_send_entry_alert(entry_signal) and should_send_a_plus_alert(a_plus_quality, entry_signal.get("signal"), "ENTRY", structure_key):
+        confidence_ok = (not CONFIDENCE_ENGINE_ENABLED) or int((entry_signal.get("confidence") or {}).get("score", 0)) >= A_PLUS_MIN_CONFIDENCE
+        if entry_signal.get("valid") and confidence_ok and should_send_entry_alert(entry_signal) and should_send_a_plus_alert(a_plus_quality, entry_signal.get("signal"), "ENTRY", structure_key):
             send_telegram(format_a_plus_entry_alert(entry_signal))
             entry_sent = True
 
@@ -4415,7 +4673,7 @@ def job() -> None:
 
 @app.get("/")
 def root():
-    return jsonify({"app": "Gold AI Bot v6.8 A+ Quality Filter", "version": APP_VERSION, "status": "ok"})
+    return jsonify({"app": "Gold AI Bot v7.0 Institutional Signal Intelligence", "version": APP_VERSION, "status": "ok"})
 
 
 @app.get("/health")
@@ -4475,6 +4733,16 @@ def health():
         "momentum_breakout_min_range_atr": MOMENTUM_BREAKOUT_MIN_RANGE_ATR,
         "momentum_breakout_min_checks": MOMENTUM_BREAKOUT_MIN_CHECKS,
         "momentum_breakout_cooldown_minutes": MOMENTUM_BREAKOUT_COOLDOWN_MINUTES,
+        "confidence_engine_enabled": CONFIDENCE_ENGINE_ENABLED,
+        "a_plus_2_enabled": A_PLUS_2_ENABLED,
+        "a_plus_min_confidence": A_PLUS_MIN_CONFIDENCE,
+        "momentum_breakout_min_confidence": MOMENTUM_BREAKOUT_MIN_CONFIDENCE,
+        "extreme_candle_enabled": EXTREME_CANDLE_ENABLED,
+        "extreme_candle_intervals": EXTREME_CANDLE_INTERVALS,
+        "extreme_candle_min_body_atr": EXTREME_CANDLE_MIN_BODY_ATR,
+        "extreme_candle_min_range_atr": EXTREME_CANDLE_MIN_RANGE_ATR,
+        "extreme_candle_min_percentile": EXTREME_CANDLE_MIN_PERCENTILE,
+        "extreme_candle_cooldown_minutes": EXTREME_CANDLE_COOLDOWN_MINUTES,
         "spread_filter_enabled": SPREAD_FILTER_ENABLED,
         "current_spread_points": CURRENT_SPREAD_POINTS,
     })
@@ -5050,6 +5318,46 @@ def trade_history_endpoint():
         return jsonify({"status":"error","version":APP_VERSION,"error":f"{type(e).__name__}: {e}"}), 200
 
 
+@app.get("/extreme-candle-status")
+def extreme_candle_status_endpoint():
+    try:
+        signal = build_signal()
+        events = detect_extreme_candles(signal)
+        return jsonify({
+            "status": "ok",
+            "version": APP_VERSION,
+            "events": events,
+            "config": {
+                "enabled": EXTREME_CANDLE_ENABLED,
+                "intervals": EXTREME_CANDLE_INTERVALS,
+                "min_body_atr": EXTREME_CANDLE_MIN_BODY_ATR,
+                "min_range_atr": EXTREME_CANDLE_MIN_RANGE_ATR,
+                "min_percentile": EXTREME_CANDLE_MIN_PERCENTILE,
+                "cooldown_minutes": EXTREME_CANDLE_COOLDOWN_MINUTES,
+            },
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "version": APP_VERSION, "error": f"{type(e).__name__}: {e}"}), 200
+
+
+@app.get("/confidence-status")
+def confidence_status_endpoint():
+    try:
+        signal = build_signal()
+        entry = evaluate_entry_signal(signal)
+        quality = evaluate_a_plus_quality(signal, entry)
+        confidence = evaluate_confidence_score(signal, quality, side=entry.get("signal") or signal.get("signal"))
+        return jsonify({
+            "status": "ok",
+            "version": APP_VERSION,
+            "signal": {"signal": signal.get("signal"), "score": signal.get("score"), "directional_scores": signal.get("directional_scores"), "trend": signal.get("trend")},
+            "a_plus_quality": quality,
+            "confidence": confidence,
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "version": APP_VERSION, "error": f"{type(e).__name__}: {e}"}), 200
+
+
 @app.get("/move-alert-test")
 def move_alert_test():
     results = []
@@ -5078,7 +5386,7 @@ if SCHEDULER_ENABLED:
         job,
         "interval",
         minutes=max(1, RUN_INTERVAL_MINUTES),
-        id="gold_ai_bot_v6_8_1_signal",
+        id="gold_ai_bot_v7_0_signal",
         replace_existing=True,
     )
 
