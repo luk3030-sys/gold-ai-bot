@@ -13,7 +13,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "6.8.0-a-plus-quality-filter"
+APP_VERSION = "6.8.2-a-plus-momentum-breakout-cron-safe"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -76,6 +76,25 @@ A_PLUS_RSI_BUY_MAX = float(os.getenv("A_PLUS_RSI_BUY_MAX", "70"))
 A_PLUS_RSI_SELL_MIN = float(os.getenv("A_PLUS_RSI_SELL_MIN", "30"))
 A_PLUS_MIN_CANDLE_ATR = float(os.getenv("A_PLUS_MIN_CANDLE_ATR", "1.0"))
 A_PLUS_MIN_RR = float(os.getenv("A_PLUS_MIN_RR", "2.0"))
+
+# v6.8.1 Momentum Breakout Watch — catches strong trend breakouts without requiring a classical retest
+MOMENTUM_BREAKOUT_ENABLED = env_bool("MOMENTUM_BREAKOUT_ENABLED", True)
+MOMENTUM_BREAKOUT_INTERVALS = [
+    x.strip() for x in os.getenv("MOMENTUM_BREAKOUT_INTERVALS", "15min,1h").split(",") if x.strip()
+]
+MOMENTUM_BREAKOUT_LOOKBACK = int(os.getenv("MOMENTUM_BREAKOUT_LOOKBACK", "20"))
+MOMENTUM_BREAKOUT_MIN_BODY_ATR = float(os.getenv("MOMENTUM_BREAKOUT_MIN_BODY_ATR", "1.15"))
+MOMENTUM_BREAKOUT_MIN_RANGE_ATR = float(os.getenv("MOMENTUM_BREAKOUT_MIN_RANGE_ATR", "1.35"))
+MOMENTUM_BREAKOUT_MIN_BODY_RATIO = float(os.getenv("MOMENTUM_BREAKOUT_MIN_BODY_RATIO", "0.60"))
+MOMENTUM_BREAKOUT_MIN_CLOSE_POSITION = float(os.getenv("MOMENTUM_BREAKOUT_MIN_CLOSE_POSITION", "0.72"))
+MOMENTUM_BREAKOUT_BUFFER_ATR = float(os.getenv("MOMENTUM_BREAKOUT_BUFFER_ATR", "0.03"))
+MOMENTUM_BREAKOUT_MIN_CHECKS = int(os.getenv("MOMENTUM_BREAKOUT_MIN_CHECKS", "6"))
+MOMENTUM_BREAKOUT_COOLDOWN_MINUTES = int(os.getenv("MOMENTUM_BREAKOUT_COOLDOWN_MINUTES", "90"))
+MOMENTUM_BREAKOUT_STATE_FILE = os.getenv("MOMENTUM_BREAKOUT_STATE_FILE", "momentum_breakout_state.json")
+MOMENTUM_BREAKOUT_LOG_TO_DB = env_bool("MOMENTUM_BREAKOUT_LOG_TO_DB", True)
+MOMENTUM_BREAKOUT_REQUIRE_H1_H4 = env_bool("MOMENTUM_BREAKOUT_REQUIRE_H1_H4", True)
+MOMENTUM_BREAKOUT_REQUIRE_M15 = env_bool("MOMENTUM_BREAKOUT_REQUIRE_M15", True)
+
 SPREAD_FILTER_ENABLED = env_bool("SPREAD_FILTER_ENABLED", False)
 try:
     CURRENT_SPREAD_POINTS = float(os.getenv("CURRENT_SPREAD_POINTS", ""))
@@ -3596,6 +3615,162 @@ def _open_position_warnings(direction: str, price: float) -> List[Dict[str, Any]
     return warnings
 
 
+
+def _momentum_breakout_candidate(interval: str, current_signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Detect a closed-candle structural breakout with strong momentum."""
+    try:
+        lookback = max(10, MOMENTUM_BREAKOUT_LOOKBACK)
+        df = add_indicators(fetch_ohlc(interval, lookback + 40))
+        if df is None or len(df) < lookback + 3:
+            return None
+
+        last = df.iloc[-1]
+        history = df.iloc[-(lookback + 1):-1]
+        body = float(last.close - last.open)
+        rng = float(last.high - last.low)
+        atr = float(last.atr14)
+        if atr <= 0 or rng <= 0 or body == 0:
+            return None
+
+        side = "BUY" if body > 0 else "SELL"
+        body_atr = abs(body) / atr
+        range_atr = rng / atr
+        body_ratio = abs(body) / rng
+        close_position = (float(last.close) - float(last.low)) / rng
+        directional_close_position = close_position if side == "BUY" else (1.0 - close_position)
+
+        prior_high = float(history.high.max())
+        prior_low = float(history.low.min())
+        buffer_points = atr * MOMENTUM_BREAKOUT_BUFFER_ATR
+        breakout_level = prior_high if side == "BUY" else prior_low
+        structure_break = (
+            float(last.close) > prior_high + buffer_points
+            if side == "BUY"
+            else float(last.close) < prior_low - buffer_points
+        )
+
+        trends = current_signal.get("trend") or {}
+        required = "UP" if side == "BUY" else "DOWN"
+        opposite = "DOWN" if side == "BUY" else "UP"
+        h1_h4 = trends.get("H1") == required and trends.get("H4") == required
+        m15_ok = trends.get("M15") == required
+        d1_not_opposite = trends.get("D1") != opposite
+        strong_body = body_atr >= MOMENTUM_BREAKOUT_MIN_BODY_ATR
+        strong_range = range_atr >= MOMENTUM_BREAKOUT_MIN_RANGE_ATR
+        body_quality = body_ratio >= MOMENTUM_BREAKOUT_MIN_BODY_RATIO
+        close_near_edge = directional_close_position >= MOMENTUM_BREAKOUT_MIN_CLOSE_POSITION
+
+        checks = [
+            ("H1/H4 aligned", h1_h4),
+            ("M15 confirms", m15_ok),
+            ("D1 not opposite", d1_not_opposite),
+            ("Structural breakout", structure_break),
+            ("Body/ATR strong", strong_body),
+            ("Range/ATR strong", strong_range),
+            ("Body quality", body_quality),
+            ("Close near candle extreme", close_near_edge),
+        ]
+        passed = sum(1 for _, ok in checks if ok)
+        hard_ok = structure_break and close_near_edge and (strong_body or strong_range)
+        if MOMENTUM_BREAKOUT_REQUIRE_H1_H4:
+            hard_ok = hard_ok and h1_h4
+        if MOMENTUM_BREAKOUT_REQUIRE_M15:
+            hard_ok = hard_ok and m15_ok
+        valid = hard_ok and passed >= MOMENTUM_BREAKOUT_MIN_CHECKS
+
+        price = round(float(last.close), 2)
+        retest_from = round(float(breakout_level) - (atr * 0.20), 2)
+        retest_to = round(float(breakout_level) + (atr * 0.20), 2)
+        continuation_level = round(float(last.high if side == "BUY" else last.low), 2)
+        return {
+            "type": "MOMENTUM_BREAKOUT",
+            "valid": bool(valid),
+            "direction": side,
+            "interval": interval,
+            "datetime": str(last.datetime),
+            "price": price,
+            "open": round(float(last.open), 2),
+            "high": round(float(last.high), 2),
+            "low": round(float(last.low), 2),
+            "body_points": round(body, 2),
+            "body_atr": round(body_atr, 2),
+            "range_atr": round(range_atr, 2),
+            "body_ratio": round(body_ratio, 2),
+            "close_position": round(directional_close_position, 2),
+            "breakout_level": round(breakout_level, 2),
+            "continuation_level": continuation_level,
+            "retest_zone": [retest_from, retest_to],
+            "trend": trends,
+            "checks_passed": passed,
+            "checks_total": len(checks),
+            "quality_score": int(round(passed / len(checks) * 100)),
+            "checks": [{"name": name, "passed": ok} for name, ok in checks],
+            "instruction": (
+                f"Nie gonić ceny. Obserwuj cofnięcie do strefy {retest_from}-{retest_to} "
+                f"albo zamknięcie kolejnej świecy ponad {continuation_level}."
+                if side == "BUY" else
+                f"Nie gonić ceny. Obserwuj podbicie do strefy {retest_from}-{retest_to} "
+                f"albo zamknięcie kolejnej świecy poniżej {continuation_level}."
+            ),
+            "dedupe_key": f"BREAKOUT:{side}:{interval}:{last.datetime}:{round(breakout_level, 2)}",
+        }
+    except Exception as e:
+        return {"type": "MOMENTUM_BREAKOUT", "valid": False, "interval": interval, "error": f"{type(e).__name__}: {e}"}
+
+
+def detect_momentum_breakouts(current_signal: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    if not MOMENTUM_BREAKOUT_ENABLED:
+        return []
+    current_signal = current_signal or build_signal()
+    events: List[Dict[str, Any]] = []
+    for interval in MOMENTUM_BREAKOUT_INTERVALS:
+        event = _momentum_breakout_candidate(interval, current_signal)
+        if event and event.get("valid"):
+            events.append(event)
+    return events
+
+
+def should_send_momentum_breakout_alert(event: Dict[str, Any]) -> bool:
+    if not MOMENTUM_BREAKOUT_ENABLED or not event.get("valid"):
+        return False
+    state = load_json(MOMENTUM_BREAKOUT_STATE_FILE, {"alerts": {}})
+    alerts = state.get("alerts", {}) if isinstance(state, dict) else {}
+    side = event.get("direction")
+    interval = event.get("interval")
+    level = event.get("breakout_level")
+    # Structural key prevents repeated alerts from successive candles breaking the same zone.
+    key = f"{side}:{interval}:{level}"
+    now_ts = _utc_ts()
+    last_ts = float(alerts.get(key, 0) or 0)
+    if now_ts - last_ts < max(60, MOMENTUM_BREAKOUT_COOLDOWN_MINUTES * 60):
+        return False
+    alerts[key] = now_ts
+    # Keep the state bounded.
+    if len(alerts) > 300:
+        alerts = dict(sorted(alerts.items(), key=lambda item: item[1], reverse=True)[:200])
+    save_json(MOMENTUM_BREAKOUT_STATE_FILE, {"updated_utc": now_utc(), "alerts": alerts})
+    return True
+
+
+def format_momentum_breakout_alert(event: Dict[str, Any]) -> str:
+    side = event.get("direction")
+    icon = "🚀" if side == "BUY" else "💥"
+    trends = event.get("trend") or {}
+    failed = [c.get("name") for c in event.get("checks", []) if not c.get("passed")]
+    return (
+        f"{icon} GOLD MOMENTUM BREAKOUT — {side}\n\n"
+        f"Interwał: {event.get('interval')}\n"
+        f"Cena zamknięcia: {event.get('price')}\n"
+        f"Przełamany poziom: {event.get('breakout_level')}\n"
+        f"Jakość: {event.get('quality_score')}/100 ({event.get('checks_passed')}/{event.get('checks_total')})\n"
+        f"Body/ATR: {event.get('body_atr')} | Range/ATR: {event.get('range_atr')} | Body ratio: {event.get('body_ratio')}\n"
+        f"Trend M15/H1/H4/D1: {trends.get('M15')} / {trends.get('H1')} / {trends.get('H4')} / {trends.get('D1')}\n\n"
+        f"Plan obserwacji: {event.get('instruction')}\n"
+        f"Braki: {', '.join(failed) or '-'}\n\n"
+        f"To jest wczesny alert o wybiciu, nie automatyczne wejście. Poczekaj na retest lub dalsze potwierdzenie."
+    )
+
+
 def detect_reversal_momentum_watch(current_signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Warning layer independent of final ENTRY SIGNAL.
@@ -3787,8 +3962,20 @@ def reversal_momentum_watch_job(current_signal: Optional[Dict[str, Any]] = None)
     LAST_REVERSAL_STATUS["last_run_utc"] = now_utc()
 
     try:
-        watch = detect_reversal_momentum_watch(current_signal)
+        resolved_signal = current_signal or build_signal()
+        watch = detect_reversal_momentum_watch(resolved_signal)
         sent_count = 0
+
+        # Independent breakout lane: catches strong trend continuation before a classical retest exists.
+        breakout_events = detect_momentum_breakouts(resolved_signal)
+        for breakout in breakout_events:
+            if MOMENTUM_BREAKOUT_LOG_TO_DB:
+                record_signal_history("MOMENTUM_BREAKOUT_EVALUATION", breakout)
+            if should_send_momentum_breakout_alert(breakout):
+                send_telegram(format_momentum_breakout_alert(breakout))
+                sent_count += 1
+
+        watch["momentum_breakouts"] = breakout_events
 
         for event in watch.get("events", []):
             quality = evaluate_a_plus_quality(current_signal or build_signal(), event=event)
@@ -4282,6 +4469,12 @@ def health():
         "a_grade_min_score": A_GRADE_MIN_SCORE,
         "a_plus_telegram_min_grade": A_PLUS_TELEGRAM_MIN_GRADE,
         "a_plus_cooldown_minutes": A_PLUS_COOLDOWN_MINUTES,
+        "momentum_breakout_enabled": MOMENTUM_BREAKOUT_ENABLED,
+        "momentum_breakout_intervals": MOMENTUM_BREAKOUT_INTERVALS,
+        "momentum_breakout_min_body_atr": MOMENTUM_BREAKOUT_MIN_BODY_ATR,
+        "momentum_breakout_min_range_atr": MOMENTUM_BREAKOUT_MIN_RANGE_ATR,
+        "momentum_breakout_min_checks": MOMENTUM_BREAKOUT_MIN_CHECKS,
+        "momentum_breakout_cooldown_minutes": MOMENTUM_BREAKOUT_COOLDOWN_MINUTES,
         "spread_filter_enabled": SPREAD_FILTER_ENABLED,
         "current_spread_points": CURRENT_SPREAD_POINTS,
     })
@@ -4379,12 +4572,28 @@ def quota_reset_endpoint():
 @app.get("/tick")
 def tick_endpoint():
     """
+    Lightweight cron/keep-alive endpoint.
+
+    cron-job.org only needs a small HTTP 200 response. Returning diagnostics
+    here can eventually exceed external cron response-size limits, so the
+    detailed market-data diagnostic was moved to /tick-debug.
+    """
+    return jsonify({
+        "status": "ok",
+        "version": APP_VERSION,
+        "time_utc": now_utc(),
+    }), 200
+
+
+@app.get("/tick-debug")
+def tick_debug_endpoint():
+    """
     Runtime market-data diagnostic.
     Default: smart fetch through cache + Quota Guard.
     Optional query params:
       ?interval=1h
       ?outputsize=20
-      ?force=1   -> wymusza próbę odświeżenia z API (używać ostrożnie)
+      ?force=1   -> forces an API refresh attempt (use sparingly)
     """
     interval = str(request.args.get("interval", "1h")).strip()
     allowed_intervals = {"5min", "15min", "1h", "4h", "1day"}
@@ -4400,7 +4609,9 @@ def tick_endpoint():
         outputsize = int(request.args.get("outputsize", "20"))
     except Exception:
         outputsize = 20
-    outputsize = max(5, min(outputsize, 5000))
+    # Diagnostic endpoint does not need thousands of rows. Keep a hard cap
+    # to protect Render, Twelve Data quota, and response sizes.
+    outputsize = max(5, min(outputsize, 200))
 
     force_raw = str(request.args.get("force", "0")).strip().lower()
     force_refresh = force_raw in {"1", "true", "yes", "on"}
@@ -4867,7 +5078,7 @@ if SCHEDULER_ENABLED:
         job,
         "interval",
         minutes=max(1, RUN_INTERVAL_MINUTES),
-        id="gold_ai_bot_v6_7_signal",
+        id="gold_ai_bot_v6_8_1_signal",
         replace_existing=True,
     )
 
