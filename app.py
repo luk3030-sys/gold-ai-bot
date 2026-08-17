@@ -2,6 +2,9 @@ import os
 import json
 import time
 import threading
+import csv
+import io
+import hashlib
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -13,7 +16,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "7.0.0-institutional-signal-intelligence"
+APP_VERSION = "7.0.1-gc-positioning-v6.7.0"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -94,6 +97,26 @@ MOMENTUM_BREAKOUT_STATE_FILE = os.getenv("MOMENTUM_BREAKOUT_STATE_FILE", "moment
 MOMENTUM_BREAKOUT_LOG_TO_DB = env_bool("MOMENTUM_BREAKOUT_LOG_TO_DB", True)
 MOMENTUM_BREAKOUT_REQUIRE_H1_H4 = env_bool("MOMENTUM_BREAKOUT_REQUIRE_H1_H4", True)
 MOMENTUM_BREAKOUT_REQUIRE_M15 = env_bool("MOMENTUM_BREAKOUT_REQUIRE_M15", True)
+
+# Positioning module v6.7.0 — CME Gold Futures Volume + Open Interest
+# Integrated on top of v7.0 to preserve all newer bot features.
+GC_POSITIONING_ENABLED = env_bool("GC_POSITIONING_ENABLED", True)
+GC_POSITIONING_SOURCE_URL = os.getenv(
+    "GC_POSITIONING_SOURCE_URL",
+    "https://www.cmegroup.com/CmeWS/mvc/ProductSlate/V1/Download.csv",
+).strip()
+GC_POSITIONING_PRODUCT_CODE = os.getenv("GC_POSITIONING_PRODUCT_CODE", "GC").strip().upper()
+GC_POSITIONING_REFRESH_MINUTES = int(os.getenv("GC_POSITIONING_REFRESH_MINUTES", "360"))
+GC_POSITIONING_TIMEOUT_SECONDS = int(os.getenv("GC_POSITIONING_TIMEOUT_SECONDS", "25"))
+GC_POSITIONING_USER_AGENT = os.getenv(
+    "GC_POSITIONING_USER_AGENT",
+    "Mozilla/5.0 (compatible; GoldAIBot/7.0)",
+).strip()
+GC_POSITIONING_PRICE_PROXY_INTERVAL = os.getenv("GC_POSITIONING_PRICE_PROXY_INTERVAL", "1day").strip()
+GC_POSITIONING_STRONG_OI_PCT = float(os.getenv("GC_POSITIONING_STRONG_OI_PCT", "3.0"))
+GC_POSITIONING_MODERATE_OI_PCT = float(os.getenv("GC_POSITIONING_MODERATE_OI_PCT", "1.0"))
+GC_POSITIONING_ALERTS_ENABLED = env_bool("GC_POSITIONING_ALERTS_ENABLED", False)
+GC_POSITIONING_ALERT_MIN_STRENGTH = os.getenv("GC_POSITIONING_ALERT_MIN_STRENGTH", "STRONG").strip().upper()
 
 # v7.0 Institutional Signal Intelligence
 # Confidence is a transparent evidence score (0-100), NOT a statistical win probability.
@@ -464,6 +487,32 @@ def init_db() -> None:
                     )
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_history_closed_at ON trade_history(closed_at DESC)")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS gold_futures_positioning (
+                        id BIGSERIAL PRIMARY KEY,
+                        snapshot_date DATE NOT NULL,
+                        source_name TEXT NOT NULL DEFAULT 'CME_PRODUCT_SLATE',
+                        source_url TEXT,
+                        product_code TEXT NOT NULL DEFAULT 'GC',
+                        product_description TEXT,
+                        gc_volume BIGINT,
+                        gc_open_interest BIGINT,
+                        volume_change BIGINT,
+                        volume_change_pct NUMERIC,
+                        oi_change BIGINT,
+                        oi_change_pct NUMERIC,
+                        price_proxy_symbol TEXT,
+                        price_proxy_close NUMERIC,
+                        price_proxy_change_pct NUMERIC,
+                        positioning_state TEXT,
+                        positioning_strength TEXT,
+                        source_fingerprint TEXT,
+                        raw_payload JSONB,
+                        fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE(snapshot_date, source_name, product_code)
+                    )
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_gold_futures_positioning_date ON gold_futures_positioning(snapshot_date DESC)")
         DB_STATUS.update({
             "configured": True,
             "connected": True,
@@ -1007,6 +1056,459 @@ def cache_status_snapshot() -> Dict[str, Any]:
                 "usable_for_stored_outputsize": rows_count >= min_required_rows,
             }
     return out
+
+
+# -----------------------------
+# CME Gold Futures Positioning v6.7.0
+# -----------------------------
+
+GC_POSITIONING_STATUS: Dict[str, Any] = {
+    "enabled": GC_POSITIONING_ENABLED,
+    "last_run_utc": None,
+    "last_success_utc": None,
+    "last_error": None,
+    "last_state": None,
+    "last_strength": None,
+    "last_volume": None,
+    "last_open_interest": None,
+}
+
+
+def _gc_norm_key(value: Any) -> str:
+    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+
+def _gc_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", "").replace(" ", "")
+    if not text or text in {"-", "--", "n/a", "N/A"}:
+        return None
+    try:
+        return int(float(text))
+    except Exception:
+        return None
+
+
+def _gc_pick(row: Dict[str, Any], candidates: List[str]) -> Any:
+    normalized = {_gc_norm_key(k): v for k, v in row.items()}
+    for candidate in candidates:
+        key = _gc_norm_key(candidate)
+        if key in normalized and str(normalized[key]).strip() != "":
+            return normalized[key]
+    return None
+
+
+def _gc_parse_product_slate(text: str) -> Dict[str, Any]:
+    reader = csv.DictReader(io.StringIO(text.lstrip("\ufeff")))
+    rows = list(reader)
+    if not rows:
+        raise RuntimeError("CME Product Slate CSV is empty")
+
+    exact = []
+    fallback = []
+    for row in rows:
+        desc = str(_gc_pick(row, ["Product Description", "Product", "Name", "Description"]) or "").strip()
+        ptype = str(_gc_pick(row, ["Product Type", "Type"]) or "").strip().upper()
+        codes = {
+            str(_gc_pick(row, ["Product Code"]) or "").strip().upper(),
+            str(_gc_pick(row, ["Globex Code", "Globex"]) or "").strip().upper(),
+            str(_gc_pick(row, ["Clearing Code", "Clearing"]) or "").strip().upper(),
+        }
+        volume = _gc_int(_gc_pick(row, ["Total Volume", "Volume"]))
+        oi = _gc_int(_gc_pick(row, ["Open Interest", "OpenInterest", "OI"]))
+        if volume is None or oi is None:
+            continue
+
+        desc_n = desc.lower()
+        is_future = ptype in {"", "F", "FUT", "FUTURE", "FUTURES"} or "future" in desc_n
+        if not is_future or "option" in desc_n:
+            continue
+
+        item = {
+            "description": desc,
+            "product_type": ptype,
+            "codes": sorted(c for c in codes if c),
+            "volume": volume,
+            "open_interest": oi,
+            "row": row,
+        }
+        if GC_POSITIONING_PRODUCT_CODE in codes:
+            exact.append(item)
+        elif (
+            "gold future" in desc_n
+            and "micro" not in desc_n
+            and "1-ounce" not in desc_n
+            and "1 ounce" not in desc_n
+        ):
+            fallback.append(item)
+
+    candidates = exact or fallback
+    if not candidates:
+        sample_headers = list(rows[0].keys())[:20]
+        raise RuntimeError(f"GC futures row not found in CME CSV; headers={sample_headers}")
+
+    # Product Slate normally exposes one aggregate GC product row.
+    # If duplicates occur, use the highest-volume exact row instead of double-counting.
+    return max(candidates, key=lambda x: (x["volume"], x["open_interest"]))
+
+
+def _gc_price_proxy() -> Dict[str, Any]:
+    try:
+        df = fetch_ohlc(GC_POSITIONING_PRICE_PROXY_INTERVAL, outputsize=6, force_refresh=False)
+        if df is None or len(df) < 2:
+            return {
+                "symbol": SYMBOL,
+                "close": None,
+                "change_pct": None,
+                "source": "TWELVEDATA_INSUFFICIENT",
+            }
+        last = float(df.iloc[-1]["close"])
+        prev = float(df.iloc[-2]["close"])
+        change_pct = ((last - prev) / prev * 100.0) if prev else None
+        return {
+            "symbol": SYMBOL,
+            "close": round(last, 6),
+            "change_pct": round(change_pct, 6) if change_pct is not None else None,
+            "source": f"TWELVEDATA_{GC_POSITIONING_PRICE_PROXY_INTERVAL}",
+            "datetime": str(df.iloc[-1].get("datetime", "")),
+        }
+    except Exception as e:
+        return {
+            "symbol": SYMBOL,
+            "close": None,
+            "change_pct": None,
+            "source": "UNAVAILABLE",
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
+def classify_gc_positioning(
+    price_change_pct: Optional[float],
+    oi_change_pct: Optional[float],
+) -> Tuple[str, str]:
+    if price_change_pct is None or oi_change_pct is None:
+        return "INSUFFICIENT_HISTORY", "UNKNOWN"
+
+    eps = 1e-9
+    if price_change_pct < -eps and oi_change_pct < -eps:
+        state = "LONG_LIQUIDATION"
+    elif price_change_pct < -eps and oi_change_pct > eps:
+        state = "NEW_SHORT_BUILDUP"
+    elif price_change_pct > eps and oi_change_pct > eps:
+        state = "NEW_LONG_BUILDUP"
+    elif price_change_pct > eps and oi_change_pct < -eps:
+        state = "SHORT_COVERING"
+    else:
+        state = "NEUTRAL"
+
+    magnitude = abs(float(oi_change_pct))
+    if magnitude >= GC_POSITIONING_STRONG_OI_PCT:
+        strength = "STRONG"
+    elif magnitude >= GC_POSITIONING_MODERATE_OI_PCT:
+        strength = "MODERATE"
+    else:
+        strength = "WEAK"
+    return state, strength
+
+
+def _gc_previous_snapshot(before_date: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not DATABASE_URL:
+        return None
+    try:
+        with _db_connect() as conn:
+            with conn.cursor() as cur:
+                if before_date:
+                    cur.execute(
+                        """SELECT snapshot_date,gc_volume,gc_open_interest,price_proxy_close,
+                                  price_proxy_change_pct,source_fingerprint
+                           FROM gold_futures_positioning
+                           WHERE product_code=%s AND snapshot_date < %s
+                           ORDER BY snapshot_date DESC, fetched_at DESC LIMIT 1""",
+                        (GC_POSITIONING_PRODUCT_CODE, before_date),
+                    )
+                else:
+                    cur.execute(
+                        """SELECT snapshot_date,gc_volume,gc_open_interest,price_proxy_close,
+                                  price_proxy_change_pct,source_fingerprint
+                           FROM gold_futures_positioning
+                           WHERE product_code=%s
+                           ORDER BY snapshot_date DESC, fetched_at DESC LIMIT 1""",
+                        (GC_POSITIONING_PRODUCT_CODE,),
+                    )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "snapshot_date": row[0].isoformat() if row[0] else None,
+            "volume": int(row[1]) if row[1] is not None else None,
+            "open_interest": int(row[2]) if row[2] is not None else None,
+            "price_close": float(row[3]) if row[3] is not None else None,
+            "price_change_pct": float(row[4]) if row[4] is not None else None,
+            "fingerprint": row[5],
+        }
+    except Exception as e:
+        print(f"GC PREVIOUS SNAPSHOT ERROR: {type(e).__name__}: {e}")
+        return None
+
+
+def _gc_snapshot_date(raw_row: Dict[str, Any]) -> str:
+    raw = _gc_pick(raw_row, ["Trade Date", "TradeDate", "Date"])
+    if raw:
+        text = str(raw).strip()
+        for fmt in ("%Y%m%d", "%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(text, fmt).date().isoformat()
+            except Exception:
+                pass
+    # Product Slate may omit an explicit trade date. In that case this is a fetch-date snapshot.
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def save_gc_positioning_snapshot(payload: Dict[str, Any]) -> None:
+    if not DATABASE_URL:
+        return
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO gold_futures_positioning(
+                       snapshot_date,source_name,source_url,product_code,product_description,
+                       gc_volume,gc_open_interest,volume_change,volume_change_pct,oi_change,oi_change_pct,
+                       price_proxy_symbol,price_proxy_close,price_proxy_change_pct,positioning_state,
+                       positioning_strength,source_fingerprint,raw_payload,fetched_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                   ON CONFLICT(snapshot_date,source_name,product_code) DO UPDATE SET
+                       source_url=EXCLUDED.source_url,
+                       product_description=EXCLUDED.product_description,
+                       gc_volume=EXCLUDED.gc_volume,
+                       gc_open_interest=EXCLUDED.gc_open_interest,
+                       volume_change=EXCLUDED.volume_change,
+                       volume_change_pct=EXCLUDED.volume_change_pct,
+                       oi_change=EXCLUDED.oi_change,
+                       oi_change_pct=EXCLUDED.oi_change_pct,
+                       price_proxy_symbol=EXCLUDED.price_proxy_symbol,
+                       price_proxy_close=EXCLUDED.price_proxy_close,
+                       price_proxy_change_pct=EXCLUDED.price_proxy_change_pct,
+                       positioning_state=EXCLUDED.positioning_state,
+                       positioning_strength=EXCLUDED.positioning_strength,
+                       source_fingerprint=EXCLUDED.source_fingerprint,
+                       raw_payload=EXCLUDED.raw_payload,
+                       fetched_at=NOW()""",
+                (
+                    payload["snapshot_date"],
+                    payload["source_name"],
+                    payload["source_url"],
+                    payload["product_code"],
+                    payload.get("product_description"),
+                    payload.get("gc_volume"),
+                    payload.get("gc_open_interest"),
+                    payload.get("volume_change"),
+                    payload.get("volume_change_pct"),
+                    payload.get("oi_change"),
+                    payload.get("oi_change_pct"),
+                    payload.get("price_proxy_symbol"),
+                    payload.get("price_proxy_close"),
+                    payload.get("price_proxy_change_pct"),
+                    payload.get("positioning_state"),
+                    payload.get("positioning_strength"),
+                    payload.get("source_fingerprint"),
+                    Json(payload.get("raw_payload") or {}),
+                ),
+            )
+
+
+def fetch_and_store_gc_positioning() -> Dict[str, Any]:
+    if not GC_POSITIONING_ENABLED:
+        return {"enabled": False, "status": "disabled", "version": APP_VERSION}
+
+    headers = {
+        "User-Agent": GC_POSITIONING_USER_AGENT,
+        "Accept": "text/csv,*/*;q=0.8",
+    }
+    r = requests.get(
+        GC_POSITIONING_SOURCE_URL,
+        headers=headers,
+        timeout=max(5, GC_POSITIONING_TIMEOUT_SECONDS),
+    )
+    r.raise_for_status()
+    item = _gc_parse_product_slate(r.text)
+    volume = int(item["volume"])
+    oi = int(item["open_interest"])
+    snapshot_date = _gc_snapshot_date(item.get("row") or {})
+    previous = _gc_previous_snapshot(before_date=snapshot_date)
+    price = _gc_price_proxy()
+    fingerprint = hashlib.sha256(f"{volume}:{oi}".encode("utf-8")).hexdigest()[:24]
+
+    # Prevent weekend/repeated-source snapshots from creating fake zero-change signals.
+    if previous and previous.get("fingerprint") == fingerprint:
+        GC_POSITIONING_STATUS.update(
+            {
+                "enabled": True,
+                "last_run_utc": now_utc(),
+                "last_success_utc": now_utc(),
+                "last_error": None,
+                "last_state": "SOURCE_UNCHANGED",
+                "last_strength": "UNKNOWN",
+                "last_volume": volume,
+                "last_open_interest": oi,
+            }
+        )
+        return {
+            "status": "unchanged",
+            "version": APP_VERSION,
+            "module": "GC_POSITIONING_V6_7_0",
+            "snapshot_date": snapshot_date,
+            "gc_volume": volume,
+            "gc_open_interest": oi,
+            "source_fingerprint": fingerprint,
+            "message": "CME source values unchanged versus previous stored snapshot; no duplicate snapshot saved.",
+        }
+
+    volume_change = None
+    volume_change_pct = None
+    oi_change = None
+    oi_change_pct = None
+    if previous and previous.get("volume") is not None:
+        volume_change = volume - int(previous["volume"])
+        if previous["volume"]:
+            volume_change_pct = round(volume_change / float(previous["volume"]) * 100.0, 6)
+    if previous and previous.get("open_interest") is not None:
+        oi_change = oi - int(previous["open_interest"])
+        if previous["open_interest"]:
+            oi_change_pct = round(oi_change / float(previous["open_interest"]) * 100.0, 6)
+
+    state, strength = classify_gc_positioning(price.get("change_pct"), oi_change_pct)
+    payload = {
+        "status": "ok",
+        "version": APP_VERSION,
+        "module": "GC_POSITIONING_V6_7_0",
+        "snapshot_date": snapshot_date,
+        "fetched_utc": now_utc(),
+        "source_name": "CME_PRODUCT_SLATE",
+        "source_url": GC_POSITIONING_SOURCE_URL,
+        "product_code": GC_POSITIONING_PRODUCT_CODE,
+        "product_description": item.get("description"),
+        "gc_volume": volume,
+        "gc_open_interest": oi,
+        "volume_change": volume_change,
+        "volume_change_pct": volume_change_pct,
+        "oi_change": oi_change,
+        "oi_change_pct": oi_change_pct,
+        "price_proxy_symbol": price.get("symbol"),
+        "price_proxy_close": price.get("close"),
+        "price_proxy_change_pct": price.get("change_pct"),
+        "price_proxy_source": price.get("source"),
+        "positioning_state": state,
+        "positioning_strength": strength,
+        "source_fingerprint": fingerprint,
+        "interpretation": {
+            "LONG_LIQUIDATION": "Price down + OI down: closing longs / liquidation dominates.",
+            "NEW_SHORT_BUILDUP": "Price down + OI up: new short exposure is being built.",
+            "NEW_LONG_BUILDUP": "Price up + OI up: new long exposure is being built.",
+            "SHORT_COVERING": "Price up + OI down: short covering dominates.",
+            "NEUTRAL": "No directional price/OI combination.",
+            "INSUFFICIENT_HISTORY": "Need at least one earlier OI snapshot for classification.",
+        }.get(state),
+        "raw_payload": {
+            "cme_row": item.get("row"),
+            "codes": item.get("codes"),
+            "product_type": item.get("product_type"),
+            "price_proxy": price,
+            "previous_snapshot": previous,
+        },
+    }
+    save_gc_positioning_snapshot(payload)
+    GC_POSITIONING_STATUS.update(
+        {
+            "enabled": True,
+            "last_run_utc": now_utc(),
+            "last_success_utc": now_utc(),
+            "last_error": None,
+            "last_state": state,
+            "last_strength": strength,
+            "last_volume": volume,
+            "last_open_interest": oi,
+            "last_snapshot_date": snapshot_date,
+        }
+    )
+    return payload
+
+
+def gc_positioning_job() -> None:
+    GC_POSITIONING_STATUS["last_run_utc"] = now_utc()
+    try:
+        result = fetch_and_store_gc_positioning()
+        if (
+            GC_POSITIONING_ALERTS_ENABLED
+            and result.get("positioning_strength") == GC_POSITIONING_ALERT_MIN_STRENGTH
+        ):
+            state = result.get("positioning_state")
+            if state in {
+                "LONG_LIQUIDATION",
+                "NEW_SHORT_BUILDUP",
+                "NEW_LONG_BUILDUP",
+                "SHORT_COVERING",
+            }:
+                send_telegram(
+                    f"📊 GOLD FUTURES POSITIONING — {state}\n"
+                    f"Strength: {result.get('positioning_strength')}\n"
+                    f"GC Volume: {result.get('gc_volume')} ({result.get('volume_change_pct')}%)\n"
+                    f"GC OI: {result.get('gc_open_interest')} ({result.get('oi_change_pct')}%)\n"
+                    f"Price proxy {result.get('price_proxy_symbol')}: {result.get('price_proxy_change_pct')}%\n"
+                    f"Interpretation: {result.get('interpretation')}"
+                )
+    except Exception as e:
+        GC_POSITIONING_STATUS["last_error"] = f"{type(e).__name__}: {e}"
+        print(f"GC POSITIONING ERROR: {type(e).__name__}: {e}")
+
+
+def get_latest_gc_positioning() -> Dict[str, Any]:
+    if not DATABASE_URL:
+        return {"configured": False, "status": GC_POSITIONING_STATUS}
+    try:
+        with _db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT snapshot_date,product_code,product_description,gc_volume,gc_open_interest,
+                              volume_change,volume_change_pct,oi_change,oi_change_pct,price_proxy_symbol,
+                              price_proxy_close,price_proxy_change_pct,positioning_state,positioning_strength,
+                              fetched_at,raw_payload
+                       FROM gold_futures_positioning
+                       ORDER BY snapshot_date DESC,fetched_at DESC LIMIT 1"""
+                )
+                row = cur.fetchone()
+        if not row:
+            return {
+                "configured": True,
+                "data": None,
+                "status": GC_POSITIONING_STATUS,
+            }
+        return {
+            "configured": True,
+            "snapshot_date": row[0].isoformat(),
+            "product_code": row[1],
+            "product_description": row[2],
+            "gc_volume": int(row[3]) if row[3] is not None else None,
+            "gc_open_interest": int(row[4]) if row[4] is not None else None,
+            "volume_change": int(row[5]) if row[5] is not None else None,
+            "volume_change_pct": float(row[6]) if row[6] is not None else None,
+            "oi_change": int(row[7]) if row[7] is not None else None,
+            "oi_change_pct": float(row[8]) if row[8] is not None else None,
+            "price_proxy_symbol": row[9],
+            "price_proxy_close": float(row[10]) if row[10] is not None else None,
+            "price_proxy_change_pct": float(row[11]) if row[11] is not None else None,
+            "positioning_state": row[12],
+            "positioning_strength": row[13],
+            "fetched_at": row[14].isoformat() if row[14] else None,
+            "raw_payload": row[15],
+            "runtime_status": GC_POSITIONING_STATUS,
+        }
+    except Exception as e:
+        return {
+            "configured": True,
+            "error": f"{type(e).__name__}: {e}",
+            "status": GC_POSITIONING_STATUS,
+        }
 
 
 def fetch_ohlc(interval: str, outputsize: int = 300, force_refresh: bool = False) -> pd.DataFrame:
@@ -4673,7 +5175,7 @@ def job() -> None:
 
 @app.get("/")
 def root():
-    return jsonify({"app": "Gold AI Bot v7.0 Institutional Signal Intelligence", "version": APP_VERSION, "status": "ok"})
+    return jsonify({"app": "Gold AI Bot v7.0.1 + GC Positioning v6.7.0", "version": APP_VERSION, "status": "ok"})
 
 
 @app.get("/health")
@@ -4733,6 +5235,12 @@ def health():
         "momentum_breakout_min_range_atr": MOMENTUM_BREAKOUT_MIN_RANGE_ATR,
         "momentum_breakout_min_checks": MOMENTUM_BREAKOUT_MIN_CHECKS,
         "momentum_breakout_cooldown_minutes": MOMENTUM_BREAKOUT_COOLDOWN_MINUTES,
+        "gc_positioning_enabled": GC_POSITIONING_ENABLED,
+        "gc_positioning_refresh_minutes": GC_POSITIONING_REFRESH_MINUTES,
+        "gc_positioning_last_success_utc": GC_POSITIONING_STATUS.get("last_success_utc"),
+        "gc_positioning_last_error": GC_POSITIONING_STATUS.get("last_error"),
+        "gc_positioning_last_state": GC_POSITIONING_STATUS.get("last_state"),
+        "gc_positioning_last_strength": GC_POSITIONING_STATUS.get("last_strength"),
         "confidence_engine_enabled": CONFIDENCE_ENGINE_ENABLED,
         "a_plus_2_enabled": A_PLUS_2_ENABLED,
         "a_plus_min_confidence": A_PLUS_MIN_CONFIDENCE,
@@ -5358,6 +5866,19 @@ def confidence_status_endpoint():
         return jsonify({"status": "error", "version": APP_VERSION, "error": f"{type(e).__name__}: {e}"}), 200
 
 
+@app.get("/gc-positioning")
+def gc_positioning_endpoint():
+    return jsonify(get_latest_gc_positioning())
+
+
+@app.post("/gc-positioning/refresh")
+def gc_positioning_refresh_endpoint():
+    try:
+        return jsonify(fetch_and_store_gc_positioning())
+    except Exception as e:
+        return jsonify({"status": "error", "version": APP_VERSION, "error": f"{type(e).__name__}: {e}"}), 200
+
+
 @app.get("/move-alert-test")
 def move_alert_test():
     results = []
@@ -5435,6 +5956,16 @@ if SCHEDULER_ENABLED:
         replace_existing=True,
     )
 
+    # CME GC Volume/Open Interest positioning snapshot (daily data; low-frequency refresh).
+    if GC_POSITIONING_ENABLED:
+        scheduler.add_job(
+            gc_positioning_job,
+            "interval",
+            minutes=max(60, GC_POSITIONING_REFRESH_MINUTES),
+            id="gc_positioning_v6_7_0",
+            replace_existing=True,
+        )
+
     # Czyszczenie cache bez zapytań do API.
     scheduler.add_job(
         cleanup_cache_job,
@@ -5445,6 +5976,11 @@ if SCHEDULER_ENABLED:
     )
 
     scheduler.start()
+    if GC_POSITIONING_ENABLED:
+        try:
+            threading.Thread(target=gc_positioning_job, daemon=True, name="gc-positioning-startup").start()
+        except Exception as e:
+            GC_POSITIONING_STATUS["last_error"] = f"startup: {type(e).__name__}: {e}"
     try:
         ensure_telegram_polling_mode()
         telegram_poll_job()
