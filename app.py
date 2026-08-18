@@ -16,7 +16,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "7.0.3-precision-entry-vwap-mfi-profile"
+APP_VERSION = "7.0.3.1-database-resilience-fail-open"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -60,6 +60,13 @@ TRAIL_LOCK_R_3 = float(os.getenv("TRAIL_LOCK_R_3", "1.5"))
 TRADE_HISTORY_ENABLED = env_bool("TRADE_HISTORY_ENABLED", True)
 DATABASE_REQUIRED = env_bool("DATABASE_REQUIRED", True)
 DATABASE_CONNECT_TIMEOUT_SECONDS = int(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "10"))
+# v7.0.3.1 Database Resilience: keep market monitoring alive when Neon is unavailable/quota-limited.
+# FAIL_OPEN=true means DATABASE_REQUIRED no longer kills the whole process on a temporary DB outage.
+DATABASE_FAIL_OPEN = env_bool("DATABASE_FAIL_OPEN", True)
+DATABASE_RETRY_COOLDOWN_SECONDS = int(os.getenv("DATABASE_RETRY_COOLDOWN_SECONDS", "1800"))
+DATABASE_RECOVERY_INTERVAL_MINUTES = int(os.getenv("DATABASE_RECOVERY_INTERVAL_MINUTES", "30"))
+DATABASE_LOG_SKIPPED_WRITES = env_bool("DATABASE_LOG_SKIPPED_WRITES", False)
+DB_STRICT_STARTUP = bool(DATABASE_REQUIRED and not DATABASE_FAIL_OPEN)
 
 # v6.8 A+ Quality Filter — fewer, higher-quality Telegram alerts
 A_PLUS_FILTER_ENABLED = env_bool("A_PLUS_FILTER_ENABLED", True)
@@ -125,6 +132,7 @@ GC_POSITIONING_STRONG_OI_PCT = float(os.getenv("GC_POSITIONING_STRONG_OI_PCT", "
 GC_POSITIONING_MODERATE_OI_PCT = float(os.getenv("GC_POSITIONING_MODERATE_OI_PCT", "1.0"))
 GC_POSITIONING_ALERTS_ENABLED = env_bool("GC_POSITIONING_ALERTS_ENABLED", False)
 GC_POSITIONING_ALERT_MIN_STRENGTH = os.getenv("GC_POSITIONING_ALERT_MIN_STRENGTH", "STRONG").strip().upper()
+GC_POSITIONING_LOCAL_HISTORY_FILE = os.getenv("GC_POSITIONING_LOCAL_HISTORY_FILE", "gc_positioning_history.json")
 
 # v7.0 Institutional Signal Intelligence
 # Confidence is a transparent evidence score (0-100), NOT a statistical win probability.
@@ -160,8 +168,16 @@ except Exception:
 DB_STATUS: Dict[str, Any] = {
     "configured": bool(DATABASE_URL),
     "connected": False,
+    "mode": "STARTING" if DATABASE_URL else "LOCAL_ONLY",
+    "fail_open": DATABASE_FAIL_OPEN,
+    "strict_startup": DB_STRICT_STARTUP,
     "last_success_utc": None,
     "last_error": None,
+    "last_failure_utc": None,
+    "failure_count": 0,
+    "circuit_open_until_ts": 0.0,
+    "circuit_open_until_utc": None,
+    "local_fallback_active": False,
 }
 
 # Position manager settings
@@ -442,30 +458,75 @@ def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
-def _db_connect():
+def _db_circuit_open() -> bool:
+    until = float(DB_STATUS.get("circuit_open_until_ts", 0.0) or 0.0)
+    return until > time.time()
+
+
+def _mark_db_success() -> None:
+    DB_STATUS.update({
+        "configured": bool(DATABASE_URL),
+        "connected": True,
+        "mode": "NEON",
+        "last_success_utc": now_utc(),
+        "last_error": None,
+        "circuit_open_until_ts": 0.0,
+        "circuit_open_until_utc": None,
+        "local_fallback_active": False,
+    })
+
+
+def _mark_db_failure(error: Exception, context: str = "database") -> None:
+    until_ts = time.time() + max(60, DATABASE_RETRY_COOLDOWN_SECONDS)
+    DB_STATUS.update({
+        "configured": bool(DATABASE_URL),
+        "connected": False,
+        "mode": "DEGRADED_LOCAL",
+        "last_error": f"{context}: {type(error).__name__}: {error}",
+        "last_failure_utc": now_utc(),
+        "failure_count": int(DB_STATUS.get("failure_count", 0) or 0) + 1,
+        "circuit_open_until_ts": until_ts,
+        "circuit_open_until_utc": datetime.fromtimestamp(until_ts, tz=timezone.utc).isoformat(),
+        "local_fallback_active": True,
+    })
+
+
+def _db_connect(force: bool = False):
     if not DATABASE_URL:
         raise RuntimeError("Brak DATABASE_URL")
-    return psycopg2.connect(
-        DATABASE_URL,
-        connect_timeout=max(1, DATABASE_CONNECT_TIMEOUT_SECONDS),
-        application_name="gold-ai-bot-v6.7",
-    )
+    if _db_circuit_open() and not force:
+        raise RuntimeError(
+            f"DB circuit open until {DB_STATUS.get('circuit_open_until_utc')}; using local fallback"
+        )
+    try:
+        conn = psycopg2.connect(
+            DATABASE_URL,
+            connect_timeout=max(1, DATABASE_CONNECT_TIMEOUT_SECONDS),
+            application_name="gold-ai-bot-v7.0.3.1",
+        )
+        _mark_db_success()
+        return conn
+    except Exception as e:
+        _mark_db_failure(e, "connect")
+        raise
 
 
-def init_db() -> None:
-    """Tworzy trwały magazyn JSONB w Neon/PostgreSQL."""
+def init_db(force: bool = False) -> None:
+    """Initialize Neon when available; fail-open to local state during quota/outage."""
     if not DATABASE_URL:
         DB_STATUS.update({
             "configured": False,
             "connected": False,
+            "mode": "LOCAL_ONLY",
             "last_error": "Brak DATABASE_URL",
+            "local_fallback_active": True,
         })
-        if DATABASE_REQUIRED:
-            raise RuntimeError("DATABASE_REQUIRED=true, ale brak DATABASE_URL")
+        if DB_STRICT_STARTUP:
+            raise RuntimeError("DATABASE_REQUIRED=true i DATABASE_FAIL_OPEN=false, ale brak DATABASE_URL")
         return
 
     try:
-        with _db_connect() as conn:
+        with _db_connect(force=force) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -476,9 +537,7 @@ def init_db() -> None:
                     )
                     """
                 )
-                cur.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_app_state_updated_at ON app_state(updated_at DESC)"
-                )
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_app_state_updated_at ON app_state(updated_at DESC)")
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS signal_history (
                         id BIGSERIAL PRIMARY KEY,
@@ -540,41 +599,46 @@ def init_db() -> None:
                     )
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_gold_futures_positioning_date ON gold_futures_positioning(snapshot_date DESC)")
-        DB_STATUS.update({
-            "configured": True,
-            "connected": True,
-            "last_success_utc": now_utc(),
-            "last_error": None,
-        })
-        print("DATABASE OK: Neon/PostgreSQL connected; app_state ready")
+        _mark_db_success()
+        print("DATABASE OK: Neon/PostgreSQL connected; persistent tables ready")
     except Exception as e:
-        DB_STATUS.update({
-            "configured": True,
-            "connected": False,
-            "last_error": f"{type(e).__name__}: {e}",
-        })
-        print(f"DATABASE INIT ERROR: {type(e).__name__}: {e}")
-        if DATABASE_REQUIRED:
+        _mark_db_failure(e, "init")
+        print(f"DATABASE DEGRADED: {type(e).__name__}: {e}; continuing with local fallback")
+        if DB_STRICT_STARTUP:
             raise
 
 
-def database_healthcheck() -> Dict[str, Any]:
+def database_healthcheck(force: bool = False) -> Dict[str, Any]:
     result = dict(DB_STATUS)
     if not DATABASE_URL:
         return result
+    if _db_circuit_open() and not force:
+        result["seconds_until_retry"] = max(0, int(float(result.get("circuit_open_until_ts", 0)) - time.time()))
+        return result
     try:
-        with _db_connect() as conn:
+        with _db_connect(force=force) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM app_state")
                 result["state_rows"] = int(cur.fetchone()[0])
                 cur.execute("SELECT NOW()")
                 result["server_time_utc"] = cur.fetchone()[0].isoformat()
-        result.update({"connected": True, "last_success_utc": now_utc(), "last_error": None})
-        DB_STATUS.update(result)
+        _mark_db_success()
+        result.update(DB_STATUS)
     except Exception as e:
-        result.update({"connected": False, "last_error": f"{type(e).__name__}: {e}"})
-        DB_STATUS.update(result)
+        _mark_db_failure(e, "healthcheck")
+        result.update(DB_STATUS)
     return result
+
+
+def database_recovery_job() -> Dict[str, Any]:
+    """Low-frequency forced reconnect. Never stops market/Telegram jobs on failure."""
+    if not DATABASE_URL:
+        return dict(DB_STATUS)
+    try:
+        init_db(force=True)
+    except Exception:
+        pass
+    return dict(DB_STATUS)
 
 
 def _state_key(path: str) -> str:
@@ -594,7 +658,7 @@ def load_json(path: str, default: Any) -> Any:
             return row[0] if row else default
         except Exception as e:
             DB_STATUS.update({"connected": False, "last_error": f"load {key}: {type(e).__name__}: {e}"})
-            if DATABASE_REQUIRED:
+            if DB_STRICT_STARTUP:
                 raise
 
     try:
@@ -626,7 +690,7 @@ def save_json(path: str, data: Any) -> None:
             return
         except Exception as e:
             DB_STATUS.update({"connected": False, "last_error": f"save {key}: {type(e).__name__}: {e}"})
-            if DATABASE_REQUIRED:
+            if DB_STRICT_STARTUP:
                 raise
 
     tmp = f"{path}.tmp"
@@ -636,7 +700,9 @@ def save_json(path: str, data: Any) -> None:
 
 
 def record_signal_history(signal_type: str, payload: Dict[str, Any]) -> None:
-    if not (TRADE_HISTORY_ENABLED and DATABASE_URL):
+    if not (TRADE_HISTORY_ENABLED and DATABASE_URL) or _db_circuit_open():
+        if DATABASE_LOG_SKIPPED_WRITES and _db_circuit_open():
+            print("SIGNAL HISTORY SKIPPED: database circuit open")
         return
     try:
         side = payload.get("side") or payload.get("signal")
@@ -703,7 +769,9 @@ def update_active_setup(entry_signal: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def record_closed_trade(p: Dict[str, Any], exit_price: Optional[float], reason: str) -> None:
-    if not (TRADE_HISTORY_ENABLED and DATABASE_URL):
+    if not (TRADE_HISTORY_ENABLED and DATABASE_URL) or _db_circuit_open():
+        if DATABASE_LOG_SKIPPED_WRITES and _db_circuit_open():
+            print("TRADE HISTORY SKIPPED: database circuit open")
         return
     try:
         entry=float(p.get("entry")); side=str(p.get("side")); initial_sl=safe_float(p.get("initial_sl"), safe_float(p.get("sl")))
@@ -723,6 +791,8 @@ def record_closed_trade(p: Dict[str, Any], exit_price: Optional[float], reason: 
 def trade_statistics() -> Dict[str, Any]:
     if not DATABASE_URL:
         return {"configured": False}
+    if _db_circuit_open():
+        return {"configured": True, "available": False, "database_mode": DB_STATUS.get("mode"), "reason": DB_STATUS.get("last_error")}
     with _db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT COUNT(*), COUNT(*) FILTER (WHERE outcome='WIN'), COUNT(*) FILTER (WHERE outcome='LOSS'),
@@ -1239,9 +1309,48 @@ def classify_gc_positioning(
     return state, strength
 
 
-def _gc_previous_snapshot(before_date: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    if not DATABASE_URL:
+def _gc_local_history() -> List[Dict[str, Any]]:
+    try:
+        if not os.path.exists(GC_POSITIONING_LOCAL_HISTORY_FILE):
+            return []
+        with open(GC_POSITIONING_LOCAL_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _gc_save_local_snapshot(payload: Dict[str, Any]) -> None:
+    history = _gc_local_history()
+    key = (str(payload.get("snapshot_date")), str(payload.get("source_name")), str(payload.get("product_code")))
+    history = [x for x in history if (str(x.get("snapshot_date")), str(x.get("source_name")), str(x.get("product_code"))) != key]
+    history.append(payload)
+    history = sorted(history, key=lambda x: str(x.get("snapshot_date") or ""))[-60:]
+    tmp = GC_POSITIONING_LOCAL_HISTORY_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2, default=str)
+    os.replace(tmp, GC_POSITIONING_LOCAL_HISTORY_FILE)
+
+
+def _gc_previous_local_snapshot(before_date: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    history = _gc_local_history()
+    rows = [x for x in history if (not before_date or str(x.get("snapshot_date") or "") < str(before_date))]
+    if not rows:
         return None
+    x = sorted(rows, key=lambda z: str(z.get("snapshot_date") or ""))[-1]
+    return {
+        "snapshot_date": x.get("snapshot_date"),
+        "volume": x.get("gc_volume"),
+        "open_interest": x.get("gc_open_interest"),
+        "price_close": x.get("price_proxy_close"),
+        "price_change_pct": x.get("price_proxy_change_pct"),
+        "fingerprint": x.get("source_fingerprint"),
+    }
+
+
+def _gc_previous_snapshot(before_date: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not DATABASE_URL or _db_circuit_open():
+        return _gc_previous_local_snapshot(before_date)
     try:
         with _db_connect() as conn:
             with conn.cursor() as cur:
@@ -1276,7 +1385,7 @@ def _gc_previous_snapshot(before_date: Optional[str] = None) -> Optional[Dict[st
         }
     except Exception as e:
         print(f"GC PREVIOUS SNAPSHOT ERROR: {type(e).__name__}: {e}")
-        return None
+        return _gc_previous_local_snapshot(before_date)
 
 
 def _gc_snapshot_date(raw_row: Dict[str, Any]) -> str:
@@ -1293,7 +1402,9 @@ def _gc_snapshot_date(raw_row: Dict[str, Any]) -> str:
 
 
 def save_gc_positioning_snapshot(payload: Dict[str, Any]) -> None:
-    if not DATABASE_URL:
+    # Always keep a lightweight local copy so positioning survives a Neon outage during this process lifetime.
+    _gc_save_local_snapshot(payload)
+    if not DATABASE_URL or _db_circuit_open():
         return
     with _db_connect() as conn:
         with conn.cursor() as cur:
@@ -1490,8 +1601,10 @@ def gc_positioning_job() -> None:
 
 
 def get_latest_gc_positioning() -> Dict[str, Any]:
-    if not DATABASE_URL:
-        return {"configured": False, "status": GC_POSITIONING_STATUS}
+    if not DATABASE_URL or _db_circuit_open():
+        hist = _gc_local_history()
+        latest = sorted(hist, key=lambda x: str(x.get("snapshot_date") or ""))[-1] if hist else None
+        return {"configured": bool(DATABASE_URL), "database_mode": DB_STATUS.get("mode"), "data": latest, "status": GC_POSITIONING_STATUS}
     try:
         with _db_connect() as conn:
             with conn.cursor() as cur:
@@ -5553,7 +5666,7 @@ def job() -> None:
 
 @app.get("/")
 def root():
-    return jsonify({"app": "Gold AI Bot v7.0.1 + GC Positioning v6.7.0", "version": APP_VERSION, "status": "ok"})
+    return jsonify({"app": "Gold AI Bot v7.0.3.1 Database Resilience", "version": APP_VERSION, "status": "ok"})
 
 
 @app.get("/health")
@@ -5569,9 +5682,10 @@ def health():
     db_health = database_healthcheck()
 
     return jsonify({
-        "status": "ok" if db_health.get("connected") or not DATABASE_REQUIRED else "degraded",
+        "status": "ok" if db_health.get("connected") or DATABASE_FAIL_OPEN or not DATABASE_REQUIRED else "degraded",
         "version": APP_VERSION,
         "database": db_health,
+        "database_resilience": {"fail_open": DATABASE_FAIL_OPEN, "strict_startup": DB_STRICT_STARTUP, "retry_cooldown_seconds": DATABASE_RETRY_COOLDOWN_SECONDS, "recovery_interval_minutes": DATABASE_RECOVERY_INTERVAL_MINUTES},
         "scheduler_enabled": SCHEDULER_ENABLED,
         "scheduler_running": scheduler_running,
         "scheduler_jobs": scheduler_jobs,
@@ -5683,7 +5797,7 @@ def cache_status_endpoint():
     db_health = database_healthcheck()
 
     return jsonify({
-        "status": "ok" if db_health.get("connected") or not DATABASE_REQUIRED else "degraded",
+        "status": "ok" if db_health.get("connected") or DATABASE_FAIL_OPEN or not DATABASE_REQUIRED else "degraded",
         "version": APP_VERSION,
         "database": db_health,
         "cache": cache_status_snapshot(),
@@ -5701,7 +5815,7 @@ def fast_check_status_endpoint():
     db_health = database_healthcheck()
 
     return jsonify({
-        "status": "ok" if db_health.get("connected") or not DATABASE_REQUIRED else "degraded",
+        "status": "ok" if db_health.get("connected") or DATABASE_FAIL_OPEN or not DATABASE_REQUIRED else "degraded",
         "version": APP_VERSION,
         "database": db_health,
         "fast_check": fast_check_status_snapshot(),
@@ -5716,7 +5830,7 @@ def quota_status_endpoint():
     db_health = database_healthcheck()
 
     return jsonify({
-        "status": "ok" if db_health.get("connected") or not DATABASE_REQUIRED else "degraded",
+        "status": "ok" if db_health.get("connected") or DATABASE_FAIL_OPEN or not DATABASE_REQUIRED else "degraded",
         "version": APP_VERSION,
         "database": db_health,
         "api_runtime": api_runtime_snapshot(),
@@ -5851,7 +5965,7 @@ def move_alert_status_endpoint():
     db_health = database_healthcheck()
 
     return jsonify({
-        "status": "ok" if db_health.get("connected") or not DATABASE_REQUIRED else "degraded",
+        "status": "ok" if db_health.get("connected") or DATABASE_FAIL_OPEN or not DATABASE_REQUIRED else "degraded",
         "version": APP_VERSION,
         "database": db_health,
         "move_alert_config": {
@@ -5891,7 +6005,7 @@ def move_alert_run_now_endpoint():
     db_health = database_healthcheck()
 
     return jsonify({
-        "status": "ok" if db_health.get("connected") or not DATABASE_REQUIRED else "degraded",
+        "status": "ok" if db_health.get("connected") or DATABASE_FAIL_OPEN or not DATABASE_REQUIRED else "degraded",
         "version": APP_VERSION,
         "database": db_health,
         "last_move_alert_status": LAST_MOVE_ALERT_STATUS,
@@ -6132,7 +6246,7 @@ def entry_exit_run_now_endpoint():
     db_health = database_healthcheck()
 
     return jsonify({
-        "status": "ok" if db_health.get("connected") or not DATABASE_REQUIRED else "degraded",
+        "status": "ok" if db_health.get("connected") or DATABASE_FAIL_OPEN or not DATABASE_REQUIRED else "degraded",
         "version": APP_VERSION,
         "database": db_health,
         "entry_exit_status": LAST_ENTRY_EXIT_STATUS,
@@ -6308,6 +6422,26 @@ def gc_positioning_refresh_endpoint():
         return jsonify({"status": "error", "version": APP_VERSION, "error": f"{type(e).__name__}: {e}"}), 200
 
 
+@app.get("/database-status")
+def database_status_endpoint():
+    return jsonify({
+        "status": "ok",
+        "version": APP_VERSION,
+        "database": database_healthcheck(),
+        "fail_open": DATABASE_FAIL_OPEN,
+        "strict_startup": DB_STRICT_STARTUP,
+    })
+
+
+@app.post("/database-reconnect")
+def database_reconnect_endpoint():
+    return jsonify({
+        "status": "ok",
+        "version": APP_VERSION,
+        "database": database_recovery_job(),
+    })
+
+
 @app.get("/move-alert-test")
 def move_alert_test():
     results = []
@@ -6392,6 +6526,17 @@ if SCHEDULER_ENABLED:
             "interval",
             minutes=max(60, GC_POSITIONING_REFRESH_MINUTES),
             id="gc_positioning_v6_7_0",
+            replace_existing=True,
+        )
+
+    # Database recovery probe is deliberately low-frequency so a Neon quota outage
+    # cannot create a reconnect storm or consume unnecessary compute.
+    if DATABASE_URL:
+        scheduler.add_job(
+            database_recovery_job,
+            "interval",
+            minutes=max(5, DATABASE_RECOVERY_INTERVAL_MINUTES),
+            id="database_recovery",
             replace_existing=True,
         )
 
