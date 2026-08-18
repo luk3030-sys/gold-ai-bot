@@ -16,7 +16,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "7.0.2-momentum-failure-rsi-extreme"
+APP_VERSION = "7.0.3-precision-entry-vwap-mfi-profile"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -79,6 +79,14 @@ A_PLUS_RSI_BUY_MAX = float(os.getenv("A_PLUS_RSI_BUY_MAX", "70"))
 A_PLUS_RSI_SELL_MIN = float(os.getenv("A_PLUS_RSI_SELL_MIN", "30"))
 A_PLUS_MIN_CANDLE_ATR = float(os.getenv("A_PLUS_MIN_CANDLE_ATR", "1.0"))
 A_PLUS_MIN_RR = float(os.getenv("A_PLUS_MIN_RR", "2.0"))
+
+# v7.0.3 Precision Entry Engine — VWAP/MFI/divergence/profile
+PRECISION_ENTRY_ENABLED = env_bool("PRECISION_ENTRY_ENABLED", True)
+PRECISION_DIVERGENCE_LOOKBACK = int(os.getenv("PRECISION_DIVERGENCE_LOOKBACK", "40"))
+PRECISION_PROFILE_BINS = int(os.getenv("PRECISION_PROFILE_BINS", "24"))
+PRECISION_PROFILE_LOOKBACK = int(os.getenv("PRECISION_PROFILE_LOOKBACK", "96"))
+PRECISION_VWAP_LOOKBACK = int(os.getenv("PRECISION_VWAP_LOOKBACK", "96"))
+PRECISION_MIN_SCORE_CONFIRM = int(os.getenv("PRECISION_MIN_SCORE_CONFIRM", "65"))
 
 # v6.8.1 Momentum Breakout Watch — catches strong trend breakouts without requiring a classical retest
 MOMENTUM_BREAKOUT_ENABLED = env_bool("MOMENTUM_BREAKOUT_ENABLED", True)
@@ -1600,6 +1608,8 @@ def fetch_ohlc(interval: str, outputsize: int = 300, force_refresh: bool = False
         df["datetime"] = pd.to_datetime(df["datetime"])
         for col in ["open", "high", "low", "close"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
         df = df.dropna().sort_values("datetime").reset_index(drop=True)
         if CLOSED_CANDLES_ONLY and len(df) > 2:
             df = df.iloc[:-1].copy()
@@ -1648,6 +1658,93 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
 
+def mfi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    if "volume" not in df.columns or df["volume"].notna().sum() < period + 2:
+        return pd.Series(np.nan, index=df.index, dtype=float)
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    flow = tp * df["volume"].fillna(0)
+    direction = tp.diff()
+    pos = flow.where(direction > 0, 0.0).rolling(period).sum()
+    neg = flow.where(direction < 0, 0.0).rolling(period).sum()
+    ratio = pos / neg.replace(0, np.nan)
+    out = 100 - (100 / (1 + ratio))
+    out = out.mask((neg == 0) & (pos > 0), 100.0)
+    out = out.mask((pos == 0) & (neg > 0), 0.0)
+    return out
+
+def rolling_vwap(df: pd.DataFrame, lookback: int = 96) -> pd.Series:
+    if "volume" not in df.columns or df["volume"].fillna(0).sum() <= 0:
+        return pd.Series(np.nan, index=df.index, dtype=float)
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    vol = df["volume"].fillna(0)
+    pv = tp * vol
+    return pv.rolling(lookback, min_periods=max(5, min(lookback, 20))).sum() / vol.rolling(lookback, min_periods=max(5, min(lookback, 20))).sum().replace(0, np.nan)
+
+def indicator_divergence(df: pd.DataFrame, indicator_col: str, lookback: int = 40) -> Dict[str, Any]:
+    out = {"bullish": False, "bearish": False, "indicator": indicator_col, "reason": None}
+    if indicator_col not in df.columns:
+        return out
+    x = df.tail(max(12, lookback)).reset_index(drop=True)
+    sp = swing_points(x, 2, 2)
+    try:
+        lows = sp["lows"]
+        if len(lows) >= 2:
+            a,b=lows[-2],lows[-1]
+            ia,ib=float(x.loc[a["i"], indicator_col]),float(x.loc[b["i"], indicator_col])
+            if np.isfinite(ia) and np.isfinite(ib) and b["price"] < a["price"] and ib > ia:
+                out.update({"bullish": True, "reason": f"price LL, {indicator_col} HL"})
+        highs = sp["highs"]
+        if len(highs) >= 2:
+            a,b=highs[-2],highs[-1]
+            ia,ib=float(x.loc[a["i"], indicator_col]),float(x.loc[b["i"], indicator_col])
+            if np.isfinite(ia) and np.isfinite(ib) and b["price"] > a["price"] and ib < ia:
+                out.update({"bearish": True, "reason": f"price HH, {indicator_col} LH"})
+    except Exception:
+        pass
+    return out
+
+def volume_profile(df: pd.DataFrame, lookback: int = 96, bins: int = 24) -> Dict[str, Any]:
+    x=df.tail(max(20, lookback)).copy()
+    if "volume" not in x.columns or x["volume"].fillna(0).sum() <= 0:
+        return {"available": False, "reason": "No exchange/tick volume in feed", "poc": None, "vah": None, "val": None}
+    lo,hi=float(x.low.min()),float(x.high.max())
+    if hi <= lo:
+        return {"available": False, "reason": "Invalid range", "poc": None, "vah": None, "val": None}
+    edges=np.linspace(lo,hi,max(6,bins)+1); hist=np.zeros(len(edges)-1)
+    tp=((x.high+x.low+x.close)/3.0).to_numpy(); vol=x.volume.fillna(0).to_numpy()
+    idx=np.clip(np.digitize(tp,edges)-1,0,len(hist)-1)
+    for i,v in zip(idx,vol): hist[i]+=float(v)
+    centers=(edges[:-1]+edges[1:])/2; poc_i=int(np.argmax(hist)); total=float(hist.sum())
+    order=np.argsort(hist)[::-1]; chosen=[]; acc=0.0
+    for i in order:
+        chosen.append(int(i)); acc += float(hist[i])
+        if total and acc/total >= .70: break
+    return {"available": True, "poc": round(float(centers[poc_i]),2), "vah": round(float(max(centers[chosen])),2), "val": round(float(min(centers[chosen])),2), "volume_total": round(total,2)}
+
+def precision_entry_snapshot(df: pd.DataFrame) -> Dict[str, Any]:
+    if df is None or df.empty:
+        return {"available": False}
+    x=add_indicators(df) if "rsi14" not in df.columns else df.copy()
+    last=x.iloc[-1]; price=float(last.close)
+    rd=indicator_divergence(x,"rsi14",PRECISION_DIVERGENCE_LOOKBACK)
+    md=indicator_divergence(x,"mfi14",PRECISION_DIVERGENCE_LOOKBACK)
+    vp=volume_profile(x,PRECISION_PROFILE_LOOKBACK,PRECISION_PROFILE_BINS)
+    vw=safe_float(last.get("vwap")); mf=safe_float(last.get("mfi14")); rs=safe_float(last.get("rsi14"))
+    buy=sell=50; reasons=[]
+    if rd["bullish"]: buy+=15; reasons.append("bullish RSI divergence")
+    if rd["bearish"]: sell+=15; reasons.append("bearish RSI divergence")
+    if md["bullish"]: buy+=10; reasons.append("bullish MFI divergence")
+    if md["bearish"]: sell+=10; reasons.append("bearish MFI divergence")
+    if vw is not None:
+        if price > vw: buy+=10; sell-=5; reasons.append("price above VWAP")
+        elif price < vw: sell+=10; buy-=5; reasons.append("price below VWAP")
+    if rs is not None and rs <= 20: buy+=5
+    if rs is not None and rs >= 80: sell+=5
+    if mf is not None and mf <= 20: buy+=5
+    if mf is not None and mf >= 80: sell+=5
+    buy=max(0,min(100,buy)); sell=max(0,min(100,sell))
+    return {"available": True,"price":round(price,2),"rsi14":round(rs,2) if rs is not None else None,"mfi14":round(mf,2) if mf is not None else None,"vwap":round(vw,2) if vw is not None else None,"vwap_available":vw is not None,"rsi_divergence":rd,"mfi_divergence":md,"volume_profile":vp,"buy_score":int(buy),"sell_score":int(sell),"reasons":reasons,"note":"VWAP/MFI/Volume Profile require volume from data feed; unavailable components are not approximated."}
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["ema20"] = ema(out["close"], 20)
@@ -1655,6 +1752,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["ema200"] = ema(out["close"], 200)
     out["rsi14"] = rsi(out["close"], 14)
     out["atr14"] = atr(out, 14)
+    out["mfi14"] = mfi(out, 14)
+    out["vwap"] = rolling_vwap(out, PRECISION_VWAP_LOOKBACK)
     return out
 
 
@@ -1800,6 +1899,7 @@ def build_signal() -> Dict[str, Any]:
     sweep = liquidity_sweep(h1)
     fvg = fair_value_gap(h1)
     ob = order_block(h1)
+    precision_m15 = precision_entry_snapshot(m15) if PRECISION_ENTRY_ENABLED else {"available": False, "enabled": False}
 
     score_sell = 0
     score_buy = 0
@@ -1822,6 +1922,13 @@ def build_signal() -> Dict[str, Any]:
     if fvg["latest"] and fvg["latest"]["type"] == "BULLISH_FVG": score_buy += 10
     if ob["latest"] and ob["latest"]["type"] == "BEARISH_OB": score_sell += 10
     if ob["latest"] and ob["latest"]["type"] == "BULLISH_OB": score_buy += 10
+
+    # Precision layer is intentionally a confirmation bonus/penalty, not a standalone trigger.
+    if PRECISION_ENTRY_ENABLED and precision_m15.get("available"):
+        if precision_m15.get("buy_score", 50) >= PRECISION_MIN_SCORE_CONFIRM:
+            score_buy += 5; reasons.append("M15 precision layer confirms BUY")
+        if precision_m15.get("sell_score", 50) >= PRECISION_MIN_SCORE_CONFIRM:
+            score_sell += 5; reasons.append("M15 precision layer confirms SELL")
 
     if score_sell >= score_buy + 15 and score_sell >= MIN_SCORE_TO_ALERT:
         side = "SELL"; score = score_sell
@@ -1849,6 +1956,7 @@ def build_signal() -> Dict[str, Any]:
             "liquidity_sweep_h1": sweep,
             "fair_value_gap_h1": fvg,
             "order_block_h1": ob,
+            "precision_entry_m15": precision_m15,
         },
         "risk_plan": rp | {"risk_note": "Risk max 1-2% capital. Signal is rule score, not probability."},
         "reasons": reasons,
@@ -6101,6 +6209,16 @@ def trade_history_endpoint():
                     try: r[k]=float(v)
                     except Exception: r[k]=str(v)
         return jsonify({"status":"ok","version":APP_VERSION,"count":len(rows),"trades":rows})
+    except Exception as e:
+        return jsonify({"status":"error","version":APP_VERSION,"error":f"{type(e).__name__}: {e}"}), 200
+
+
+@app.get("/precision-entry-status")
+def precision_entry_status_endpoint():
+    try:
+        m15 = add_indicators(fetch_ohlc("15min", max(120, PRECISION_PROFILE_LOOKBACK + 20)))
+        h1 = add_indicators(fetch_ohlc("1h", max(120, PRECISION_PROFILE_LOOKBACK + 20)))
+        return jsonify({"status":"ok","version":APP_VERSION,"enabled":PRECISION_ENTRY_ENABLED,"M15":precision_entry_snapshot(m15),"H1":precision_entry_snapshot(h1)})
     except Exception as e:
         return jsonify({"status":"error","version":APP_VERSION,"error":f"{type(e).__name__}: {e}"}), 200
 
