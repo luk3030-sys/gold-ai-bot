@@ -16,7 +16,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "7.0.1-gc-positioning-v6.7.0"
+APP_VERSION = "7.0.2-momentum-failure-rsi-extreme"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -306,6 +306,25 @@ ALERT_ON_STRONG_MOVE_WITH_NO_ENTRY = env_bool("ALERT_ON_STRONG_MOVE_WITH_NO_ENTR
 SELL_INVALIDATION_ON_BULLISH_REVERSAL = env_bool("SELL_INVALIDATION_ON_BULLISH_REVERSAL", True)
 BUY_INVALIDATION_ON_BEARISH_REVERSAL = env_bool("BUY_INVALIDATION_ON_BEARISH_REVERSAL", True)
 REVERSAL_WARN_OPEN_POSITIONS = env_bool("REVERSAL_WARN_OPEN_POSITIONS", True)
+
+# v7.0.2 Momentum Failure Guard + RSI Extreme Alert
+MOMENTUM_FAILURE_GUARD_ENABLED = env_bool("MOMENTUM_FAILURE_GUARD_ENABLED", True)
+MOMENTUM_FAILURE_STATE_FILE = os.getenv("MOMENTUM_FAILURE_STATE_FILE", "momentum_failure_state.json")
+MOMENTUM_FAILURE_MAX_AGE_MINUTES = int(os.getenv("MOMENTUM_FAILURE_MAX_AGE_MINUTES", "180"))
+MOMENTUM_FAILURE_RETRACE_RATIO = float(os.getenv("MOMENTUM_FAILURE_RETRACE_RATIO", "0.55"))
+MOMENTUM_FAILURE_BEARISH_BODY_ATR_MIN = float(os.getenv("MOMENTUM_FAILURE_BEARISH_BODY_ATR_MIN", "0.80"))
+MOMENTUM_FAILURE_BULLISH_BODY_ATR_MIN = float(os.getenv("MOMENTUM_FAILURE_BULLISH_BODY_ATR_MIN", "0.80"))
+MOMENTUM_FAILURE_COOLDOWN_MINUTES = int(os.getenv("MOMENTUM_FAILURE_COOLDOWN_MINUTES", "45"))
+MOMENTUM_FAILURE_ROUND_STEP = float(os.getenv("MOMENTUM_FAILURE_ROUND_STEP", "20"))
+
+RSI_EXTREME_ALERT_ENABLED = env_bool("RSI_EXTREME_ALERT_ENABLED", True)
+RSI_EXTREME_INTERVAL = os.getenv("RSI_EXTREME_INTERVAL", "15min")
+RSI_EXTREME_HIGH = float(os.getenv("RSI_EXTREME_HIGH", "90"))
+RSI_EXTREME_LOW = float(os.getenv("RSI_EXTREME_LOW", "10"))
+RSI_EXTREME_REARM_HIGH = float(os.getenv("RSI_EXTREME_REARM_HIGH", "85"))
+RSI_EXTREME_REARM_LOW = float(os.getenv("RSI_EXTREME_REARM_LOW", "15"))
+RSI_EXTREME_COOLDOWN_MINUTES = int(os.getenv("RSI_EXTREME_COOLDOWN_MINUTES", "60"))
+RSI_EXTREME_STATE_FILE = os.getenv("RSI_EXTREME_STATE_FILE", "rsi_extreme_state.json")
 
 # Precision Signal Alignment
 PRECISION_ALIGNMENT_ENABLED = env_bool("PRECISION_ALIGNMENT_ENABLED", True)
@@ -1615,7 +1634,12 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     ma_up = up.ewm(alpha=1/period, adjust=False).mean()
     ma_down = down.ewm(alpha=1/period, adjust=False).mean()
     rs = ma_up / ma_down.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    out = 100 - (100 / (1 + rs))
+    # Correct Wilder edge cases: a one-way move must not become NaN.
+    out = out.mask((ma_down == 0) & (ma_up > 0), 100.0)
+    out = out.mask((ma_up == 0) & (ma_down > 0), 0.0)
+    out = out.mask((ma_up == 0) & (ma_down == 0), 50.0)
+    return out
 
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -4517,6 +4541,234 @@ def format_extreme_candle_alert(event: Dict[str, Any]) -> str:
     )
 
 
+def _parse_event_ts(value: Any) -> float:
+    if value is None:
+        return 0.0
+    try:
+        text = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _record_momentum_impulse(event: Dict[str, Any]) -> None:
+    """Remember a strong M15 impulse so we can warn if it fails shortly afterwards."""
+    if not MOMENTUM_FAILURE_GUARD_ENABLED or str(event.get("interval")) != "15min":
+        return
+    direction = str(event.get("direction", "")).upper()
+    if direction not in ("BUY", "SELL"):
+        return
+    change = safe_float(event.get("candle_change"))
+    close = safe_float(event.get("price"))
+    if change is None or close is None or abs(change) < 0.01:
+        return
+    start = close - change
+    state = load_json(MOMENTUM_FAILURE_STATE_FILE, {})
+    state["active_impulse"] = {
+        "direction": direction,
+        "interval": "15min",
+        "datetime": event.get("datetime"),
+        "created_ts": _utc_ts(),
+        "start_price": round(float(start), 2),
+        "end_price": round(float(close), 2),
+        "high": round(max(float(start), float(close)), 2),
+        "low": round(min(float(start), float(close)), 2),
+        "body_atr": event.get("body_atr"),
+        "source_type": event.get("type"),
+        "failed_alert_sent": False,
+    }
+    state["updated_utc"] = now_utc()
+    save_json(MOMENTUM_FAILURE_STATE_FILE, state)
+
+
+def detect_momentum_failure() -> Optional[Dict[str, Any]]:
+    """Early warning that the most recent strong M15 impulse has been invalidated.
+
+    This is deliberately independent of the A+ entry filter: it is a risk warning,
+    not an automatic opposite-side entry signal.
+    """
+    if not MOMENTUM_FAILURE_GUARD_ENABLED:
+        return None
+    state = load_json(MOMENTUM_FAILURE_STATE_FILE, {})
+    imp = state.get("active_impulse") if isinstance(state, dict) else None
+    if not isinstance(imp, dict):
+        return None
+    age = _utc_ts() - float(imp.get("created_ts", 0) or 0)
+    if age <= 0 or age > max(15, MOMENTUM_FAILURE_MAX_AGE_MINUTES) * 60:
+        return None
+    if imp.get("failed_alert_sent"):
+        return None
+
+    try:
+        df = add_indicators(fetch_ohlc("15min", 80))
+        if df is None or len(df) < 25:
+            return None
+        last = df.iloc[-1]
+        recent = df.tail(8)
+        close = float(last.close)
+        body = float(last.close - last.open)
+        atrv = float(last.atr14) if pd.notna(last.atr14) else 0.0
+        body_atr = abs(body) / atrv if atrv > 0 else 0.0
+        start = float(imp["start_price"])
+        end = float(imp["end_price"])
+        span = max(0.01, abs(end - start))
+        direction = imp.get("direction")
+
+        if direction == "BUY":
+            retrace_level = end - span * MOMENTUM_FAILURE_RETRACE_RATIO
+            local_floor = float(recent.iloc[:-1].low.min()) if len(recent) > 1 else start
+            displacement = body < 0 and body_atr >= MOMENTUM_FAILURE_BEARISH_BODY_ATR_MIN
+            full_failure = close < start
+            deep_retrace = close <= retrace_level
+            structure_break = close < local_floor
+            round_level = np.floor(end / MOMENTUM_FAILURE_ROUND_STEP) * MOMENTUM_FAILURE_ROUND_STEP if MOMENTUM_FAILURE_ROUND_STEP > 0 else None
+            round_loss = round_level is not None and close < round_level <= end
+            failed = full_failure or (deep_retrace and (displacement or structure_break or round_loss))
+            opposite = "SELL"
+        else:
+            retrace_level = end + span * MOMENTUM_FAILURE_RETRACE_RATIO
+            local_ceiling = float(recent.iloc[:-1].high.max()) if len(recent) > 1 else start
+            displacement = body > 0 and body_atr >= MOMENTUM_FAILURE_BULLISH_BODY_ATR_MIN
+            full_failure = close > start
+            deep_retrace = close >= retrace_level
+            structure_break = close > local_ceiling
+            round_level = np.ceil(end / MOMENTUM_FAILURE_ROUND_STEP) * MOMENTUM_FAILURE_ROUND_STEP if MOMENTUM_FAILURE_ROUND_STEP > 0 else None
+            round_loss = round_level is not None and close > round_level >= end
+            failed = full_failure or (deep_retrace and (displacement or structure_break or round_loss))
+            opposite = "BUY"
+
+        if not failed:
+            return None
+        event = {
+            "type": "MOMENTUM_FAILURE",
+            "previous_direction": direction,
+            "warning_direction": opposite,
+            "previous_impulse_price": round(end, 2),
+            "impulse_start": round(start, 2),
+            "current_price": round(close, 2),
+            "retrace_level": round(float(retrace_level), 2),
+            "body_atr": round(float(body_atr), 2),
+            "opposite_displacement": bool(displacement),
+            "structure_break": bool(structure_break),
+            "round_level_loss": bool(round_loss),
+            "full_failure": bool(full_failure),
+            "datetime": str(last.datetime),
+            "dedupe_key": f"MOMENTUM_FAILURE:{direction}:{imp.get('datetime')}",
+        }
+        return event
+    except Exception as e:
+        return {"type": "MOMENTUM_FAILURE", "error": f"{type(e).__name__}: {e}"}
+
+
+def should_send_momentum_failure_alert(event: Dict[str, Any]) -> bool:
+    if not event or event.get("error"):
+        return False
+    state = load_json(MOMENTUM_FAILURE_STATE_FILE, {})
+    now_ts = _utc_ts()
+    last_alert_ts = float(state.get("last_failure_alert_ts", 0) or 0)
+    if now_ts - last_alert_ts < max(60, MOMENTUM_FAILURE_COOLDOWN_MINUTES * 60):
+        return False
+    imp = state.get("active_impulse") or {}
+    imp["failed_alert_sent"] = True
+    state["active_impulse"] = imp
+    state["last_failure_alert_ts"] = now_ts
+    state["last_failure_event"] = event
+    state["updated_utc"] = now_utc()
+    save_json(MOMENTUM_FAILURE_STATE_FILE, state)
+    return True
+
+
+def format_momentum_failure_alert(event: Dict[str, Any]) -> str:
+    prev = event.get("previous_direction")
+    warn = event.get("warning_direction")
+    risk = "BEARISH REVERSAL RISK" if warn == "SELL" else "BULLISH REVERSAL RISK"
+    return (
+        f"🔴 GOLD MOMENTUM FAILURE — {prev} IMPULSE FAILED\n\n"
+        f"Poprzedni impuls: {prev} @ {event.get('previous_impulse_price')}\n"
+        f"Początek impulsu: {event.get('impulse_start')}\n"
+        f"Aktualna cena M15: {event.get('current_price')}\n"
+        f"Poziom głębokiego retrace: {event.get('retrace_level')}\n"
+        f"Opposite displacement: {'TAK' if event.get('opposite_displacement') else 'NIE'} | "
+        f"Break struktury: {'TAK' if event.get('structure_break') else 'NIE'} | "
+        f"Round-level loss: {'TAK' if event.get('round_level_loss') else 'NIE'}\n"
+        f"Body/ATR ostatniej M15: {event.get('body_atr')}\n\n"
+        f"Status: {risk}.\n"
+        f"To jest alert ochronny, NIE automatyczny sygnał {warn}. Nie dokładać do wcześniejszego {prev}; "
+        f"czekać na potwierdzenie struktury/retest przed nowym wejściem."
+    )
+
+
+def detect_rsi_extreme_alert() -> Optional[Dict[str, Any]]:
+    if not RSI_EXTREME_ALERT_ENABLED:
+        return None
+    try:
+        df = add_indicators(fetch_ohlc(RSI_EXTREME_INTERVAL, 100))
+        if df is None or len(df) < 30:
+            return None
+        last = df.iloc[-1]
+        value = safe_float(last.rsi14)
+        if value is None:
+            return None
+        state = load_json(RSI_EXTREME_STATE_FILE, {"high_armed": True, "low_armed": True})
+        high_armed = bool(state.get("high_armed", True))
+        low_armed = bool(state.get("low_armed", True))
+
+        # Rearm only after RSI leaves the extreme zone materially.
+        if value <= RSI_EXTREME_REARM_HIGH:
+            high_armed = True
+        if value >= RSI_EXTREME_REARM_LOW:
+            low_armed = True
+
+        event = None
+        if value >= RSI_EXTREME_HIGH and high_armed:
+            event = {"type": "RSI_EXTREME", "side": "OVERBOUGHT", "rsi": round(value, 1), "price": round(float(last.close), 2), "interval": RSI_EXTREME_INTERVAL, "datetime": str(last.datetime)}
+            high_armed = False
+        elif value <= RSI_EXTREME_LOW and low_armed:
+            event = {"type": "RSI_EXTREME", "side": "OVERSOLD", "rsi": round(value, 1), "price": round(float(last.close), 2), "interval": RSI_EXTREME_INTERVAL, "datetime": str(last.datetime)}
+            low_armed = False
+
+        state.update({"high_armed": high_armed, "low_armed": low_armed, "last_rsi": round(value, 2), "last_price": round(float(last.close), 2), "updated_utc": now_utc()})
+        save_json(RSI_EXTREME_STATE_FILE, state)
+        return event
+    except Exception as e:
+        return {"type": "RSI_EXTREME", "error": f"{type(e).__name__}: {e}"}
+
+
+def should_send_rsi_extreme_alert(event: Dict[str, Any]) -> bool:
+    if not event or event.get("error"):
+        return False
+    state = load_json(RSI_EXTREME_STATE_FILE, {})
+    now_ts = _utc_ts()
+    key = "last_high_alert_ts" if event.get("side") == "OVERBOUGHT" else "last_low_alert_ts"
+    last_ts = float(state.get(key, 0) or 0)
+    if now_ts - last_ts < max(60, RSI_EXTREME_COOLDOWN_MINUTES * 60):
+        return False
+    state[key] = now_ts
+    state["last_event"] = event
+    state["updated_utc"] = now_utc()
+    save_json(RSI_EXTREME_STATE_FILE, state)
+    return True
+
+
+def format_rsi_extreme_alert(event: Dict[str, Any]) -> str:
+    over = event.get("side") == "OVERBOUGHT"
+    icon = "🔴" if over else "🟢"
+    label = "EXTREME OVERBOUGHT" if over else "EXTREME OVERSOLD"
+    warning = "Ryzyko wyczerpania wzrostu/korekty jest podwyższone." if over else "Ryzyko wyczerpania spadku/odbicia jest podwyższone."
+    return (
+        f"{icon} GOLD RSI EXTREME — {label}\n\n"
+        f"Interwał: {event.get('interval')}\n"
+        f"RSI(14): {event.get('rsi')}\n"
+        f"Cena: {event.get('price')}\n\n"
+        f"{warning}\n"
+        f"To NIE jest automatyczny sygnał {'SELL' if over else 'BUY'}. "
+        f"Szukaj potwierdzenia: divergence, failed breakout, knot odrzucenia lub break struktury M15."
+    )
+
+
 def detect_reversal_momentum_watch(current_signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Warning layer independent of final ENTRY SIGNAL.
@@ -4735,7 +4987,25 @@ def reversal_momentum_watch_job(current_signal: Optional[Dict[str, Any]] = None)
                 sent_count += 1
         watch["extreme_candles"] = extreme_events
 
+        # v7.0.2 independent protection lane: bypasses A+ because these are warnings, not entries.
+        failure_event = detect_momentum_failure()
+        if failure_event and not failure_event.get("error") and should_send_momentum_failure_alert(failure_event):
+            send_telegram(format_momentum_failure_alert(failure_event))
+            sent_count += 1
+            if A_PLUS_LOG_INFO_TO_DB:
+                record_signal_history("MOMENTUM_FAILURE_WARNING", failure_event)
+        watch["momentum_failure"] = failure_event
+
+        rsi_event = detect_rsi_extreme_alert()
+        if rsi_event and not rsi_event.get("error") and should_send_rsi_extreme_alert(rsi_event):
+            send_telegram(format_rsi_extreme_alert(rsi_event))
+            sent_count += 1
+            if A_PLUS_LOG_INFO_TO_DB:
+                record_signal_history("RSI_EXTREME_WARNING", rsi_event)
+        watch["rsi_extreme"] = rsi_event
+
         for event in watch.get("events", []):
+            _record_momentum_impulse(event)
             quality = evaluate_a_plus_quality(current_signal or build_signal(), event=event)
             event["a_plus_quality"] = quality
             if A_PLUS_LOG_INFO_TO_DB:
@@ -5251,6 +5521,15 @@ def health():
         "extreme_candle_min_range_atr": EXTREME_CANDLE_MIN_RANGE_ATR,
         "extreme_candle_min_percentile": EXTREME_CANDLE_MIN_PERCENTILE,
         "extreme_candle_cooldown_minutes": EXTREME_CANDLE_COOLDOWN_MINUTES,
+        "momentum_failure_guard_enabled": MOMENTUM_FAILURE_GUARD_ENABLED,
+        "momentum_failure_max_age_minutes": MOMENTUM_FAILURE_MAX_AGE_MINUTES,
+        "momentum_failure_retrace_ratio": MOMENTUM_FAILURE_RETRACE_RATIO,
+        "rsi_extreme_alert_enabled": RSI_EXTREME_ALERT_ENABLED,
+        "rsi_extreme_interval": RSI_EXTREME_INTERVAL,
+        "rsi_extreme_high": RSI_EXTREME_HIGH,
+        "rsi_extreme_low": RSI_EXTREME_LOW,
+        "rsi_extreme_rearm_high": RSI_EXTREME_REARM_HIGH,
+        "rsi_extreme_rearm_low": RSI_EXTREME_REARM_LOW,
         "spread_filter_enabled": SPREAD_FILTER_ENABLED,
         "current_spread_points": CURRENT_SPREAD_POINTS,
     })
@@ -5824,6 +6103,38 @@ def trade_history_endpoint():
         return jsonify({"status":"ok","version":APP_VERSION,"count":len(rows),"trades":rows})
     except Exception as e:
         return jsonify({"status":"error","version":APP_VERSION,"error":f"{type(e).__name__}: {e}"}), 200
+
+
+@app.get("/reversal-guard-status")
+def reversal_guard_status_endpoint():
+    return jsonify({
+        "status": "ok",
+        "version": APP_VERSION,
+        "momentum_failure": {
+            "enabled": MOMENTUM_FAILURE_GUARD_ENABLED,
+            "config": {
+                "max_age_minutes": MOMENTUM_FAILURE_MAX_AGE_MINUTES,
+                "retrace_ratio": MOMENTUM_FAILURE_RETRACE_RATIO,
+                "bearish_body_atr_min": MOMENTUM_FAILURE_BEARISH_BODY_ATR_MIN,
+                "bullish_body_atr_min": MOMENTUM_FAILURE_BULLISH_BODY_ATR_MIN,
+                "cooldown_minutes": MOMENTUM_FAILURE_COOLDOWN_MINUTES,
+            },
+            "state": load_json(MOMENTUM_FAILURE_STATE_FILE, {}),
+            "current_event": detect_momentum_failure(),
+        },
+        "rsi_extreme": {
+            "enabled": RSI_EXTREME_ALERT_ENABLED,
+            "config": {
+                "interval": RSI_EXTREME_INTERVAL,
+                "high": RSI_EXTREME_HIGH,
+                "low": RSI_EXTREME_LOW,
+                "rearm_high": RSI_EXTREME_REARM_HIGH,
+                "rearm_low": RSI_EXTREME_REARM_LOW,
+                "cooldown_minutes": RSI_EXTREME_COOLDOWN_MINUTES,
+            },
+            "state": load_json(RSI_EXTREME_STATE_FILE, {}),
+        },
+    })
 
 
 @app.get("/extreme-candle-status")
