@@ -16,7 +16,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "7.0.3.1-database-resilience-fail-open"
+APP_VERSION = "7.0.3.2-rsi-70-30-alerts"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -343,10 +343,10 @@ MOMENTUM_FAILURE_ROUND_STEP = float(os.getenv("MOMENTUM_FAILURE_ROUND_STEP", "20
 
 RSI_EXTREME_ALERT_ENABLED = env_bool("RSI_EXTREME_ALERT_ENABLED", True)
 RSI_EXTREME_INTERVAL = os.getenv("RSI_EXTREME_INTERVAL", "15min")
-RSI_EXTREME_HIGH = float(os.getenv("RSI_EXTREME_HIGH", "90"))
-RSI_EXTREME_LOW = float(os.getenv("RSI_EXTREME_LOW", "10"))
-RSI_EXTREME_REARM_HIGH = float(os.getenv("RSI_EXTREME_REARM_HIGH", "85"))
-RSI_EXTREME_REARM_LOW = float(os.getenv("RSI_EXTREME_REARM_LOW", "15"))
+RSI_EXTREME_HIGH = float(os.getenv("RSI_EXTREME_HIGH", "70"))
+RSI_EXTREME_LOW = float(os.getenv("RSI_EXTREME_LOW", "30"))
+RSI_EXTREME_REARM_HIGH = float(os.getenv("RSI_EXTREME_REARM_HIGH", "65"))
+RSI_EXTREME_REARM_LOW = float(os.getenv("RSI_EXTREME_REARM_LOW", "35"))
 RSI_EXTREME_COOLDOWN_MINUTES = int(os.getenv("RSI_EXTREME_COOLDOWN_MINUTES", "60"))
 RSI_EXTREME_STATE_FILE = os.getenv("RSI_EXTREME_STATE_FILE", "rsi_extreme_state.json")
 
