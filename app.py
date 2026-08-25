@@ -16,7 +16,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "7.0.3.2-rsi-70-30-alerts"
+APP_VERSION = "7.0.3.4-adx-dmi-anti-chase"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -343,12 +343,29 @@ MOMENTUM_FAILURE_ROUND_STEP = float(os.getenv("MOMENTUM_FAILURE_ROUND_STEP", "20
 
 RSI_EXTREME_ALERT_ENABLED = env_bool("RSI_EXTREME_ALERT_ENABLED", True)
 RSI_EXTREME_INTERVAL = os.getenv("RSI_EXTREME_INTERVAL", "15min")
-RSI_EXTREME_HIGH = float(os.getenv("RSI_EXTREME_HIGH", "70"))
-RSI_EXTREME_LOW = float(os.getenv("RSI_EXTREME_LOW", "30"))
-RSI_EXTREME_REARM_HIGH = float(os.getenv("RSI_EXTREME_REARM_HIGH", "65"))
-RSI_EXTREME_REARM_LOW = float(os.getenv("RSI_EXTREME_REARM_LOW", "35"))
+RSI_EXTREME_HIGH = float(os.getenv("RSI_EXTREME_HIGH", "65"))
+RSI_EXTREME_LOW = float(os.getenv("RSI_EXTREME_LOW", "35"))
+RSI_EXTREME_REARM_HIGH = float(os.getenv("RSI_EXTREME_REARM_HIGH", "60"))
+RSI_EXTREME_REARM_LOW = float(os.getenv("RSI_EXTREME_REARM_LOW", "40"))
 RSI_EXTREME_COOLDOWN_MINUTES = int(os.getenv("RSI_EXTREME_COOLDOWN_MINUTES", "60"))
 RSI_EXTREME_STATE_FILE = os.getenv("RSI_EXTREME_STATE_FILE", "rsi_extreme_state.json")
+
+# v7.0.3.4 ADX/DMI + Anti-Chase Entry Quality
+ADX_DMI_ENABLED = env_bool("ADX_DMI_ENABLED", True)
+ADX_DMI_PERIOD = int(os.getenv("ADX_DMI_PERIOD", "14"))
+ADX_STRONG_THRESHOLD = float(os.getenv("ADX_STRONG_THRESHOLD", "25"))
+ADX_VERY_STRONG_THRESHOLD = float(os.getenv("ADX_VERY_STRONG_THRESHOLD", "35"))
+ANTI_CHASE_ENABLED = env_bool("ANTI_CHASE_ENABLED", True)
+ANTI_CHASE_INTERVAL = os.getenv("ANTI_CHASE_INTERVAL", "15min")
+ANTI_CHASE_MIN_ENTRY_QUALITY = int(os.getenv("ANTI_CHASE_MIN_ENTRY_QUALITY", "55"))
+ANTI_CHASE_CAUTION_QUALITY = int(os.getenv("ANTI_CHASE_CAUTION_QUALITY", "70"))
+ANTI_CHASE_BODY_ATR_HIGH = float(os.getenv("ANTI_CHASE_BODY_ATR_HIGH", "1.50"))
+ANTI_CHASE_RANGE_PERCENTILE_HIGH = float(os.getenv("ANTI_CHASE_RANGE_PERCENTILE_HIGH", "95"))
+ANTI_CHASE_EMA20_DISTANCE_ATR = float(os.getenv("ANTI_CHASE_EMA20_DISTANCE_ATR", "1.25"))
+ANTI_CHASE_VWAP_DISTANCE_ATR = float(os.getenv("ANTI_CHASE_VWAP_DISTANCE_ATR", "1.50"))
+ANTI_CHASE_RSI_BUY_HIGH = float(os.getenv("ANTI_CHASE_RSI_BUY_HIGH", "65"))
+ANTI_CHASE_RSI_SELL_LOW = float(os.getenv("ANTI_CHASE_RSI_SELL_LOW", "35"))
+ANTI_CHASE_ADVERSE_WICK_RATIO = float(os.getenv("ANTI_CHASE_ADVERSE_WICK_RATIO", "0.25"))
 
 # Precision Signal Alignment
 PRECISION_ALIGNMENT_ENABLED = env_bool("PRECISION_ALIGNMENT_ENABLED", True)
@@ -1771,6 +1788,29 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
 
+def adx_dmi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """Wilder-style ADX, +DI and -DI from OHLC data."""
+    if df is None or df.empty or len(df) < max(5, period + 2):
+        return pd.DataFrame({"adx": pd.Series(np.nan, index=df.index if df is not None else []),
+                             "plus_di": pd.Series(np.nan, index=df.index if df is not None else []),
+                             "minus_di": pd.Series(np.nan, index=df.index if df is not None else [])})
+    high, low, close = df["high"], df["low"], df["close"]
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+    tr = pd.concat([(high-low), (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
+    atr_w = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_sm = plus_dm.ewm(alpha=1/period, adjust=False).mean()
+    minus_sm = minus_dm.ewm(alpha=1/period, adjust=False).mean()
+    plus_di = 100.0 * plus_sm / atr_w.replace(0, np.nan)
+    minus_di = 100.0 * minus_sm / atr_w.replace(0, np.nan)
+    denom = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / denom
+    adx = dx.ewm(alpha=1/period, adjust=False).mean()
+    return pd.DataFrame({"adx": adx, "plus_di": plus_di, "minus_di": minus_di}, index=df.index)
+
+
 def mfi(df: pd.DataFrame, period: int = 14) -> pd.Series:
     if "volume" not in df.columns or df["volume"].notna().sum() < period + 2:
         return pd.Series(np.nan, index=df.index, dtype=float)
@@ -1867,7 +1907,103 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["atr14"] = atr(out, 14)
     out["mfi14"] = mfi(out, 14)
     out["vwap"] = rolling_vwap(out, PRECISION_VWAP_LOOKBACK)
+    if ADX_DMI_ENABLED:
+        adx_frame = adx_dmi(out, ADX_DMI_PERIOD)
+        out["adx14"] = adx_frame["adx"]
+        out["plus_di14"] = adx_frame["plus_di"]
+        out["minus_di14"] = adx_frame["minus_di"]
+    else:
+        out["adx14"] = np.nan
+        out["plus_di14"] = np.nan
+        out["minus_di14"] = np.nan
     return out
+
+
+def anti_chase_entry_quality(df: pd.DataFrame, side: str) -> Dict[str, Any]:
+    """Separate trend strength from entry quality. Low score means: do not chase."""
+    side = str(side).upper()
+    if not ANTI_CHASE_ENABLED:
+        return {"enabled": False, "ok": True, "entry_quality": 100, "decision": "OK", "reasons": []}
+    if side not in ("BUY", "SELL") or df is None or df.empty:
+        return {"enabled": True, "ok": True, "entry_quality": 100, "decision": "UNKNOWN", "reasons": ["missing side/data"]}
+    x = add_indicators(df) if "adx14" not in df.columns else df.copy()
+    if len(x) < 20:
+        return {"enabled": True, "ok": True, "entry_quality": 100, "decision": "INSUFFICIENT_DATA", "reasons": []}
+    last = x.iloc[-1]
+    hist = x.iloc[:-1].tail(200) if len(x) > 1 else x
+    price = float(last.close)
+    atrv = safe_float(last.get("atr14"))
+    atrv = atrv if atrv and atrv > 0 else None
+    rs = safe_float(last.get("rsi14"))
+    adxv = safe_float(last.get("adx14"))
+    plus_di = safe_float(last.get("plus_di14"))
+    minus_di = safe_float(last.get("minus_di14"))
+    ema20v = safe_float(last.get("ema20"))
+    vwapv = safe_float(last.get("vwap"))
+    body = abs(float(last.close) - float(last.open))
+    rng = max(float(last.high) - float(last.low), 1e-9)
+    body_atr = body / atrv if atrv else None
+    range_hist = (hist.high - hist.low).abs() if not hist.empty else pd.Series(dtype=float)
+    range_pct = _percentile_rank(rng, range_hist) if len(range_hist) else None
+    upper_wick = float(last.high) - max(float(last.open), float(last.close))
+    lower_wick = min(float(last.open), float(last.close)) - float(last.low)
+    adverse_wick = upper_wick if side == "BUY" else lower_wick
+    adverse_wick_ratio = max(0.0, adverse_wick / rng)
+    ema_dist_atr = abs(price - ema20v) / atrv if atrv and ema20v is not None else None
+    vwap_dist_atr = abs(price - vwapv) / atrv if atrv and vwapv is not None else None
+
+    score = 100
+    reasons = []
+    if body_atr is not None and body_atr >= ANTI_CHASE_BODY_ATR_HIGH:
+        score -= 20; reasons.append(f"large impulse body {body_atr:.2f} ATR")
+    if range_pct is not None and range_pct >= ANTI_CHASE_RANGE_PERCENTILE_HIGH:
+        score -= 15; reasons.append(f"range percentile {range_pct:.1f}%")
+    if ema_dist_atr is not None and ema_dist_atr >= ANTI_CHASE_EMA20_DISTANCE_ATR:
+        score -= 20; reasons.append(f"price {ema_dist_atr:.2f} ATR from EMA20")
+    if vwap_dist_atr is not None and vwap_dist_atr >= ANTI_CHASE_VWAP_DISTANCE_ATR:
+        score -= 15; reasons.append(f"price {vwap_dist_atr:.2f} ATR from VWAP")
+    if side == "BUY" and rs is not None and rs >= ANTI_CHASE_RSI_BUY_HIGH:
+        score -= 10; reasons.append(f"RSI elevated {rs:.1f}")
+    if side == "SELL" and rs is not None and rs <= ANTI_CHASE_RSI_SELL_LOW:
+        score -= 10; reasons.append(f"RSI depressed {rs:.1f}")
+    if adverse_wick_ratio >= ANTI_CHASE_ADVERSE_WICK_RATIO:
+        score -= 10; reasons.append(f"adverse wick {adverse_wick_ratio:.2f}")
+
+    di_aligned = None
+    if plus_di is not None and minus_di is not None:
+        di_aligned = (plus_di > minus_di) if side == "BUY" else (minus_di > plus_di)
+        if not di_aligned:
+            score -= 15; reasons.append("DMI direction opposes entry")
+    trend_strength = "UNKNOWN"
+    if adxv is not None:
+        if adxv >= ADX_VERY_STRONG_THRESHOLD: trend_strength = "VERY_STRONG"
+        elif adxv >= ADX_STRONG_THRESHOLD: trend_strength = "STRONG"
+        elif adxv >= 20: trend_strength = "MODERATE"
+        else: trend_strength = "WEAK"
+
+    score = int(max(0, min(100, score)))
+    ok = score >= ANTI_CHASE_MIN_ENTRY_QUALITY
+    decision = "OK" if score >= ANTI_CHASE_CAUTION_QUALITY else ("CAUTION" if ok else "WAIT_DO_NOT_CHASE")
+    return {
+        "enabled": True, "ok": ok, "entry_quality": score, "decision": decision,
+        "trend_strength": trend_strength, "adx": round(adxv,2) if adxv is not None else None,
+        "plus_di": round(plus_di,2) if plus_di is not None else None,
+        "minus_di": round(minus_di,2) if minus_di is not None else None,
+        "di_aligned": di_aligned, "rsi": round(rs,2) if rs is not None else None,
+        "body_atr": round(body_atr,2) if body_atr is not None else None,
+        "range_percentile": round(range_pct,1) if range_pct is not None else None,
+        "ema20_distance_atr": round(ema_dist_atr,2) if ema_dist_atr is not None else None,
+        "vwap_distance_atr": round(vwap_dist_atr,2) if vwap_dist_atr is not None else None,
+        "adverse_wick_ratio": round(adverse_wick_ratio,2), "reasons": reasons
+    }
+
+
+def anti_chase_snapshot_for_side(side: str, interval: Optional[str] = None) -> Dict[str, Any]:
+    try:
+        df = fetch_ohlc(interval or ANTI_CHASE_INTERVAL, 220)
+        return anti_chase_entry_quality(df, side)
+    except Exception as e:
+        return {"enabled": ANTI_CHASE_ENABLED, "ok": True, "entry_quality": 100, "decision": "DATA_UNAVAILABLE", "reasons": [f"{type(e).__name__}: {e}"]}
 
 
 def swing_points(df: pd.DataFrame, left: int = 2, right: int = 2) -> Dict[str, List[Dict[str, float]]]:
@@ -3710,6 +3846,19 @@ def evaluate_entry_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         })
         return result
 
+    # v7.0.3.4: separate trend quality from entry quality; block late/overextended market entries.
+    anti_chase = anti_chase_snapshot_for_side(side)
+    result["anti_chase"] = anti_chase
+    result["entry_quality"] = anti_chase.get("entry_quality")
+    if ANTI_CHASE_ENABLED and not anti_chase.get("ok", True):
+        result.update({
+            "valid": False,
+            "status": "blocked_by_anti_chase",
+            "reason": "; ".join(anti_chase.get("reasons", [])) or "entry quality too low",
+            "blocked_by_anti_chase": True,
+        })
+        return result
+
     # First check market structure quality: no chasing, no selling into support, no buying into resistance.
     sr_guard = support_resistance_retest_guard(side, entry, signal)
     result["structure_guard"] = sr_guard
@@ -4703,6 +4852,7 @@ def _extreme_candle_candidate(interval: str, current_signal: Dict[str, Any]) -> 
             "trend": trends,
         }
         event["confidence"] = evaluate_confidence_score(current_signal, side=side, event=event)
+        event["entry_quality"] = anti_chase_entry_quality(df, side)
         event["dedupe_key"] = f"{classification}:{side}:{interval}:{last.datetime}"
         return event
     except Exception as e:
@@ -4742,23 +4892,38 @@ def format_extreme_candle_alert(event: Dict[str, Any]) -> str:
     cls = event.get("classification")
     side = event.get("direction")
     conf = event.get("confidence") or {}
+    eq = event.get("entry_quality") or {}
+    entry_score = eq.get("entry_quality")
+    decision = eq.get("decision") or "UNKNOWN"
+    adxv = eq.get("adx")
+    trend_strength = eq.get("trend_strength")
+    reasons = eq.get("reasons") or []
     if cls == "TREND":
-        icon, title, action = "🚀", "EXTREME TREND", "Silny impuls zgodny z trendem. Nie gonić ceny; szukaj retestu lub kolejnego potwierdzenia."
+        icon, title = "🚀", "EXTREME TREND"
     elif cls == "REVERSAL":
-        icon, title, action = "🔄", "EXTREME REVERSAL", "Możliwa zmiana kierunku. Nie wchodź bez potwierdzenia M15/H1 i retestu struktury."
+        icon, title = "🔄", "EXTREME REVERSAL"
     elif cls == "EXHAUSTION":
-        icon, title, action = "⚠️", "EXTREME EXHAUSTION", "Rynek może być przegrzany. Nie gonić ruchu; oczekuj korekty lub konsolidacji."
+        icon, title = "⚠️", "EXTREME EXHAUSTION"
     else:
-        icon, title, action = "🚨", "EXTREME VOLATILITY", "Wyjątkowa zmienność. Traktuj jako ostrzeżenie, nie automatyczny sygnał wejścia."
+        icon, title = "🚨", "EXTREME VOLATILITY"
+    if decision == "WAIT_DO_NOT_CHASE":
+        action = "⛔ ENTRY: WAIT — DO NOT CHASE. Trend może być silny, ale miejsce wejścia jest rozciągnięte."
+    elif decision == "CAUTION":
+        action = "🟡 ENTRY: CAUTION — czekaj na retest/potwierdzenie zamiast wejścia po rynku."
+    else:
+        action = "🟢 ENTRY QUALITY: akceptowalna, ale nadal wymagane są normalne filtry wejścia i RR."
     return (
         f"{icon} GOLD {title} — {side}\n\n"
         f"Interwał: {event.get('interval')} | Cena: {event.get('price')}\n"
         f"Body/ATR: {event.get('body_atr')} | Range/ATR: {event.get('range_atr')}\n"
         f"Percentyl zakresu: {event.get('range_percentile')}% | RSI: {event.get('rsi')}\n"
-        f"Jakość: {event.get('quality_score')}/100 | Confidence: {conf.get('score')}/100 ({conf.get('label')})\n"
+        f"Trend/impuls quality: {event.get('quality_score')}/100 | Confidence: {conf.get('score')}/100 ({conf.get('label')})\n"
+        f"Entry Quality: {entry_score}/100 | Decyzja: {decision}\n"
+        f"ADX: {adxv} | Siła trendu: {trend_strength} | +DI/-DI: {eq.get('plus_di')}/{eq.get('minus_di')}\n"
         f"Break struktury: {'TAK' if event.get('structure_break') else 'NIE'} | Trend aligned: {'TAK' if event.get('trend_aligned') else 'NIE'}\n\n"
-        f"{action}\n\n"
-        f"Confidence jest heurystycznym evidence score, nie gwarancją ani statystycznym prawdopodobieństwem wyniku."
+        f"{action}\n"
+        f"Powody Anti-Chase: {', '.join(reasons) if reasons else '-'}\n\n"
+        f"Trend score i Entry Quality to dwie różne oceny. Wysoki trend score nie oznacza dobrego miejsca wejścia."
     )
 
 
@@ -6046,6 +6211,26 @@ def precision_status_endpoint():
             "error": f"{type(e).__name__}: {e}",
             "api_runtime": api_runtime_snapshot(),
         }), 200
+
+
+@app.get("/entry-quality-status")
+def entry_quality_status_endpoint():
+    try:
+        buy = anti_chase_snapshot_for_side("BUY")
+        sell = anti_chase_snapshot_for_side("SELL")
+        return jsonify({
+            "status": "ok", "version": APP_VERSION, "interval": ANTI_CHASE_INTERVAL,
+            "buy_entry_quality": buy, "sell_entry_quality": sell,
+            "config": {
+                "enabled": ANTI_CHASE_ENABLED,
+                "min_entry_quality": ANTI_CHASE_MIN_ENTRY_QUALITY,
+                "caution_quality": ANTI_CHASE_CAUTION_QUALITY,
+                "adx_strong": ADX_STRONG_THRESHOLD,
+                "adx_very_strong": ADX_VERY_STRONG_THRESHOLD,
+            }
+        })
+    except Exception as e:
+        return jsonify({"status":"error","version":APP_VERSION,"error":f"{type(e).__name__}: {e}"}), 200
 
 
 @app.get("/reversal-status")
