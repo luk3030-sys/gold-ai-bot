@@ -16,7 +16,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "7.0.3.4-adx-dmi-anti-chase"
+APP_VERSION = "7.0.3.5-rsi-cross-recovery"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -349,6 +349,11 @@ RSI_EXTREME_REARM_HIGH = float(os.getenv("RSI_EXTREME_REARM_HIGH", "60"))
 RSI_EXTREME_REARM_LOW = float(os.getenv("RSI_EXTREME_REARM_LOW", "40"))
 RSI_EXTREME_COOLDOWN_MINUTES = int(os.getenv("RSI_EXTREME_COOLDOWN_MINUTES", "60"))
 RSI_EXTREME_STATE_FILE = os.getenv("RSI_EXTREME_STATE_FILE", "rsi_extreme_state.json")
+RSI_RECOVERY_ALERT_ENABLED = env_bool("RSI_RECOVERY_ALERT_ENABLED", True)
+RSI_RECOVERY_BUY_CONFIRM = float(os.getenv("RSI_RECOVERY_BUY_CONFIRM", "40"))
+RSI_RECOVERY_SELL_CONFIRM = float(os.getenv("RSI_RECOVERY_SELL_CONFIRM", "60"))
+RSI_RECOVERY_COOLDOWN_MINUTES = int(os.getenv("RSI_RECOVERY_COOLDOWN_MINUTES", "45"))
+RSI_DIAGNOSTIC_LOOKBACK = int(os.getenv("RSI_DIAGNOSTIC_LOOKBACK", "8"))
 
 # v7.0.3.4 ADX/DMI + Anti-Chase Entry Quality
 ADX_DMI_ENABLED = env_bool("ADX_DMI_ENABLED", True)
@@ -5088,35 +5093,117 @@ def format_momentum_failure_alert(event: Dict[str, Any]) -> str:
 
 
 def detect_rsi_extreme_alert() -> Optional[Dict[str, Any]]:
+    """
+    v7.0.3.5 RSI cross/recovery detector.
+
+    Uses CLOSED candles and tracks the previous M15 RSI plus the excursion state.
+    This avoids checking only a single static RSI value and adds a second alert when
+    RSI recovers after an oversold/overbought excursion.
+    """
     if not RSI_EXTREME_ALERT_ENABLED:
         return None
     try:
-        df = add_indicators(fetch_ohlc(RSI_EXTREME_INTERVAL, 100))
+        df = add_indicators(fetch_ohlc(RSI_EXTREME_INTERVAL, max(100, RSI_DIAGNOSTIC_LOOKBACK + 30)))
         if df is None or len(df) < 30:
             return None
-        last = df.iloc[-1]
+        tail = df.tail(max(2, RSI_DIAGNOSTIC_LOOKBACK)).copy()
+        vals = pd.to_numeric(tail.get("rsi14"), errors="coerce").dropna()
+        if vals.empty:
+            return None
+        last = tail.iloc[-1]
         value = safe_float(last.rsi14)
         if value is None:
             return None
-        state = load_json(RSI_EXTREME_STATE_FILE, {"high_armed": True, "low_armed": True})
+
+        candle_key = str(last.datetime)
+        state = load_json(RSI_EXTREME_STATE_FILE, {
+            "high_armed": True, "low_armed": True,
+            "high_excursion_active": False, "low_excursion_active": False,
+        })
+        prev_value = safe_float(state.get("last_rsi"))
+        prev_candle = str(state.get("last_candle_datetime") or "")
         high_armed = bool(state.get("high_armed", True))
         low_armed = bool(state.get("low_armed", True))
+        high_active = bool(state.get("high_excursion_active", False))
+        low_active = bool(state.get("low_excursion_active", False))
 
-        # Rearm only after RSI leaves the extreme zone materially.
+        # Do not re-evaluate the same closed candle as a fresh crossing.
+        is_new_candle = candle_key != prev_candle
+
+        # Rearm after RSI materially leaves the warning zone.
         if value <= RSI_EXTREME_REARM_HIGH:
             high_armed = True
         if value >= RSI_EXTREME_REARM_LOW:
             low_armed = True
 
         event = None
-        if value >= RSI_EXTREME_HIGH and high_armed:
-            event = {"type": "RSI_EXTREME", "side": "OVERBOUGHT", "rsi": round(value, 1), "price": round(float(last.close), 2), "interval": RSI_EXTREME_INTERVAL, "datetime": str(last.datetime)}
-            high_armed = False
-        elif value <= RSI_EXTREME_LOW and low_armed:
-            event = {"type": "RSI_EXTREME", "side": "OVERSOLD", "rsi": round(value, 1), "price": round(float(last.close), 2), "interval": RSI_EXTREME_INTERVAL, "datetime": str(last.datetime)}
-            low_armed = False
+        crossed_high = bool(is_new_candle and prev_value is not None and prev_value < RSI_EXTREME_HIGH <= value)
+        crossed_low = bool(is_new_candle and prev_value is not None and prev_value > RSI_EXTREME_LOW >= value)
 
-        state.update({"high_armed": high_armed, "low_armed": low_armed, "last_rsi": round(value, 2), "last_price": round(float(last.close), 2), "updated_utc": now_utc()})
+        # First alert: entry into an RSI warning zone.
+        if (crossed_high or (prev_value is None and value >= RSI_EXTREME_HIGH)) and high_armed:
+            high_active = True
+            high_armed = False
+            state["high_peak_rsi"] = round(max(value, safe_float(state.get("high_peak_rsi"), value)), 2)
+            event = {
+                "type": "RSI_EXTREME", "side": "OVERBOUGHT", "phase": "ZONE_ENTRY",
+                "rsi": round(value, 1), "previous_rsi": round(prev_value, 1) if prev_value is not None else None,
+                "price": round(float(last.close), 2), "interval": RSI_EXTREME_INTERVAL,
+                "datetime": candle_key, "crossed": crossed_high,
+            }
+        elif (crossed_low or (prev_value is None and value <= RSI_EXTREME_LOW)) and low_armed:
+            low_active = True
+            low_armed = False
+            state["low_trough_rsi"] = round(min(value, safe_float(state.get("low_trough_rsi"), value)), 2)
+            event = {
+                "type": "RSI_EXTREME", "side": "OVERSOLD", "phase": "ZONE_ENTRY",
+                "rsi": round(value, 1), "previous_rsi": round(prev_value, 1) if prev_value is not None else None,
+                "price": round(float(last.close), 2), "interval": RSI_EXTREME_INTERVAL,
+                "datetime": candle_key, "crossed": crossed_low,
+            }
+
+        # Keep excursion extrema updated even without a new alert.
+        if high_active:
+            state["high_peak_rsi"] = round(max(value, safe_float(state.get("high_peak_rsi"), value)), 2)
+        if low_active:
+            state["low_trough_rsi"] = round(min(value, safe_float(state.get("low_trough_rsi"), value)), 2)
+
+        # Second alert: recovery after an excursion. This bypasses A+ and acts as a reversal watch.
+        if event is None and RSI_RECOVERY_ALERT_ENABLED and is_new_candle and prev_value is not None:
+            if low_active and prev_value < RSI_RECOVERY_BUY_CONFIRM <= value:
+                event = {
+                    "type": "RSI_RECOVERY", "side": "BUY_REVERSAL", "phase": "RECOVERY",
+                    "rsi": round(value, 1), "previous_rsi": round(prev_value, 1),
+                    "extreme_rsi": state.get("low_trough_rsi"),
+                    "price": round(float(last.close), 2), "interval": RSI_EXTREME_INTERVAL,
+                    "datetime": candle_key, "confirm_level": RSI_RECOVERY_BUY_CONFIRM,
+                }
+                low_active = False
+                state["low_trough_rsi"] = None
+            elif high_active and prev_value > RSI_RECOVERY_SELL_CONFIRM >= value:
+                event = {
+                    "type": "RSI_RECOVERY", "side": "SELL_REVERSAL", "phase": "RECOVERY",
+                    "rsi": round(value, 1), "previous_rsi": round(prev_value, 1),
+                    "extreme_rsi": state.get("high_peak_rsi"),
+                    "price": round(float(last.close), 2), "interval": RSI_EXTREME_INTERVAL,
+                    "datetime": candle_key, "confirm_level": RSI_RECOVERY_SELL_CONFIRM,
+                }
+                high_active = False
+                state["high_peak_rsi"] = None
+
+        state.update({
+            "high_armed": high_armed,
+            "low_armed": low_armed,
+            "high_excursion_active": high_active,
+            "low_excursion_active": low_active,
+            "last_rsi": round(value, 2),
+            "last_price": round(float(last.close), 2),
+            "last_candle_datetime": candle_key,
+            "recent_rsi_min": round(float(vals.min()), 2),
+            "recent_rsi_max": round(float(vals.max()), 2),
+            "recent_rsi_values": [round(float(x), 2) for x in vals.tolist()],
+            "updated_utc": now_utc(),
+        })
         save_json(RSI_EXTREME_STATE_FILE, state)
         return event
     except Exception as e:
@@ -5128,9 +5215,14 @@ def should_send_rsi_extreme_alert(event: Dict[str, Any]) -> bool:
         return False
     state = load_json(RSI_EXTREME_STATE_FILE, {})
     now_ts = _utc_ts()
-    key = "last_high_alert_ts" if event.get("side") == "OVERBOUGHT" else "last_low_alert_ts"
+    if event.get("type") == "RSI_RECOVERY":
+        key = "last_buy_recovery_alert_ts" if event.get("side") == "BUY_REVERSAL" else "last_sell_recovery_alert_ts"
+        cooldown = RSI_RECOVERY_COOLDOWN_MINUTES
+    else:
+        key = "last_high_alert_ts" if event.get("side") == "OVERBOUGHT" else "last_low_alert_ts"
+        cooldown = RSI_EXTREME_COOLDOWN_MINUTES
     last_ts = float(state.get(key, 0) or 0)
-    if now_ts - last_ts < max(60, RSI_EXTREME_COOLDOWN_MINUTES * 60):
+    if now_ts - last_ts < max(60, cooldown * 60):
         return False
     state[key] = now_ts
     state["last_event"] = event
@@ -5140,20 +5232,36 @@ def should_send_rsi_extreme_alert(event: Dict[str, Any]) -> bool:
 
 
 def format_rsi_extreme_alert(event: Dict[str, Any]) -> str:
+    if event.get("type") == "RSI_RECOVERY":
+        buy = event.get("side") == "BUY_REVERSAL"
+        icon = "🟢" if buy else "🔴"
+        direction = "POSSIBLE BUY REVERSAL" if buy else "POSSIBLE SELL REVERSAL"
+        return (
+            f"{icon} GOLD RSI RECOVERY — {direction}\n\n"
+            f"Interwał: {event.get('interval')}\n"
+            f"RSI(14): {event.get('previous_rsi')} → {event.get('rsi')}\n"
+            f"Ekstremum RSI w sekwencji: {event.get('extreme_rsi')}\n"
+            f"Poziom potwierdzenia: {event.get('confirm_level')}\n"
+            f"Cena: {event.get('price')}\n\n"
+            f"RSI wraca z wcześniejszej strefy {'wyprzedania' if buy else 'wykupienia'}. "
+            f"To jest REVERSAL WATCH, nie automatyczny sygnał {'BUY' if buy else 'SELL'}. "
+            f"Szukaj potwierdzenia świecą M5/M15, odzyskaniem struktury albo retestem."
+        )
+
     over = event.get("side") == "OVERBOUGHT"
     icon = "🔴" if over else "🟢"
-    label = "EXTREME OVERBOUGHT" if over else "EXTREME OVERSOLD"
+    label = "OVERBOUGHT WATCH" if over else "OVERSOLD WATCH"
     warning = "Ryzyko wyczerpania wzrostu/korekty jest podwyższone." if over else "Ryzyko wyczerpania spadku/odbicia jest podwyższone."
     return (
-        f"{icon} GOLD RSI EXTREME — {label}\n\n"
+        f"{icon} GOLD RSI ALERT — {label}\n\n"
         f"Interwał: {event.get('interval')}\n"
-        f"RSI(14): {event.get('rsi')}\n"
-        f"Cena: {event.get('price')}\n\n"
+        f"RSI(14): {event.get('previous_rsi')} → {event.get('rsi')}\n"
+        f"Cena: {event.get('price')}\n"
+        f"Przecięcie progu: {'TAK' if event.get('crossed') else 'START W STREFIE'}\n\n"
         f"{warning}\n"
         f"To NIE jest automatyczny sygnał {'SELL' if over else 'BUY'}. "
-        f"Szukaj potwierdzenia: divergence, failed breakout, knot odrzucenia lub break struktury M15."
+        f"Czekaj na RSI recovery / divergence / knot odrzucenia / break struktury M15."
     )
-
 
 def detect_reversal_momentum_watch(current_signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
@@ -5387,7 +5495,7 @@ def reversal_momentum_watch_job(current_signal: Optional[Dict[str, Any]] = None)
             send_telegram(format_rsi_extreme_alert(rsi_event))
             sent_count += 1
             if A_PLUS_LOG_INFO_TO_DB:
-                record_signal_history("RSI_EXTREME_WARNING", rsi_event)
+                record_signal_history("RSI_RECOVERY_WARNING" if rsi_event.get("type") == "RSI_RECOVERY" else "RSI_EXTREME_WARNING", rsi_event)
         watch["rsi_extreme"] = rsi_event
 
         for event in watch.get("events", []):
@@ -5917,6 +6025,9 @@ def health():
         "rsi_extreme_low": RSI_EXTREME_LOW,
         "rsi_extreme_rearm_high": RSI_EXTREME_REARM_HIGH,
         "rsi_extreme_rearm_low": RSI_EXTREME_REARM_LOW,
+        "rsi_recovery_alert_enabled": RSI_RECOVERY_ALERT_ENABLED,
+        "rsi_recovery_buy_confirm": RSI_RECOVERY_BUY_CONFIRM,
+        "rsi_recovery_sell_confirm": RSI_RECOVERY_SELL_CONFIRM,
         "spread_filter_enabled": SPREAD_FILTER_ENABLED,
         "current_spread_points": CURRENT_SPREAD_POINTS,
     })
@@ -6548,6 +6659,11 @@ def reversal_guard_status_endpoint():
                 "rearm_high": RSI_EXTREME_REARM_HIGH,
                 "rearm_low": RSI_EXTREME_REARM_LOW,
                 "cooldown_minutes": RSI_EXTREME_COOLDOWN_MINUTES,
+                "recovery_enabled": RSI_RECOVERY_ALERT_ENABLED,
+                "buy_recovery_confirm": RSI_RECOVERY_BUY_CONFIRM,
+                "sell_recovery_confirm": RSI_RECOVERY_SELL_CONFIRM,
+                "recovery_cooldown_minutes": RSI_RECOVERY_COOLDOWN_MINUTES,
+                "diagnostic_lookback": RSI_DIAGNOSTIC_LOOKBACK,
             },
             "state": load_json(RSI_EXTREME_STATE_FILE, {}),
         },
