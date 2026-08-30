@@ -16,7 +16,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "7.0.3.5-rsi-cross-recovery"
+APP_VERSION = "7.0.3.6-early-reversal"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -354,6 +354,19 @@ RSI_RECOVERY_BUY_CONFIRM = float(os.getenv("RSI_RECOVERY_BUY_CONFIRM", "40"))
 RSI_RECOVERY_SELL_CONFIRM = float(os.getenv("RSI_RECOVERY_SELL_CONFIRM", "60"))
 RSI_RECOVERY_COOLDOWN_MINUTES = int(os.getenv("RSI_RECOVERY_COOLDOWN_MINUTES", "45"))
 RSI_DIAGNOSTIC_LOOKBACK = int(os.getenv("RSI_DIAGNOSTIC_LOOKBACK", "8"))
+
+# v7.0.3.6 Early Reversal layer — bridges RSI extreme and full entry signal.
+EARLY_REVERSAL_ENABLED = env_bool("EARLY_REVERSAL_ENABLED", True)
+EARLY_REVERSAL_INTERVAL = os.getenv("EARLY_REVERSAL_INTERVAL", "5min")
+EARLY_REVERSAL_LOOKBACK = int(os.getenv("EARLY_REVERSAL_LOOKBACK", "8"))
+EARLY_REVERSAL_MIN_SCORE = int(os.getenv("EARLY_REVERSAL_MIN_SCORE", "60"))
+EARLY_REVERSAL_CONFIRM_SCORE = int(os.getenv("EARLY_REVERSAL_CONFIRM_SCORE", "75"))
+EARLY_REVERSAL_RSI_RISE_MIN = float(os.getenv("EARLY_REVERSAL_RSI_RISE_MIN", "5"))
+EARLY_REVERSAL_BODY_ATR_MIN = float(os.getenv("EARLY_REVERSAL_BODY_ATR_MIN", "0.45"))
+EARLY_REVERSAL_BODY_RATIO_MIN = float(os.getenv("EARLY_REVERSAL_BODY_RATIO_MIN", "0.55"))
+EARLY_REVERSAL_STRUCTURE_LOOKBACK = int(os.getenv("EARLY_REVERSAL_STRUCTURE_LOOKBACK", "3"))
+EARLY_REVERSAL_COOLDOWN_MINUTES = int(os.getenv("EARLY_REVERSAL_COOLDOWN_MINUTES", "20"))
+EARLY_REVERSAL_STATE_FILE = os.getenv("EARLY_REVERSAL_STATE_FILE", "early_reversal_state.json")
 
 # v7.0.3.4 ADX/DMI + Anti-Chase Entry Quality
 ADX_DMI_ENABLED = env_bool("ADX_DMI_ENABLED", True)
@@ -4917,8 +4930,13 @@ def format_extreme_candle_alert(event: Dict[str, Any]) -> str:
         action = "🟡 ENTRY: CAUTION — czekaj na retest/potwierdzenie zamiast wejścia po rynku."
     else:
         action = "🟢 ENTRY QUALITY: akceptowalna, ale nadal wymagane są normalne filtry wejścia i RR."
+    side_label = side
+    if decision == "WAIT_DO_NOT_CHASE":
+        side_label = f"POSSIBLE {side} REVERSAL / WATCH"
+    elif decision == "CAUTION":
+        side_label = f"{side} WATCH"
     return (
-        f"{icon} GOLD {title} — {side}\n\n"
+        f"{icon} GOLD {title} — {side_label}\n\n"
         f"Interwał: {event.get('interval')} | Cena: {event.get('price')}\n"
         f"Body/ATR: {event.get('body_atr')} | Range/ATR: {event.get('range_atr')}\n"
         f"Percentyl zakresu: {event.get('range_percentile')}% | RSI: {event.get('rsi')}\n"
@@ -5263,6 +5281,182 @@ def format_rsi_extreme_alert(event: Dict[str, Any]) -> str:
         f"Czekaj na RSI recovery / divergence / knot odrzucenia / break struktury M15."
     )
 
+
+def detect_early_reversal() -> Optional[Dict[str, Any]]:
+    """v7.0.3.6: early reversal warning between RSI extreme and full BUY/SELL entry.
+
+    It intentionally does NOT bypass the normal entry engine. It only warns that an
+    exhausted move may be turning when M5 price action starts confirming the RSI
+    excursion. A CONFIRMED event still means a setup/watch, not an automatic order.
+    """
+    if not EARLY_REVERSAL_ENABLED:
+        return None
+    try:
+        rsi_state = load_json(RSI_EXTREME_STATE_FILE, {})
+        low_active = bool(rsi_state.get("low_excursion_active", False))
+        high_active = bool(rsi_state.get("high_excursion_active", False))
+        trough = safe_float(rsi_state.get("low_trough_rsi"))
+        peak = safe_float(rsi_state.get("high_peak_rsi"))
+        m15_rsi = safe_float(rsi_state.get("last_rsi"))
+
+        # Keep a short grace window after a recovery alert, so confirmation can still
+        # be detected even if the RSI state machine has just deactivated the excursion.
+        last_rsi_event = rsi_state.get("last_event") if isinstance(rsi_state.get("last_event"), dict) else {}
+        last_side = str(last_rsi_event.get("side") or "")
+        last_event_ts = safe_float(rsi_state.get("last_buy_recovery_alert_ts" if last_side == "BUY_REVERSAL" else "last_sell_recovery_alert_ts"))
+        grace = bool(last_event_ts and (_utc_ts() - last_event_ts) <= 45 * 60)
+        if not low_active and not high_active and not grace:
+            return None
+
+        df = add_indicators(fetch_ohlc(EARLY_REVERSAL_INTERVAL, max(80, EARLY_REVERSAL_LOOKBACK + 30)))
+        if df is None or len(df) < max(20, EARLY_REVERSAL_STRUCTURE_LOOKBACK + 3):
+            return None
+        x = df.tail(max(EARLY_REVERSAL_LOOKBACK, EARLY_REVERSAL_STRUCTURE_LOOKBACK + 4)).copy()
+        last = x.iloc[-1]
+        prev = x.iloc[-2]
+        atrv = safe_float(last.get("atr14"))
+        atrv = atrv if atrv and atrv > 0 else None
+        body = abs(float(last.close) - float(last.open))
+        rng = max(float(last.high) - float(last.low), 1e-9)
+        body_atr = body / atrv if atrv else 0.0
+        body_ratio = body / rng
+        adxv = safe_float(last.get("adx14"))
+        plus_di = safe_float(last.get("plus_di14"))
+        minus_di = safe_float(last.get("minus_di14"))
+        candle_key = str(last.datetime)
+
+        recent = x.iloc[:-1].tail(max(2, EARLY_REVERSAL_STRUCTURE_LOOKBACK))
+        prior_high = float(recent.high.max())
+        prior_low = float(recent.low.min())
+        bullish = float(last.close) > float(last.open)
+        bearish = float(last.close) < float(last.open)
+        bullish_break = bullish and float(last.close) > prior_high
+        bearish_break = bearish and float(last.close) < prior_low
+        last3 = x.tail(3)
+        bullish_count = int((last3.close > last3.open).sum())
+        bearish_count = int((last3.close < last3.open).sum())
+        higher_low = float(last.low) > prior_low
+        lower_high = float(last.high) < prior_high
+        lower_wick = min(float(last.open), float(last.close)) - float(last.low)
+        upper_wick = float(last.high) - max(float(last.open), float(last.close))
+        lower_wick_ratio = max(0.0, lower_wick / rng)
+        upper_wick_ratio = max(0.0, upper_wick / rng)
+
+        side = None
+        if low_active or (grace and last_side == "BUY_REVERSAL"):
+            side = "BUY"
+        elif high_active or (grace and last_side == "SELL_REVERSAL"):
+            side = "SELL"
+        if side is None:
+            return None
+
+        score = 0
+        reasons = []
+        warnings = []
+        structure_break = bullish_break if side == "BUY" else bearish_break
+        if side == "BUY":
+            if trough is not None and trough <= RSI_EXTREME_LOW:
+                score += 25; reasons.append(f"RSI oversold trough {trough:.1f}")
+            if m15_rsi is not None and trough is not None and m15_rsi - trough >= EARLY_REVERSAL_RSI_RISE_MIN:
+                score += 20; reasons.append(f"RSI recovering +{m15_rsi-trough:.1f}")
+            if bullish:
+                score += 15; reasons.append("M5 bullish candle")
+            if body_atr >= EARLY_REVERSAL_BODY_ATR_MIN and body_ratio >= EARLY_REVERSAL_BODY_RATIO_MIN and bullish:
+                score += 15; reasons.append(f"M5 bullish displacement {body_atr:.2f} ATR")
+            if bullish_break:
+                score += 20; reasons.append("M5 bullish structure break")
+            elif higher_low:
+                score += 10; reasons.append("M5 higher low / no new low")
+            if bullish_count >= 2:
+                score += 5; reasons.append("2/3 recent M5 candles bullish")
+            if lower_wick_ratio >= 0.25:
+                score += 5; reasons.append("lower rejection wick")
+            if adxv is not None and adxv >= ADX_STRONG_THRESHOLD and plus_di is not None and minus_di is not None and minus_di > plus_di:
+                warnings.append("DMI/ADX still favors sellers")
+        else:
+            if peak is not None and peak >= RSI_EXTREME_HIGH:
+                score += 25; reasons.append(f"RSI overbought peak {peak:.1f}")
+            if m15_rsi is not None and peak is not None and peak - m15_rsi >= EARLY_REVERSAL_RSI_RISE_MIN:
+                score += 20; reasons.append(f"RSI cooling -{peak-m15_rsi:.1f}")
+            if bearish:
+                score += 15; reasons.append("M5 bearish candle")
+            if body_atr >= EARLY_REVERSAL_BODY_ATR_MIN and body_ratio >= EARLY_REVERSAL_BODY_RATIO_MIN and bearish:
+                score += 15; reasons.append(f"M5 bearish displacement {body_atr:.2f} ATR")
+            if bearish_break:
+                score += 20; reasons.append("M5 bearish structure break")
+            elif lower_high:
+                score += 10; reasons.append("M5 lower high / no new high")
+            if bearish_count >= 2:
+                score += 5; reasons.append("2/3 recent M5 candles bearish")
+            if upper_wick_ratio >= 0.25:
+                score += 5; reasons.append("upper rejection wick")
+            if adxv is not None and adxv >= ADX_STRONG_THRESHOLD and plus_di is not None and minus_di is not None and plus_di > minus_di:
+                warnings.append("DMI/ADX still favors buyers")
+
+        score = int(max(0, min(100, score)))
+        if score < EARLY_REVERSAL_MIN_SCORE:
+            return None
+        phase = "CONFIRMED" if score >= EARLY_REVERSAL_CONFIRM_SCORE and structure_break else "WATCH"
+        return {
+            "type": "EARLY_REVERSAL", "side": side, "phase": phase,
+            "score": score, "price": round(float(last.close), 2),
+            "interval": EARLY_REVERSAL_INTERVAL, "datetime": candle_key,
+            "m15_rsi": round(m15_rsi, 1) if m15_rsi is not None else None,
+            "rsi_extreme": round(trough if side == "BUY" else peak, 1) if (trough if side == "BUY" else peak) is not None else None,
+            "body_atr": round(body_atr, 2), "body_ratio": round(body_ratio, 2),
+            "structure_break": structure_break, "higher_low": higher_low if side == "BUY" else None,
+            "lower_high": lower_high if side == "SELL" else None,
+            "adx": round(adxv, 2) if adxv is not None else None,
+            "plus_di": round(plus_di, 2) if plus_di is not None else None,
+            "minus_di": round(minus_di, 2) if minus_di is not None else None,
+            "reasons": reasons, "warnings": warnings,
+        }
+    except Exception as e:
+        return {"type": "EARLY_REVERSAL", "error": f"{type(e).__name__}: {e}"}
+
+
+def should_send_early_reversal(event: Dict[str, Any]) -> bool:
+    if not event or event.get("error"):
+        return False
+    state = load_json(EARLY_REVERSAL_STATE_FILE, {})
+    key = f"{event.get('side')}:{event.get('phase')}"
+    last_ts = safe_float((state.get("alerts") or {}).get(key), 0) or 0
+    now_ts = _utc_ts()
+    if now_ts - last_ts < max(60, EARLY_REVERSAL_COOLDOWN_MINUTES * 60):
+        return False
+    alerts = state.get("alerts") if isinstance(state.get("alerts"), dict) else {}
+    alerts[key] = now_ts
+    state.update({"alerts": alerts, "last_event": event, "updated_utc": now_utc()})
+    save_json(EARLY_REVERSAL_STATE_FILE, state)
+    return True
+
+
+def format_early_reversal_alert(event: Dict[str, Any]) -> str:
+    side = event.get("side")
+    phase = event.get("phase")
+    buy = side == "BUY"
+    if phase == "CONFIRMED":
+        icon = "🟢" if buy else "🔴"
+        title = f"REVERSAL CONFIRMED — {side} SETUP"
+        action = f"Setup {side} jest potwierdzony strukturą M5, ale nadal wymaga normalnego Entry Quality/RR przed wejściem."
+    else:
+        icon = "🟡"
+        title = f"EARLY REVERSAL WATCH — POSSIBLE {side}"
+        action = f"To jest wczesne ostrzeżenie, NIE automatyczny {side}. Czekaj na break/retest M5/M15 lub pełny sygnał ENTRY."
+    warnings = event.get("warnings") or []
+    return (
+        f"{icon} GOLD {title}\n\n"
+        f"Cena: {event.get('price')} | Interwał ceny: {event.get('interval')}\n"
+        f"RSI M15: {event.get('rsi_extreme')} → {event.get('m15_rsi')}\n"
+        f"Early Reversal Score: {event.get('score')}/100\n"
+        f"M5 Body/ATR: {event.get('body_atr')} | Body ratio: {event.get('body_ratio')}\n"
+        f"Break struktury M5: {'TAK' if event.get('structure_break') else 'NIE'}\n"
+        f"ADX: {event.get('adx')} | +DI/-DI: {event.get('plus_di')}/{event.get('minus_di')}\n\n"
+        f"Potwierdzenia: {', '.join(event.get('reasons') or []) or '-'}\n"
+        f"Ostrzeżenia: {', '.join(warnings) if warnings else '-'}\n\n"
+        f"{action}"
+    )
+
 def detect_reversal_momentum_watch(current_signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Warning layer independent of final ENTRY SIGNAL.
@@ -5497,6 +5691,15 @@ def reversal_momentum_watch_job(current_signal: Optional[Dict[str, Any]] = None)
             if A_PLUS_LOG_INFO_TO_DB:
                 record_signal_history("RSI_RECOVERY_WARNING" if rsi_event.get("type") == "RSI_RECOVERY" else "RSI_EXTREME_WARNING", rsi_event)
         watch["rsi_extreme"] = rsi_event
+
+        # v7.0.3.6: early reversal lane after RSI state is refreshed.
+        early_reversal = detect_early_reversal()
+        if early_reversal and not early_reversal.get("error") and should_send_early_reversal(early_reversal):
+            send_telegram(format_early_reversal_alert(early_reversal))
+            sent_count += 1
+            if A_PLUS_LOG_INFO_TO_DB:
+                record_signal_history("EARLY_REVERSAL_CONFIRMED" if early_reversal.get("phase") == "CONFIRMED" else "EARLY_REVERSAL_WATCH", early_reversal)
+        watch["early_reversal"] = early_reversal
 
         for event in watch.get("events", []):
             _record_momentum_impulse(event)
@@ -5939,7 +6142,7 @@ def job() -> None:
 
 @app.get("/")
 def root():
-    return jsonify({"app": "Gold AI Bot v7.0.3.1 Database Resilience", "version": APP_VERSION, "status": "ok"})
+    return jsonify({"app": "Gold AI Bot v7.0.3.6 Early Reversal", "version": APP_VERSION, "status": "ok"})
 
 
 @app.get("/health")
@@ -6664,6 +6867,19 @@ def reversal_guard_status_endpoint():
                 "sell_recovery_confirm": RSI_RECOVERY_SELL_CONFIRM,
                 "recovery_cooldown_minutes": RSI_RECOVERY_COOLDOWN_MINUTES,
                 "diagnostic_lookback": RSI_DIAGNOSTIC_LOOKBACK,
+            },
+            "early_reversal": {
+                "enabled": EARLY_REVERSAL_ENABLED,
+                "interval": EARLY_REVERSAL_INTERVAL,
+                "lookback": EARLY_REVERSAL_LOOKBACK,
+                "min_score": EARLY_REVERSAL_MIN_SCORE,
+                "confirm_score": EARLY_REVERSAL_CONFIRM_SCORE,
+                "rsi_rise_min": EARLY_REVERSAL_RSI_RISE_MIN,
+                "body_atr_min": EARLY_REVERSAL_BODY_ATR_MIN,
+                "body_ratio_min": EARLY_REVERSAL_BODY_RATIO_MIN,
+                "structure_lookback": EARLY_REVERSAL_STRUCTURE_LOOKBACK,
+                "cooldown_minutes": EARLY_REVERSAL_COOLDOWN_MINUTES,
+                "state": load_json(EARLY_REVERSAL_STATE_FILE, {}),
             },
             "state": load_json(RSI_EXTREME_STATE_FILE, {}),
         },
