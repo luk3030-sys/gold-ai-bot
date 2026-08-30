@@ -16,7 +16,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "7.0.3.6-early-reversal"
+APP_VERSION = "7.0.3.7-rsi-sequence-gap-guard"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -354,6 +354,12 @@ RSI_RECOVERY_BUY_CONFIRM = float(os.getenv("RSI_RECOVERY_BUY_CONFIRM", "40"))
 RSI_RECOVERY_SELL_CONFIRM = float(os.getenv("RSI_RECOVERY_SELL_CONFIRM", "60"))
 RSI_RECOVERY_COOLDOWN_MINUTES = int(os.getenv("RSI_RECOVERY_COOLDOWN_MINUTES", "45"))
 RSI_DIAGNOSTIC_LOOKBACK = int(os.getenv("RSI_DIAGNOSTIC_LOOKBACK", "8"))
+
+# v7.0.3.7 RSI Sequence Expiration + Session Gap Guard.
+RSI_STATE_SCHEMA_VERSION = 2
+RSI_SEQUENCE_MAX_AGE_MINUTES = int(os.getenv("RSI_SEQUENCE_MAX_AGE_MINUTES", "60"))
+RSI_SESSION_GAP_RESET_MINUTES = int(os.getenv("RSI_SESSION_GAP_RESET_MINUTES", "45"))
+RSI_SEQUENCE_REQUIRE_CONTIGUOUS = env_bool("RSI_SEQUENCE_REQUIRE_CONTIGUOUS", True)
 
 # v7.0.3.6 Early Reversal layer — bridges RSI extreme and full entry signal.
 EARLY_REVERSAL_ENABLED = env_bool("EARLY_REVERSAL_ENABLED", True)
@@ -5110,6 +5116,40 @@ def format_momentum_failure_alert(event: Dict[str, Any]) -> str:
     )
 
 
+def _candle_ts(value: Any) -> Optional[float]:
+    try:
+        ts = pd.to_datetime(value, errors="coerce", utc=True)
+        if pd.isna(ts):
+            return None
+        return float(ts.timestamp())
+    except Exception:
+        return None
+
+
+def _reset_rsi_excursions(state: Dict[str, Any], reason: str, candle_key: Optional[str] = None) -> Dict[str, Any]:
+    for k, v in {
+        "high_excursion_active": False, "low_excursion_active": False,
+        "high_peak_rsi": None, "low_trough_rsi": None,
+        "high_excursion_started_candle": None, "low_excursion_started_candle": None,
+        "high_excursion_started_ts": None, "low_excursion_started_ts": None,
+    }.items():
+        state[k] = v
+    state["sequence_reset_reason"] = reason
+    state["sequence_reset_utc"] = now_utc()
+    if candle_key is not None:
+        state["sequence_reset_candle"] = candle_key
+    return state
+
+
+def _rsi_sequence_age_minutes(state: Dict[str, Any], side: str, current_candle_key: str) -> Optional[float]:
+    key = "low_excursion_started_ts" if side == "LOW" else "high_excursion_started_ts"
+    started = safe_float(state.get(key))
+    current = _candle_ts(current_candle_key)
+    if started is None or current is None:
+        return None
+    return max(0.0, (current - started) / 60.0)
+
+
 def detect_rsi_extreme_alert() -> Optional[Dict[str, Any]]:
     """
     v7.0.3.5 RSI cross/recovery detector.
@@ -5135,15 +5175,52 @@ def detect_rsi_extreme_alert() -> Optional[Dict[str, Any]]:
 
         candle_key = str(last.datetime)
         state = load_json(RSI_EXTREME_STATE_FILE, {
+            "schema_version": RSI_STATE_SCHEMA_VERSION,
             "high_armed": True, "low_armed": True,
             "high_excursion_active": False, "low_excursion_active": False,
         })
+        if not isinstance(state, dict):
+            state = {}
         prev_value = safe_float(state.get("last_rsi"))
         prev_candle = str(state.get("last_candle_datetime") or "")
+
+        # v7.0.3.7 migration: do not reuse old excursion state without sequence timestamps.
+        if int(safe_float(state.get("schema_version"), 0) or 0) != RSI_STATE_SCHEMA_VERSION:
+            state = _reset_rsi_excursions(state, "STATE_SCHEMA_MIGRATION", candle_key)
+            state["schema_version"] = RSI_STATE_SCHEMA_VERSION
+            prev_value = None
+            prev_candle = ""
+
+        gap_minutes = None
+        prev_ts = _candle_ts(prev_candle) if prev_candle else None
+        cur_ts = _candle_ts(candle_key)
+        if prev_ts is not None and cur_ts is not None and cur_ts > prev_ts:
+            gap_minutes = (cur_ts - prev_ts) / 60.0
+            if RSI_SEQUENCE_REQUIRE_CONTIGUOUS and gap_minutes > RSI_SESSION_GAP_RESET_MINUTES:
+                state = _reset_rsi_excursions(state, f"SESSION_GAP_{gap_minutes:.1f}MIN", candle_key)
+                prev_value = None
+                prev_candle = ""
         high_armed = bool(state.get("high_armed", True))
         low_armed = bool(state.get("low_armed", True))
         high_active = bool(state.get("high_excursion_active", False))
         low_active = bool(state.get("low_excursion_active", False))
+
+        high_age = _rsi_sequence_age_minutes(state, "HIGH", candle_key) if high_active else None
+        low_age = _rsi_sequence_age_minutes(state, "LOW", candle_key) if low_active else None
+        if high_active and (high_age is None or high_age > RSI_SEQUENCE_MAX_AGE_MINUTES):
+            high_active = False
+            state["high_peak_rsi"] = None
+            state["high_excursion_started_candle"] = None
+            state["high_excursion_started_ts"] = None
+            state["sequence_reset_reason"] = "HIGH_SEQUENCE_EXPIRED"
+            state["sequence_reset_utc"] = now_utc()
+        if low_active and (low_age is None or low_age > RSI_SEQUENCE_MAX_AGE_MINUTES):
+            low_active = False
+            state["low_trough_rsi"] = None
+            state["low_excursion_started_candle"] = None
+            state["low_excursion_started_ts"] = None
+            state["sequence_reset_reason"] = "LOW_SEQUENCE_EXPIRED"
+            state["sequence_reset_utc"] = now_utc()
 
         # Do not re-evaluate the same closed candle as a fresh crossing.
         is_new_candle = candle_key != prev_candle
@@ -5162,22 +5239,26 @@ def detect_rsi_extreme_alert() -> Optional[Dict[str, Any]]:
         if (crossed_high or (prev_value is None and value >= RSI_EXTREME_HIGH)) and high_armed:
             high_active = True
             high_armed = False
-            state["high_peak_rsi"] = round(max(value, safe_float(state.get("high_peak_rsi"), value)), 2)
+            state["high_excursion_started_candle"] = candle_key
+            state["high_excursion_started_ts"] = _candle_ts(candle_key)
+            state["high_peak_rsi"] = round(value, 2)
             event = {
                 "type": "RSI_EXTREME", "side": "OVERBOUGHT", "phase": "ZONE_ENTRY",
                 "rsi": round(value, 1), "previous_rsi": round(prev_value, 1) if prev_value is not None else None,
                 "price": round(float(last.close), 2), "interval": RSI_EXTREME_INTERVAL,
-                "datetime": candle_key, "crossed": crossed_high,
+                "datetime": candle_key, "crossed": crossed_high, "feed": "TwelveData",
             }
         elif (crossed_low or (prev_value is None and value <= RSI_EXTREME_LOW)) and low_armed:
             low_active = True
             low_armed = False
-            state["low_trough_rsi"] = round(min(value, safe_float(state.get("low_trough_rsi"), value)), 2)
+            state["low_excursion_started_candle"] = candle_key
+            state["low_excursion_started_ts"] = _candle_ts(candle_key)
+            state["low_trough_rsi"] = round(value, 2)
             event = {
                 "type": "RSI_EXTREME", "side": "OVERSOLD", "phase": "ZONE_ENTRY",
                 "rsi": round(value, 1), "previous_rsi": round(prev_value, 1) if prev_value is not None else None,
                 "price": round(float(last.close), 2), "interval": RSI_EXTREME_INTERVAL,
-                "datetime": candle_key, "crossed": crossed_low,
+                "datetime": candle_key, "crossed": crossed_low, "feed": "TwelveData",
             }
 
         # Keep excursion extrema updated even without a new alert.
@@ -5195,9 +5276,13 @@ def detect_rsi_extreme_alert() -> Optional[Dict[str, Any]]:
                     "extreme_rsi": state.get("low_trough_rsi"),
                     "price": round(float(last.close), 2), "interval": RSI_EXTREME_INTERVAL,
                     "datetime": candle_key, "confirm_level": RSI_RECOVERY_BUY_CONFIRM,
+                    "sequence_age_minutes": round(low_age, 1) if low_age is not None else None,
+                    "feed": "TwelveData",
                 }
                 low_active = False
                 state["low_trough_rsi"] = None
+                state["low_excursion_started_candle"] = None
+                state["low_excursion_started_ts"] = None
             elif high_active and prev_value > RSI_RECOVERY_SELL_CONFIRM >= value:
                 event = {
                     "type": "RSI_RECOVERY", "side": "SELL_REVERSAL", "phase": "RECOVERY",
@@ -5205,9 +5290,13 @@ def detect_rsi_extreme_alert() -> Optional[Dict[str, Any]]:
                     "extreme_rsi": state.get("high_peak_rsi"),
                     "price": round(float(last.close), 2), "interval": RSI_EXTREME_INTERVAL,
                     "datetime": candle_key, "confirm_level": RSI_RECOVERY_SELL_CONFIRM,
+                    "sequence_age_minutes": round(high_age, 1) if high_age is not None else None,
+                    "feed": "TwelveData",
                 }
                 high_active = False
                 state["high_peak_rsi"] = None
+                state["high_excursion_started_candle"] = None
+                state["high_excursion_started_ts"] = None
 
         state.update({
             "high_armed": high_armed,
@@ -5220,6 +5309,11 @@ def detect_rsi_extreme_alert() -> Optional[Dict[str, Any]]:
             "recent_rsi_min": round(float(vals.min()), 2),
             "recent_rsi_max": round(float(vals.max()), 2),
             "recent_rsi_values": [round(float(x), 2) for x in vals.tolist()],
+            "schema_version": RSI_STATE_SCHEMA_VERSION,
+            "last_gap_minutes": round(gap_minutes, 2) if gap_minutes is not None else None,
+            "high_sequence_age_minutes": round(high_age, 2) if high_age is not None else None,
+            "low_sequence_age_minutes": round(low_age, 2) if low_age is not None else None,
+            "feed": "TwelveData",
             "updated_utc": now_utc(),
         })
         save_json(RSI_EXTREME_STATE_FILE, state)
@@ -5260,7 +5354,9 @@ def format_rsi_extreme_alert(event: Dict[str, Any]) -> str:
             f"RSI(14): {event.get('previous_rsi')} → {event.get('rsi')}\n"
             f"Ekstremum RSI w sekwencji: {event.get('extreme_rsi')}\n"
             f"Poziom potwierdzenia: {event.get('confirm_level')}\n"
-            f"Cena: {event.get('price')}\n\n"
+            f"Cena: {event.get('price')}\n"
+            f"Świeca źródłowa: {event.get('datetime')} | Feed: {event.get('feed', 'TwelveData')}\n"
+            f"Wiek sekwencji: {event.get('sequence_age_minutes')} min\n\n"
             f"RSI wraca z wcześniejszej strefy {'wyprzedania' if buy else 'wykupienia'}. "
             f"To jest REVERSAL WATCH, nie automatyczny sygnał {'BUY' if buy else 'SELL'}. "
             f"Szukaj potwierdzenia świecą M5/M15, odzyskaniem struktury albo retestem."
@@ -5275,6 +5371,7 @@ def format_rsi_extreme_alert(event: Dict[str, Any]) -> str:
         f"Interwał: {event.get('interval')}\n"
         f"RSI(14): {event.get('previous_rsi')} → {event.get('rsi')}\n"
         f"Cena: {event.get('price')}\n"
+        f"Świeca źródłowa: {event.get('datetime')} | Feed: {event.get('feed', 'TwelveData')}\n"
         f"Przecięcie progu: {'TAK' if event.get('crossed') else 'START W STREFIE'}\n\n"
         f"{warning}\n"
         f"To NIE jest automatyczny sygnał {'SELL' if over else 'BUY'}. "
@@ -5298,6 +5395,17 @@ def detect_early_reversal() -> Optional[Dict[str, Any]]:
         trough = safe_float(rsi_state.get("low_trough_rsi"))
         peak = safe_float(rsi_state.get("high_peak_rsi"))
         m15_rsi = safe_float(rsi_state.get("last_rsi"))
+
+        # Do not let Early Reversal reuse an expired RSI excursion.
+        current_m15_candle = str(rsi_state.get("last_candle_datetime") or "")
+        if low_active:
+            age = _rsi_sequence_age_minutes(rsi_state, "LOW", current_m15_candle)
+            if age is None or age > RSI_SEQUENCE_MAX_AGE_MINUTES:
+                low_active = False
+        if high_active:
+            age = _rsi_sequence_age_minutes(rsi_state, "HIGH", current_m15_candle)
+            if age is None or age > RSI_SEQUENCE_MAX_AGE_MINUTES:
+                high_active = False
 
         # Keep a short grace window after a recovery alert, so confirmation can still
         # be detected even if the RSI state machine has just deactivated the excursion.
@@ -6142,7 +6250,7 @@ def job() -> None:
 
 @app.get("/")
 def root():
-    return jsonify({"app": "Gold AI Bot v7.0.3.6 Early Reversal", "version": APP_VERSION, "status": "ok"})
+    return jsonify({"app": "Gold AI Bot v7.0.3.7 RSI Sequence Gap Guard", "version": APP_VERSION, "status": "ok"})
 
 
 @app.get("/health")
@@ -6867,6 +6975,10 @@ def reversal_guard_status_endpoint():
                 "sell_recovery_confirm": RSI_RECOVERY_SELL_CONFIRM,
                 "recovery_cooldown_minutes": RSI_RECOVERY_COOLDOWN_MINUTES,
                 "diagnostic_lookback": RSI_DIAGNOSTIC_LOOKBACK,
+                "state_schema_version": RSI_STATE_SCHEMA_VERSION,
+                "sequence_max_age_minutes": RSI_SEQUENCE_MAX_AGE_MINUTES,
+                "session_gap_reset_minutes": RSI_SESSION_GAP_RESET_MINUTES,
+                "require_contiguous_sequence": RSI_SEQUENCE_REQUIRE_CONTIGUOUS,
             },
             "early_reversal": {
                 "enabled": EARLY_REVERSAL_ENABLED,
