@@ -6,6 +6,7 @@ import csv
 import io
 import hashlib
 from datetime import datetime, timezone
+from urllib.parse import quote
 from typing import Dict, Any, List, Optional, Tuple
 
 import requests
@@ -16,7 +17,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "7.0.3.7-rsi-sequence-gap-guard"
+APP_VERSION = "7.0.4.0-intermarket-resilience"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -122,7 +123,8 @@ GC_POSITIONING_SOURCE_URL = os.getenv(
 ).strip()
 GC_POSITIONING_PRODUCT_CODE = os.getenv("GC_POSITIONING_PRODUCT_CODE", "GC").strip().upper()
 GC_POSITIONING_REFRESH_MINUTES = int(os.getenv("GC_POSITIONING_REFRESH_MINUTES", "360"))
-GC_POSITIONING_TIMEOUT_SECONDS = int(os.getenv("GC_POSITIONING_TIMEOUT_SECONDS", "25"))
+GC_POSITIONING_TIMEOUT_SECONDS = int(os.getenv("GC_POSITIONING_TIMEOUT_SECONDS", "5"))
+GC_POSITIONING_TIMEOUT_CAP_SECONDS = int(os.getenv("GC_POSITIONING_TIMEOUT_CAP_SECONDS", "5"))
 GC_POSITIONING_USER_AGENT = os.getenv(
     "GC_POSITIONING_USER_AGENT",
     "Mozilla/5.0 (compatible; GoldAIBot/7.0)",
@@ -133,6 +135,25 @@ GC_POSITIONING_MODERATE_OI_PCT = float(os.getenv("GC_POSITIONING_MODERATE_OI_PCT
 GC_POSITIONING_ALERTS_ENABLED = env_bool("GC_POSITIONING_ALERTS_ENABLED", False)
 GC_POSITIONING_ALERT_MIN_STRENGTH = os.getenv("GC_POSITIONING_ALERT_MIN_STRENGTH", "STRONG").strip().upper()
 GC_POSITIONING_LOCAL_HISTORY_FILE = os.getenv("GC_POSITIONING_LOCAL_HISTORY_FILE", "gc_positioning_history.json")
+
+# v7.0.4 Intermarket Confirmation — free DXY + US10Y context.
+# Uses Yahoo Finance public chart endpoints (no API key) and an in-memory cache.
+# Failure is fail-open: GOLD analysis continues without intermarket confirmation.
+INTERMARKET_ENABLED = env_bool("INTERMARKET_ENABLED", True)
+INTERMARKET_DXY_SYMBOL = os.getenv("INTERMARKET_DXY_SYMBOL", "DX-Y.NYB").strip()
+INTERMARKET_US10Y_SYMBOL = os.getenv("INTERMARKET_US10Y_SYMBOL", "^TNX").strip()
+INTERMARKET_REFRESH_SECONDS = int(os.getenv("INTERMARKET_REFRESH_SECONDS", "900"))
+INTERMARKET_TIMEOUT_SECONDS = int(os.getenv("INTERMARKET_TIMEOUT_SECONDS", "4"))
+INTERMARKET_MAX_SOURCE_AGE_SECONDS = int(os.getenv("INTERMARKET_MAX_SOURCE_AGE_SECONDS", "7200"))
+INTERMARKET_STALE_FALLBACK_SECONDS = int(os.getenv("INTERMARKET_STALE_FALLBACK_SECONDS", "21600"))
+INTERMARKET_DXY_MIN_60M_PCT = float(os.getenv("INTERMARKET_DXY_MIN_60M_PCT", "0.03"))
+INTERMARKET_DXY_MIN_15M_PCT = float(os.getenv("INTERMARKET_DXY_MIN_15M_PCT", "0.015"))
+INTERMARKET_US10Y_MIN_60M_BP = float(os.getenv("INTERMARKET_US10Y_MIN_60M_BP", "1.0"))
+INTERMARKET_US10Y_MIN_15M_BP = float(os.getenv("INTERMARKET_US10Y_MIN_15M_BP", "0.5"))
+INTERMARKET_BONUS_PER_CONFIRM = int(os.getenv("INTERMARKET_BONUS_PER_CONFIRM", "5"))
+
+# Cold-start resilience: do network/database warm-up after the WSGI app is importable.
+ASYNC_STARTUP_ENABLED = env_bool("ASYNC_STARTUP_ENABLED", True)
 
 # v7.0 Institutional Signal Intelligence
 # Confidence is a transparent evidence score (0-100), NOT a statistical win probability.
@@ -487,6 +508,25 @@ API_RUNTIME: Dict[str, Any] = {
     "api_credits_left": None,
 }
 
+INTERMARKET_LOCK = threading.RLock()
+INTERMARKET_CACHE: Dict[str, Dict[str, Any]] = {}
+INTERMARKET_STATUS: Dict[str, Any] = {
+    "enabled": INTERMARKET_ENABLED,
+    "last_run_utc": None,
+    "last_success_utc": None,
+    "last_error": None,
+    "last_bias": "UNAVAILABLE",
+    "last_buy_bonus": 0,
+    "last_sell_bonus": 0,
+}
+
+STARTUP_STATUS: Dict[str, Any] = {
+    "async_enabled": ASYNC_STARTUP_ENABLED,
+    "started_utc": None,
+    "completed_utc": None,
+    "last_error": None,
+}
+
 
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -543,7 +583,7 @@ def _db_connect(force: bool = False):
         conn = psycopg2.connect(
             DATABASE_URL,
             connect_timeout=max(1, DATABASE_CONNECT_TIMEOUT_SECONDS),
-            application_name="gold-ai-bot-v7.0.3.1",
+            application_name="gold-ai-bot-v7.0.4",
         )
         _mark_db_success()
         return conn
@@ -1504,10 +1544,11 @@ def fetch_and_store_gc_positioning() -> Dict[str, Any]:
         "User-Agent": GC_POSITIONING_USER_AGENT,
         "Accept": "text/csv,*/*;q=0.8",
     }
+    cme_timeout = max(2, min(GC_POSITIONING_TIMEOUT_SECONDS, GC_POSITIONING_TIMEOUT_CAP_SECONDS))
     r = requests.get(
         GC_POSITIONING_SOURCE_URL,
         headers=headers,
-        timeout=max(5, GC_POSITIONING_TIMEOUT_SECONDS),
+        timeout=cme_timeout,
     )
     r.raise_for_status()
     item = _gc_parse_product_slate(r.text)
@@ -1691,6 +1732,243 @@ def get_latest_gc_positioning() -> Dict[str, Any]:
             "status": GC_POSITIONING_STATUS,
         }
 
+
+
+# -----------------------------
+# Intermarket Confirmation v7.0.4 — DXY + US10Y
+# -----------------------------
+
+def _intermarket_past_value(points: List[Tuple[int, float]], target_ts: int) -> Optional[float]:
+    if not points:
+        return None
+    candidates = [value for ts, value in points if ts <= target_ts]
+    if candidates:
+        return float(candidates[-1])
+    return float(points[0][1])
+
+
+def _yahoo_chart_snapshot(symbol: str) -> Dict[str, Any]:
+    """Fetch a small 5-minute chart from Yahoo Finance public endpoint."""
+    encoded = quote(symbol, safe="")
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}"
+    params = {
+        "range": "5d",
+        "interval": "5m",
+        "includePrePost": "true",
+        "events": "div,splits",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; GoldAIBot/7.0.4)",
+        "Accept": "application/json,text/plain,*/*",
+    }
+    timeout = max(2, min(INTERMARKET_TIMEOUT_SECONDS, 8))
+    r = requests.get(url, params=params, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    payload = r.json()
+    chart = payload.get("chart") or {}
+    if chart.get("error"):
+        raise RuntimeError(f"Yahoo chart error for {symbol}: {chart.get('error')}")
+    results = chart.get("result") or []
+    if not results:
+        raise RuntimeError(f"Yahoo chart returned no result for {symbol}")
+    result = results[0]
+    timestamps = result.get("timestamp") or []
+    quotes = (((result.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or []
+    points: List[Tuple[int, float]] = []
+    for ts, value in zip(timestamps, quotes):
+        v = safe_float(value)
+        if ts is None or v is None:
+            continue
+        points.append((int(ts), float(v)))
+    if not points:
+        raise RuntimeError(f"Yahoo chart returned no usable closes for {symbol}")
+
+    last_ts, last_value = points[-1]
+    v15 = _intermarket_past_value(points, last_ts - 15 * 60)
+    v60 = _intermarket_past_value(points, last_ts - 60 * 60)
+    ch15_pct = ((last_value / v15) - 1.0) * 100.0 if v15 not in (None, 0) else None
+    ch60_pct = ((last_value / v60) - 1.0) * 100.0 if v60 not in (None, 0) else None
+    age_seconds = max(0, int(time.time()) - int(last_ts))
+    return {
+        "symbol": symbol,
+        "value": round(float(last_value), 5),
+        "change_15m_abs": round(float(last_value - v15), 5) if v15 is not None else None,
+        "change_60m_abs": round(float(last_value - v60), 5) if v60 is not None else None,
+        "change_15m_pct": round(float(ch15_pct), 5) if ch15_pct is not None else None,
+        "change_60m_pct": round(float(ch60_pct), 5) if ch60_pct is not None else None,
+        "last_market_ts": int(last_ts),
+        "last_market_utc": datetime.fromtimestamp(int(last_ts), tz=timezone.utc).isoformat(),
+        "source_age_seconds": age_seconds,
+        "source": "YAHOO_FINANCE_PUBLIC_CHART",
+        "fetched_utc": now_utc(),
+    }
+
+
+def _intermarket_direction_dxy(item: Dict[str, Any]) -> str:
+    ch60 = safe_float(item.get("change_60m_pct"))
+    ch15 = safe_float(item.get("change_15m_pct"))
+    if ch60 is not None and abs(ch60) >= INTERMARKET_DXY_MIN_60M_PCT:
+        return "UP" if ch60 > 0 else "DOWN"
+    if ch15 is not None and abs(ch15) >= INTERMARKET_DXY_MIN_15M_PCT:
+        return "UP" if ch15 > 0 else "DOWN"
+    return "NEUTRAL"
+
+
+def _intermarket_direction_us10y(item: Dict[str, Any]) -> str:
+    # ^TNX is quoted directly in yield percentage points, e.g. 4.79.
+    ch60_abs = safe_float(item.get("change_60m_abs"))
+    ch15_abs = safe_float(item.get("change_15m_abs"))
+    ch60_bp = ch60_abs * 100.0 if ch60_abs is not None else None
+    ch15_bp = ch15_abs * 100.0 if ch15_abs is not None else None
+    item["change_60m_bp"] = round(ch60_bp, 2) if ch60_bp is not None else None
+    item["change_15m_bp"] = round(ch15_bp, 2) if ch15_bp is not None else None
+    if ch60_bp is not None and abs(ch60_bp) >= INTERMARKET_US10Y_MIN_60M_BP:
+        return "UP" if ch60_bp > 0 else "DOWN"
+    if ch15_bp is not None and abs(ch15_bp) >= INTERMARKET_US10Y_MIN_15M_BP:
+        return "UP" if ch15_bp > 0 else "DOWN"
+    return "NEUTRAL"
+
+
+def _intermarket_cached_instrument(name: str, symbol: str, force: bool = False) -> Dict[str, Any]:
+    now_ts = time.time()
+    with INTERMARKET_LOCK:
+        cached = dict(INTERMARKET_CACHE.get(name) or {})
+    fetched_ts = float(cached.get("cache_fetched_ts", 0) or 0)
+    if cached and not force and now_ts - fetched_ts <= max(30, INTERMARKET_REFRESH_SECONDS):
+        cached["cache_status"] = "fresh"
+        return cached
+
+    try:
+        item = _yahoo_chart_snapshot(symbol)
+        item["cache_fetched_ts"] = now_ts
+        item["cache_status"] = "fresh"
+        with INTERMARKET_LOCK:
+            INTERMARKET_CACHE[name] = dict(item)
+        return item
+    except Exception as e:
+        if cached and now_ts - fetched_ts <= max(INTERMARKET_REFRESH_SECONDS, INTERMARKET_STALE_FALLBACK_SECONDS):
+            cached["cache_status"] = "stale_fallback"
+            cached["fetch_error"] = f"{type(e).__name__}: {e}"
+            return cached
+        return {
+            "symbol": symbol,
+            "available": False,
+            "cache_status": "unavailable",
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
+def get_intermarket_snapshot(force: bool = False) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "enabled": INTERMARKET_ENABLED,
+        "status": "disabled" if not INTERMARKET_ENABLED else "starting",
+        "bias": "UNAVAILABLE",
+        "buy_bonus": 0,
+        "sell_bonus": 0,
+        "confirmations": [],
+        "warnings": [],
+        "time_utc": now_utc(),
+    }
+    if not INTERMARKET_ENABLED:
+        return result
+
+    INTERMARKET_STATUS["last_run_utc"] = now_utc()
+    dxy = _intermarket_cached_instrument("dxy", INTERMARKET_DXY_SYMBOL, force=force)
+    us10y = _intermarket_cached_instrument("us10y", INTERMARKET_US10Y_SYMBOL, force=force)
+
+    for name, item in (("DXY", dxy), ("US10Y", us10y)):
+        age = safe_float(item.get("source_age_seconds"))
+        item["available"] = bool(item.get("value") is not None)
+        item["fresh_enough_for_score"] = bool(
+            item.get("available") and age is not None and age <= INTERMARKET_MAX_SOURCE_AGE_SECONDS
+        )
+        if item.get("available") and not item.get("fresh_enough_for_score"):
+            result["warnings"].append(f"{name} market timestamp is stale ({int(age or 0)}s); informational only")
+
+    dxy_dir = _intermarket_direction_dxy(dxy) if dxy.get("fresh_enough_for_score") else "STALE"
+    us10y_dir = _intermarket_direction_us10y(us10y) if us10y.get("fresh_enough_for_score") else "STALE"
+    dxy["direction"] = dxy_dir
+    us10y["direction"] = us10y_dir
+
+    bullish = 0
+    bearish = 0
+    if dxy_dir == "DOWN":
+        bullish += 1
+        result["confirmations"].append("DXY DOWN supports GOLD BUY")
+    elif dxy_dir == "UP":
+        bearish += 1
+        result["confirmations"].append("DXY UP supports GOLD SELL")
+
+    if us10y_dir == "DOWN":
+        bullish += 1
+        result["confirmations"].append("US10Y DOWN supports GOLD BUY")
+    elif us10y_dir == "UP":
+        bearish += 1
+        result["confirmations"].append("US10Y UP supports GOLD SELL")
+
+    if bullish == 2:
+        bias = "BULLISH_GOLD"
+    elif bearish == 2:
+        bias = "BEARISH_GOLD"
+    elif bullish == 1 and bearish == 0:
+        bias = "LEAN_BULLISH_GOLD"
+    elif bearish == 1 and bullish == 0:
+        bias = "LEAN_BEARISH_GOLD"
+    elif bullish and bearish:
+        bias = "MIXED"
+    else:
+        bias = "NEUTRAL"
+
+    buy_bonus = bullish * max(0, INTERMARKET_BONUS_PER_CONFIRM)
+    sell_bonus = bearish * max(0, INTERMARKET_BONUS_PER_CONFIRM)
+    available_count = int(bool(dxy.get("available"))) + int(bool(us10y.get("available")))
+    scored_count = int(bool(dxy.get("fresh_enough_for_score"))) + int(bool(us10y.get("fresh_enough_for_score")))
+
+    result.update({
+        "status": "ok" if scored_count == 2 else "degraded" if available_count else "unavailable",
+        "bias": bias,
+        "buy_bonus": int(buy_bonus),
+        "sell_bonus": int(sell_bonus),
+        "bullish_confirmations": bullish,
+        "bearish_confirmations": bearish,
+        "available_count": available_count,
+        "scored_count": scored_count,
+        "dxy": dxy,
+        "us10y": us10y,
+    })
+    INTERMARKET_STATUS.update({
+        "last_success_utc": now_utc() if available_count else INTERMARKET_STATUS.get("last_success_utc"),
+        "last_error": None if available_count else f"DXY={dxy.get('error')}; US10Y={us10y.get('error')}",
+        "last_bias": bias,
+        "last_buy_bonus": int(buy_bonus),
+        "last_sell_bonus": int(sell_bonus),
+    })
+    return result
+
+
+def format_intermarket_block(snapshot: Optional[Dict[str, Any]]) -> str:
+    s = snapshot or {}
+    if not s or not s.get("enabled"):
+        return "Intermarket: wyłączony"
+    dxy = s.get("dxy") or {}
+    y10 = s.get("us10y") or {}
+    dxy_value = dxy.get("value")
+    y10_value = y10.get("value")
+    dxy_chg = dxy.get("change_60m_pct")
+    y10_bp = y10.get("change_60m_bp")
+    return (
+        f"Intermarket: {s.get('bias')} | bonus BUY/SELL: {s.get('buy_bonus', 0)}/{s.get('sell_bonus', 0)}\n"
+        f"DXY: {dxy_value if dxy_value is not None else '-'} | 60m: {dxy_chg if dxy_chg is not None else '-'}% | {dxy.get('direction', '-')}\n"
+        f"US10Y: {y10_value if y10_value is not None else '-'}% | 60m: {y10_bp if y10_bp is not None else '-'} bp | {y10.get('direction', '-')}"
+    )
+
+
+def intermarket_refresh_job() -> None:
+    try:
+        get_intermarket_snapshot(force=True)
+    except Exception as e:
+        INTERMARKET_STATUS["last_error"] = f"{type(e).__name__}: {e}"
+        print(f"INTERMARKET ERROR: {type(e).__name__}: {e}")
 
 def fetch_ohlc(interval: str, outputsize: int = 300, force_refresh: bool = False) -> pd.DataFrame:
     """
@@ -2173,6 +2451,7 @@ def build_signal() -> Dict[str, Any]:
     fvg = fair_value_gap(h1)
     ob = order_block(h1)
     precision_m15 = precision_entry_snapshot(m15) if PRECISION_ENTRY_ENABLED else {"available": False, "enabled": False}
+    intermarket = get_intermarket_snapshot() if INTERMARKET_ENABLED else {"enabled": False, "status": "disabled", "bias": "DISABLED", "buy_bonus": 0, "sell_bonus": 0}
 
     score_sell = 0
     score_buy = 0
@@ -2203,6 +2482,19 @@ def build_signal() -> Dict[str, Any]:
         if precision_m15.get("sell_score", 50) >= PRECISION_MIN_SCORE_CONFIRM:
             score_sell += 5; reasons.append("M15 precision layer confirms SELL")
 
+    # Intermarket is a confirmation layer only. It can add at most 5 points per
+    # confirming market (DXY, US10Y), never hard-block GOLD analysis.
+    if INTERMARKET_ENABLED:
+        buy_bonus = int(intermarket.get("buy_bonus", 0) or 0)
+        sell_bonus = int(intermarket.get("sell_bonus", 0) or 0)
+        score_buy += buy_bonus
+        score_sell += sell_bonus
+        for reason in intermarket.get("confirmations", []):
+            reasons.append(str(reason))
+
+    score_buy = min(100, int(score_buy))
+    score_sell = min(100, int(score_sell))
+
     if score_sell >= score_buy + 15 and score_sell >= MIN_SCORE_TO_ALERT:
         side = "SELL"; score = score_sell
         rp = risk_plan_for_position("SELL", price, atr_h1)
@@ -2223,6 +2515,7 @@ def build_signal() -> Dict[str, Any]:
         "directional_scores": {"BUY": int(score_buy), "SELL": int(score_sell)},
         "price": round(price, 2),
         "trend": trends,
+        "intermarket": intermarket,
         "institutional": {
             "market_structure_h1": ms_h1,
             "market_structure_h4": ms_h4,
@@ -2644,9 +2937,10 @@ def format_signal(s: Dict[str, Any]) -> str:
     rp = s["risk_plan"]
     inst = s["institutional"]
     return (
-        f"🟣 GOLD AI BOT v6.6 — POSTGRESQL SMART POSITION MANAGER\n"
+        f"🟣 GOLD AI BOT {APP_VERSION} — SMART POSITION MANAGER\n"
         f"Symbol: {s['symbol']}\nSygnał: {s['signal']}\nScore regułowy: {s['score']}/100\n"
-        f"Cena: {s['price']}\nTrend M15/H1/H4/D1: {s['trend']['M15']} / {s['trend']['H1']} / {s['trend']['H4']} / {s['trend']['D1']}\n\n"
+        f"Cena: {s['price']}\nTrend M15/H1/H4/D1: {s['trend']['M15']} / {s['trend']['H1']} / {s['trend']['H4']} / {s['trend']['D1']}\n"
+        f"{format_intermarket_block(s.get('intermarket'))}\n\n"
         f"Market Structure H1: {inst['market_structure_h1']['direction']} | BOS: {inst['market_structure_h1']['bos']} | CHOCH: {inst['market_structure_h1']['choch']}\n"
         f"Liquidity Sweep H1: {inst['liquidity_sweep_h1']}\n"
         f"FVG H1: {inst['fair_value_gap_h1']['latest']}\n"
@@ -3786,6 +4080,7 @@ def format_a_plus_entry_alert(e: Dict[str, Any]) -> str:
         f"Confidence: {(e.get('confidence') or {}).get('score')}/100 ({(e.get('confidence') or {}).get('label')})\n"
         f"Score kierunkowy: {e.get('score')}/100 | RR do TP1: {e.get('rr_to_tp1')}\n\n"
         f"Entry: {e.get('entry')}\nSL: {e.get('sl')}\nTP1: {e.get('tp1')}\nTP2: {e.get('tp2')}\nTP3: {e.get('tp3')}\n\n"
+        f"{format_intermarket_block(e.get('intermarket'))}\n\n"
         f"Spełnione: {', '.join(passed) or '-'}\n"
         f"Braki: {', '.join(failed) or '-'}\n\n"
         f"Ryzyko max 1–2%. SL ustaw ręcznie u brokera. Ocena jest regułowa, nie stanowi gwarancji wyniku."
@@ -3851,6 +4146,7 @@ def evaluate_entry_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         "risk_distance": round(risk_distance, 2),
         "rr_to_tp1": round(rr_tp1, 2) if rr_tp1 is not None else None,
         "trend": signal.get("trend"),
+        "intermarket": signal.get("intermarket"),
         "reasons": signal.get("reasons", []),
         "time_utc": now_utc(),
     })
@@ -4018,6 +4314,7 @@ def evaluate_early_watch(signal: Dict[str, Any], entry_signal: Optional[Dict[str
         "watch_tp3": rp.get("tp3"),
         "trend": trends,
         "precision_alignment": precision_guard,
+        "intermarket": signal.get("intermarket"),
         "reasons": signal.get("reasons", []),
         "time_utc": now_utc(),
         "instruction": (
@@ -4044,6 +4341,7 @@ def format_entry_signal_alert(e: Dict[str, Any]) -> str:
         f"{(e.get('trend') or {}).get('M15')} / {(e.get('trend') or {}).get('H1')} / "
         f"{(e.get('trend') or {}).get('H4')} / {(e.get('trend') or {}).get('D1')}\n"
         f"Precision: {((e.get('precision_alignment') or {}).get('status')) or '-'}\n"
+        f"{format_intermarket_block(e.get('intermarket'))}\n"
         f"Powody: {', '.join(e.get('reasons') or []) or '-'}\n\n"
         f"Zasady: ryzyko max 1–2%, nie dokładaj do straty, SL wpisz ręcznie u brokera."
     )
@@ -4087,7 +4385,8 @@ def format_early_watch_alert(w: Dict[str, Any]) -> str:
         f"SL roboczy: {w.get('watch_sl')}\n"
         f"TP1 roboczy: {w.get('watch_tp1')}\n\n"
         f"Warunek aktywacji: {condition}\n"
-        f"Precision: {((w.get('precision_alignment') or {}).get('status')) or '-'}\n\n"
+        f"Precision: {((w.get('precision_alignment') or {}).get('status')) or '-'}\n"
+        f"{format_intermarket_block(w.get('intermarket'))}\n\n"
         f"To jest wcześniejsze ostrzeżenie. Nie jest to jeszcze sygnał wejścia."
     )
 
@@ -5936,7 +6235,7 @@ def entry_exit_signal_job() -> None:
 
 def command_help() -> str:
     return (
-        "Komendy Gold AI Bot v6.7:\n"
+        f"Komendy Gold AI Bot {APP_VERSION}:\n"
         "/position SELL 4097 — dodaj pozycję SELL i automatycznie wylicz SL/TP\n"
         "/position BUY 4097 — dodaj pozycję BUY i automatycznie wylicz SL/TP\n"
         "/positions — pokaż otwarte pozycje\n"
@@ -5950,6 +6249,8 @@ def command_help() -> str:
         "/entry — pokaż aktualny sygnał wejścia BUY/SELL albo MISSED TRADE\n"
         "/exit — pokaż sygnały wyjścia/prowadzenia pozycji\n"
         "/signal-now — pełna diagnostyka early + entry + retest guard + exit\n"
+        "/macro — DXY + rentowność US10Y + wpływ na GOLD\n"
+        "/ping — szybki test, czy bot odpowiada na Telegramie\n"
         "/price — aktualna cena M5 i ATR H1\n"
         "Uwaga: bot nie składa zleceń u brokera. SL/TP trzeba wpisać ręcznie w aplikacji brokera, chyba że podłączysz API brokera."
     )
@@ -6025,6 +6326,13 @@ def handle_command(text: str, chat_id: str) -> str:
     if cmd == "/signal":
         s = build_signal()
         return format_signal(s)
+
+    if cmd == "/macro":
+        macro = get_intermarket_snapshot(force=True)
+        return "🌐 GOLD INTERMARKET CHECK\n\n" + format_intermarket_block(macro)
+
+    if cmd == "/ping":
+        return f"✅ Gold AI Bot odpowiada. Wersja: {APP_VERSION} | UTC: {now_utc()}"
 
     if cmd == "/early":
         s = build_signal()
@@ -6250,7 +6558,7 @@ def job() -> None:
 
 @app.get("/")
 def root():
-    return jsonify({"app": "Gold AI Bot v7.0.3.7 RSI Sequence Gap Guard", "version": APP_VERSION, "status": "ok"})
+    return jsonify({"app": f"Gold AI Bot {APP_VERSION}", "version": APP_VERSION, "status": "ok"})
 
 
 @app.get("/health")
@@ -6317,6 +6625,10 @@ def health():
         "gc_positioning_last_error": GC_POSITIONING_STATUS.get("last_error"),
         "gc_positioning_last_state": GC_POSITIONING_STATUS.get("last_state"),
         "gc_positioning_last_strength": GC_POSITIONING_STATUS.get("last_strength"),
+        "gc_positioning_timeout_seconds": min(GC_POSITIONING_TIMEOUT_SECONDS, GC_POSITIONING_TIMEOUT_CAP_SECONDS),
+        "intermarket_enabled": INTERMARKET_ENABLED,
+        "intermarket_status": dict(INTERMARKET_STATUS),
+        "startup": dict(STARTUP_STATUS),
         "confidence_engine_enabled": CONFIDENCE_ENGINE_ENABLED,
         "a_plus_2_enabled": A_PLUS_2_ENABLED,
         "a_plus_min_confidence": A_PLUS_MIN_CONFIDENCE,
@@ -6377,6 +6689,22 @@ def telegram_status_endpoint():
 def telegram_poll_now_endpoint():
     telegram_poll_job()
     return jsonify(dict(TELEGRAM_STATUS))
+
+
+@app.get("/intermarket-status")
+def intermarket_status_endpoint():
+    force_raw = str(request.args.get("force", "0")).strip().lower()
+    force_refresh = force_raw in {"1", "true", "yes", "on"}
+    try:
+        snapshot = get_intermarket_snapshot(force=force_refresh)
+        return jsonify({"status": "ok", "version": APP_VERSION, "intermarket": snapshot}), 200
+    except Exception as e:
+        return jsonify({
+            "status": "degraded",
+            "version": APP_VERSION,
+            "error": f"{type(e).__name__}: {e}",
+            "runtime": dict(INTERMARKET_STATUS),
+        }), 200
 
 
 @app.get("/cache-status")
@@ -7082,12 +7410,37 @@ def move_alert_test():
     return jsonify({"results": results})
 
 
-# Initialize Neon/PostgreSQL before loading persistent state.
-init_db()
-
-# Restore persistent cache before scheduler starts.
-load_ohlc_cache()
-cleanup_cache_job()
+def startup_background_job() -> None:
+    """Warm external dependencies without blocking Gunicorn from serving /tick."""
+    STARTUP_STATUS["started_utc"] = now_utc()
+    errors: List[str] = []
+    try:
+        init_db()
+    except Exception as e:
+        errors.append(f"database: {type(e).__name__}: {e}")
+    try:
+        load_ohlc_cache()
+        cleanup_cache_job()
+    except Exception as e:
+        errors.append(f"cache: {type(e).__name__}: {e}")
+    if INTERMARKET_ENABLED:
+        try:
+            get_intermarket_snapshot(force=True)
+        except Exception as e:
+            errors.append(f"intermarket: {type(e).__name__}: {e}")
+    if GC_POSITIONING_ENABLED:
+        try:
+            gc_positioning_job()
+        except Exception as e:
+            errors.append(f"gc_positioning: {type(e).__name__}: {e}")
+    try:
+        ensure_telegram_polling_mode()
+        telegram_poll_job()
+    except Exception as e:
+        TELEGRAM_STATUS["last_error"] = f"startup: {type(e).__name__}: {e}"
+        errors.append(f"telegram: {type(e).__name__}: {e}")
+    STARTUP_STATUS["last_error"] = " | ".join(errors[-5:]) if errors else None
+    STARTUP_STATUS["completed_utc"] = now_utc()
 
 
 if SCHEDULER_ENABLED:
@@ -7158,6 +7511,16 @@ if SCHEDULER_ENABLED:
             replace_existing=True,
         )
 
+    # Free intermarket DXY + US10Y refresh. Cached data is reused by all signal jobs.
+    if INTERMARKET_ENABLED:
+        scheduler.add_job(
+            intermarket_refresh_job,
+            "interval",
+            seconds=max(60, INTERMARKET_REFRESH_SECONDS),
+            id="intermarket_dxy_us10y",
+            replace_existing=True,
+        )
+
     # Database recovery probe is deliberately low-frequency so a Neon quota outage
     # cannot create a reconnect storm or consume unnecessary compute.
     if DATABASE_URL:
@@ -7179,17 +7542,17 @@ if SCHEDULER_ENABLED:
     )
 
     scheduler.start()
-    if GC_POSITIONING_ENABLED:
-        try:
-            threading.Thread(target=gc_positioning_job, daemon=True, name="gc-positioning-startup").start()
-        except Exception as e:
-            GC_POSITIONING_STATUS["last_error"] = f"startup: {type(e).__name__}: {e}"
+
+# External warm-up is intentionally started only after routes and scheduler are ready.
+# This shortens Render cold start so cron-job.org has a better chance to receive HTTP 200
+# inside its hard 30-second timeout.
+if ASYNC_STARTUP_ENABLED:
     try:
-        ensure_telegram_polling_mode()
-        telegram_poll_job()
+        threading.Thread(target=startup_background_job, daemon=True, name="startup-warmup").start()
     except Exception as e:
-        TELEGRAM_STATUS["last_error"] = f"startup: {type(e).__name__}: {e}"
-        print(f"TELEGRAM STARTUP ERROR: {type(e).__name__}: {e}")
+        STARTUP_STATUS["last_error"] = f"thread_start: {type(e).__name__}: {e}"
+else:
+    startup_background_job()
 
 
 if __name__ == "__main__":
