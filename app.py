@@ -17,7 +17,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "7.0.4.0-intermarket-resilience"
+APP_VERSION = "7.0.4.2-dmi-flip-levels"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -411,6 +411,31 @@ ANTI_CHASE_VWAP_DISTANCE_ATR = float(os.getenv("ANTI_CHASE_VWAP_DISTANCE_ATR", "
 ANTI_CHASE_RSI_BUY_HIGH = float(os.getenv("ANTI_CHASE_RSI_BUY_HIGH", "65"))
 ANTI_CHASE_RSI_SELL_LOW = float(os.getenv("ANTI_CHASE_RSI_SELL_LOW", "35"))
 ANTI_CHASE_ADVERSE_WICK_RATIO = float(os.getenv("ANTI_CHASE_ADVERSE_WICK_RATIO", "0.25"))
+
+# v7.0.4.1 RR + DMI/ADX hard quality gates
+ANTI_CHASE_SWING_LOOKBACK = int(os.getenv("ANTI_CHASE_SWING_LOOKBACK", "12"))
+ANTI_CHASE_EXTENDED_ATR = float(os.getenv("ANTI_CHASE_EXTENDED_ATR", "0.80"))
+ANTI_CHASE_HARD_EXTENDED_ATR = float(os.getenv("ANTI_CHASE_HARD_EXTENDED_ATR", "1.20"))
+DMI_ENTRY_GUARD_ENABLED = env_bool("DMI_ENTRY_GUARD_ENABLED", True)
+DMI_OPPOSITION_GAP_MIN = float(os.getenv("DMI_OPPOSITION_GAP_MIN", "5.0"))
+DMI_OPPOSITION_RATIO_MIN = float(os.getenv("DMI_OPPOSITION_RATIO_MIN", "1.25"))
+RR_QUALITY_GATE_ENABLED = env_bool("RR_QUALITY_GATE_ENABLED", True)
+RR_REJECT_BELOW = float(os.getenv("RR_REJECT_BELOW", "1.50"))
+RR_CAUTION_BELOW = float(os.getenv("RR_CAUTION_BELOW", "1.80"))
+RR_GOOD_FROM = float(os.getenv("RR_GOOD_FROM", "2.00"))
+RR_USE_ROUND_LEVELS = env_bool("RR_USE_ROUND_LEVELS", True)
+RR_USE_SWING_LEVELS = env_bool("RR_USE_SWING_LEVELS", True)
+
+# v7.0.4.2 DMI flip reversal + market support/resistance levels
+DMI_FLIP_REVERSAL_ENABLED = env_bool("DMI_FLIP_REVERSAL_ENABLED", True)
+DMI_FLIP_MIN_CONFIRMATIONS = int(os.getenv("DMI_FLIP_MIN_CONFIRMATIONS", "3"))
+DMI_FLIP_CONFIRMED_CONFIRMATIONS = int(os.getenv("DMI_FLIP_CONFIRMED_CONFIRMATIONS", "4"))
+DMI_FLIP_ENTRY_READY_CONFIRMATIONS = int(os.getenv("DMI_FLIP_ENTRY_READY_CONFIRMATIONS", "5"))
+DMI_FLIP_COOLDOWN_MINUTES = int(os.getenv("DMI_FLIP_COOLDOWN_MINUTES", "20"))
+DMI_FLIP_STATE_FILE = os.getenv("DMI_FLIP_STATE_FILE", "dmi_flip_reversal_state.json")
+DMI_FLIP_RSI_MIN_DELTA = float(os.getenv("DMI_FLIP_RSI_MIN_DELTA", "1.0"))
+MARKET_LEVELS_ENABLED = env_bool("MARKET_LEVELS_ENABLED", True)
+MARKET_LEVELS_COUNT = int(os.getenv("MARKET_LEVELS_COUNT", "3"))
 
 # Precision Signal Alignment
 PRECISION_ALIGNMENT_ENABLED = env_bool("PRECISION_ALIGNMENT_ENABLED", True)
@@ -1167,6 +1192,13 @@ def fast_check_status_snapshot() -> Dict[str, Any]:
         "entry_signal_check_interval_minutes": ENTRY_SIGNAL_CHECK_INTERVAL_MINUTES,
         "min_entry_score": MIN_ENTRY_SCORE,
         "min_rr_to_alert": MIN_RR_TO_ALERT,
+        "rr_quality_gate_enabled": RR_QUALITY_GATE_ENABLED,
+        "rr_reject_below": RR_REJECT_BELOW,
+        "rr_caution_below": RR_CAUTION_BELOW,
+        "rr_good_from": RR_GOOD_FROM,
+        "dmi_entry_guard_enabled": DMI_ENTRY_GUARD_ENABLED,
+        "dmi_opposition_gap_min": DMI_OPPOSITION_GAP_MIN,
+        "dmi_opposition_ratio_min": DMI_OPPOSITION_RATIO_MIN,
         "early_entry_watch_enabled": EARLY_ENTRY_WATCH_ENABLED,
         "early_entry_score": EARLY_ENTRY_SCORE,
         "entry_execution_guard_enabled": ENTRY_EXECUTION_GUARD_ENABLED,
@@ -2221,6 +2253,50 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def dmi_direction_context(side: str, adxv: Optional[float], plus_di: Optional[float], minus_di: Optional[float]) -> Dict[str, Any]:
+    """Classify DMI direction and whether a counter-trend entry should be vetoed."""
+    side = str(side).upper()
+    result: Dict[str, Any] = {
+        "available": False, "aligned": None, "status": "UNKNOWN",
+        "gap": None, "ratio": None, "hard_veto": False,
+        "strong_conflict": False, "reason": None,
+    }
+    if side not in ("BUY", "SELL") or plus_di is None or minus_di is None:
+        return result
+
+    p = float(plus_di); m = float(minus_di)
+    aligned = (p > m) if side == "BUY" else (m > p)
+    dominant = max(p, m)
+    weaker = min(p, m)
+    gap = abs(p - m)
+    ratio = dominant / max(weaker, 1e-9)
+    meaningful = gap >= DMI_OPPOSITION_GAP_MIN and ratio >= DMI_OPPOSITION_RATIO_MIN
+    adx_value = float(adxv) if adxv is not None else None
+    strong_conflict = bool((not aligned) and meaningful and adx_value is not None and adx_value >= ADX_STRONG_THRESHOLD)
+    hard_veto = bool(DMI_ENTRY_GUARD_ENABLED and strong_conflict and adx_value >= ADX_VERY_STRONG_THRESHOLD)
+
+    if aligned:
+        status = "ALIGNED"
+        reason = f"DMI aligned with {side}"
+    elif hard_veto:
+        status = "HARD_VETO"
+        reason = f"strong DMI/ADX opposes {side}: ADX {adx_value:.1f}, +DI/-DI {p:.1f}/{m:.1f}"
+    elif strong_conflict:
+        status = "STRONG_OPPOSITION"
+        reason = f"DMI/ADX opposes {side}: ADX {adx_value:.1f}, +DI/-DI {p:.1f}/{m:.1f}"
+    else:
+        status = "OPPOSED_WEAK"
+        reason = f"DMI direction opposes {side}, but trend strength/dominance is not enough for hard veto"
+
+    result.update({
+        "available": True, "aligned": aligned, "status": status,
+        "gap": round(gap, 2), "ratio": round(ratio, 2),
+        "hard_veto": hard_veto, "strong_conflict": strong_conflict,
+        "reason": reason,
+    })
+    return result
+
+
 def anti_chase_entry_quality(df: pd.DataFrame, side: str) -> Dict[str, Any]:
     """Separate trend strength from entry quality. Low score means: do not chase."""
     side = str(side).upper()
@@ -2254,8 +2330,23 @@ def anti_chase_entry_quality(df: pd.DataFrame, side: str) -> Dict[str, Any]:
     ema_dist_atr = abs(price - ema20v) / atrv if atrv and ema20v is not None else None
     vwap_dist_atr = abs(price - vwapv) / atrv if atrv and vwapv is not None else None
 
+    # How far price has already travelled from the recent opposite swing.
+    recent = hist.tail(max(3, ANTI_CHASE_SWING_LOOKBACK))
+    extension_atr = None
+    if atrv and not recent.empty:
+        if side == "SELL":
+            extension_atr = max(0.0, (float(recent.high.max()) - price) / atrv)
+        else:
+            extension_atr = max(0.0, (price - float(recent.low.min())) / atrv)
+
     score = 100
-    reasons = []
+    reasons: List[str] = []
+    hard_extension = bool(extension_atr is not None and extension_atr >= ANTI_CHASE_HARD_EXTENDED_ATR)
+    if hard_extension:
+        score -= 40; reasons.append(f"move already extended {extension_atr:.2f} ATR from recent swing")
+    elif extension_atr is not None and extension_atr >= ANTI_CHASE_EXTENDED_ATR:
+        score -= 15; reasons.append(f"move extended {extension_atr:.2f} ATR from recent swing")
+
     if body_atr is not None and body_atr >= ANTI_CHASE_BODY_ATR_HIGH:
         score -= 20; reasons.append(f"large impulse body {body_atr:.2f} ATR")
     if range_pct is not None and range_pct >= ANTI_CHASE_RANGE_PERCENTILE_HIGH:
@@ -2271,11 +2362,14 @@ def anti_chase_entry_quality(df: pd.DataFrame, side: str) -> Dict[str, Any]:
     if adverse_wick_ratio >= ANTI_CHASE_ADVERSE_WICK_RATIO:
         score -= 10; reasons.append(f"adverse wick {adverse_wick_ratio:.2f}")
 
-    di_aligned = None
-    if plus_di is not None and minus_di is not None:
-        di_aligned = (plus_di > minus_di) if side == "BUY" else (minus_di > plus_di)
-        if not di_aligned:
-            score -= 15; reasons.append("DMI direction opposes entry")
+    dmi = dmi_direction_context(side, adxv, plus_di, minus_di)
+    if dmi.get("hard_veto"):
+        score -= 40; reasons.append(str(dmi.get("reason")))
+    elif dmi.get("strong_conflict"):
+        score -= 25; reasons.append(str(dmi.get("reason")))
+    elif dmi.get("available") and not dmi.get("aligned"):
+        score -= 10; reasons.append("DMI direction opposes entry")
+
     trend_strength = "UNKNOWN"
     if adxv is not None:
         if adxv >= ADX_VERY_STRONG_THRESHOLD: trend_strength = "VERY_STRONG"
@@ -2284,18 +2378,24 @@ def anti_chase_entry_quality(df: pd.DataFrame, side: str) -> Dict[str, Any]:
         else: trend_strength = "WEAK"
 
     score = int(max(0, min(100, score)))
-    ok = score >= ANTI_CHASE_MIN_ENTRY_QUALITY
-    decision = "OK" if score >= ANTI_CHASE_CAUTION_QUALITY else ("CAUTION" if ok else "WAIT_DO_NOT_CHASE")
+    hard_block = bool(hard_extension or dmi.get("hard_veto"))
+    ok = score >= ANTI_CHASE_MIN_ENTRY_QUALITY and not hard_block
+    decision = "OK" if score >= ANTI_CHASE_CAUTION_QUALITY and not hard_block else ("CAUTION" if ok else "WAIT_DO_NOT_CHASE")
     return {
         "enabled": True, "ok": ok, "entry_quality": score, "decision": decision,
         "trend_strength": trend_strength, "adx": round(adxv,2) if adxv is not None else None,
         "plus_di": round(plus_di,2) if plus_di is not None else None,
         "minus_di": round(minus_di,2) if minus_di is not None else None,
-        "di_aligned": di_aligned, "rsi": round(rs,2) if rs is not None else None,
+        "di_aligned": dmi.get("aligned"), "dmi_status": dmi.get("status"),
+        "dmi_gap": dmi.get("gap"), "dmi_ratio": dmi.get("ratio"),
+        "dmi_hard_veto": dmi.get("hard_veto"),
+        "rsi": round(rs,2) if rs is not None else None,
         "body_atr": round(body_atr,2) if body_atr is not None else None,
         "range_percentile": round(range_pct,1) if range_pct is not None else None,
         "ema20_distance_atr": round(ema_dist_atr,2) if ema_dist_atr is not None else None,
         "vwap_distance_atr": round(vwap_dist_atr,2) if vwap_dist_atr is not None else None,
+        "extension_atr": round(extension_atr,2) if extension_atr is not None else None,
+        "hard_extension": hard_extension,
         "adverse_wick_ratio": round(adverse_wick_ratio,2), "reasons": reasons
     }
 
@@ -2622,6 +2722,19 @@ def move_alert_delay_guard(move: Dict[str, Any], live: Optional[Dict[str, Any]] 
             "max_allowed_drift_points": MAX_MOVE_ALERT_DRIFT_POINTS,
         })
 
+        # A candle that is already >= the entry impulse limit is context, not an entry trigger,
+        # even when live price has not drifted further after the candle close.
+        move_body_atr = safe_float(move.get("body_atr"))
+        if move_body_atr is not None and move_body_atr >= MAX_IMPULSE_ATR_BEFORE_ENTRY:
+            side_word = "SELL" if direction == "DÓŁ" else "BUY"
+            result.update({
+                "status": "impulse_already_extended_no_chase",
+                "no_chase": True,
+                "reason": f"Alert candle body is already {move_body_atr:.2f} ATR (limit {MAX_IMPULSE_ATR_BEFORE_ENTRY:.2f}).",
+                "instruction": f"Nie wchodzić {side_word} market po tej świecy. Czekać na pullback/retest i ponowną ocenę RR + DMI.",
+            })
+            return result
+
         if favorable_drift >= MAX_MOVE_ALERT_DRIFT_POINTS:
             if direction == "DÓŁ":
                 retest_low = round(float(live_price), 2)
@@ -2844,6 +2957,7 @@ def detect_big_move(interval: str) -> Optional[Dict[str, Any]]:
 
 
 def format_move_alert(m: Dict[str, Any]) -> str:
+    levels_block = format_market_levels_block(market_levels_context(LAST_SIGNAL, m.get("price")))
     live = m.get("live_price") or {}
     dg = m.get("delay_guard") or {}
 
@@ -2870,7 +2984,7 @@ def format_move_alert(m: Dict[str, Any]) -> str:
             )
 
     return (
-        f"💥 GOLD MOVE ALERT — MOCNY RUCH W {m['direction']}\n"
+        f"💥 GOLD MOVE ALERT — INFO / NIE ENTRY — MOCNY RUCH W {m['direction']}\n"
         f"Symbol: {SYMBOL} | Interwał: {m['interval']}\n"
         f"Poziom świecy alertowej: {m['price']} | Zmiana świecy: {m['candle_change']} pkt\n"
         f"Body/ATR: {m['body_atr']} | Range/ATR: {m['range_atr']}\n"
@@ -2881,6 +2995,7 @@ def format_move_alert(m: Dict[str, Any]) -> str:
         f"Świeca alertowa: {m.get('datetime')}"
         f"{live_text}"
         f"{execution_text}\n"
+        f"{levels_block}\n\n"
         f"⚠️ To jest alert zmienności, nie automatyczny sygnał BUY/SELL."
     )
 
@@ -2941,6 +3056,7 @@ def format_signal(s: Dict[str, Any]) -> str:
         f"Symbol: {s['symbol']}\nSygnał: {s['signal']}\nScore regułowy: {s['score']}/100\n"
         f"Cena: {s['price']}\nTrend M15/H1/H4/D1: {s['trend']['M15']} / {s['trend']['H1']} / {s['trend']['H4']} / {s['trend']['D1']}\n"
         f"{format_intermarket_block(s.get('intermarket'))}\n\n"
+        f"{format_market_levels_block(market_levels_context(s), s.get('signal'))}\n\n"
         f"Market Structure H1: {inst['market_structure_h1']['direction']} | BOS: {inst['market_structure_h1']['bos']} | CHOCH: {inst['market_structure_h1']['choch']}\n"
         f"Liquidity Sweep H1: {inst['liquidity_sweep_h1']}\n"
         f"FVG H1: {inst['fair_value_gap_h1']['latest']}\n"
@@ -3207,6 +3323,217 @@ def _swing_levels_from_signal(signal: Optional[Dict[str, Any]]) -> Dict[str, Lis
     supports = sorted(set(round(x, 2) for x in supports))
     resistances = sorted(set(round(x, 2) for x in resistances))
     return {"supports": supports, "resistances": resistances}
+
+
+def market_levels_context(signal: Optional[Dict[str, Any]], price: Optional[float] = None) -> Dict[str, Any]:
+    """Nearest support/resistance levels from H1/H4 swings plus round levels.
+
+    This is informational context for Telegram alerts and does not create a trade by itself.
+    """
+    result: Dict[str, Any] = {
+        "enabled": MARKET_LEVELS_ENABLED, "price": None, "supports": [], "resistances": [],
+        "nearest_support": None, "nearest_resistance": None, "buy_note": None, "sell_note": None,
+    }
+    if not MARKET_LEVELS_ENABLED:
+        return result
+    try:
+        px = safe_float(price, safe_float((signal or {}).get("price")))
+        if px is None:
+            return result
+        px = float(px)
+        result["price"] = round(px, 2)
+        candidates: List[Tuple[float, str]] = []
+        inst = (signal or {}).get("institutional") or {}
+        for key, label in [("market_structure_h1", "H1 swing"), ("market_structure_h4", "H4 swing")]:
+            swings = ((inst.get(key) or {}).get("swings") or {})
+            for low in swings.get("lows", [])[-8:]:
+                v = safe_float(low.get("price"))
+                if v is not None:
+                    candidates.append((float(v), label))
+            for high in swings.get("highs", [])[-8:]:
+                v = safe_float(high.get("price"))
+                if v is not None:
+                    candidates.append((float(v), label))
+
+        # Round levels around current price are important on GOLD and cost no extra API quota.
+        for step, label in [(ROUND_LEVEL_STEP_POINTS, "round"), (STRONG_ROUND_LEVEL_STEP_POINTS, "strong round")]:
+            try:
+                step = float(step)
+                if step <= 0:
+                    continue
+                base = np.floor(px / step) * step
+                for k in range(-2, 4):
+                    candidates.append((float(base + k * step), label))
+            except Exception:
+                pass
+
+        # Deduplicate by price, retaining the more structural label when available.
+        rank = {"H4 swing": 4, "H1 swing": 3, "strong round": 2, "round": 1}
+        by_price: Dict[float, str] = {}
+        for level, source in candidates:
+            level = round(float(level), 2)
+            if abs(level - px) < 1e-6:
+                continue
+            old = by_price.get(level)
+            if old is None or rank.get(source, 0) > rank.get(old, 0):
+                by_price[level] = source
+
+        supports = sorted(((lvl, src) for lvl, src in by_price.items() if lvl < px), key=lambda x: px - x[0])
+        resistances = sorted(((lvl, src) for lvl, src in by_price.items() if lvl > px), key=lambda x: x[0] - px)
+        count = max(1, min(6, MARKET_LEVELS_COUNT))
+        result["supports"] = [{"level": lvl, "source": src, "distance": round(px-lvl, 2)} for lvl, src in supports[:count]]
+        result["resistances"] = [{"level": lvl, "source": src, "distance": round(lvl-px, 2)} for lvl, src in resistances[:count]]
+        result["nearest_support"] = result["supports"][0] if result["supports"] else None
+        result["nearest_resistance"] = result["resistances"][0] if result["resistances"] else None
+        ns = result["nearest_support"]
+        nr = result["nearest_resistance"]
+        if ns and nr:
+            result["buy_note"] = f"BUY: utrzymanie nad {ns['level']} wspiera odbicie; wybicie {nr['level']} wzmacnia ruch w górę."
+            result["sell_note"] = f"SELL: odrzucenie {nr['level']} wspiera spadek; zejście pod {ns['level']} wzmacnia ruch w dół."
+        elif ns:
+            result["buy_note"] = f"BUY: utrzymanie nad {ns['level']} wspiera odbicie."
+            result["sell_note"] = f"SELL: zejście pod {ns['level']} wzmacnia ruch w dół."
+        elif nr:
+            result["buy_note"] = f"BUY: wybicie {nr['level']} wzmacnia ruch w górę."
+            result["sell_note"] = f"SELL: odrzucenie {nr['level']} wspiera spadek."
+        return result
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        return result
+
+
+def format_market_levels_block(levels: Optional[Dict[str, Any]], side: Optional[str] = None) -> str:
+    levels = levels or {}
+    if not levels.get("enabled", True):
+        return ""
+    supports = levels.get("supports") or []
+    resistances = levels.get("resistances") or []
+    if not supports and not resistances:
+        return "📍 Poziomy rynku: brak wystarczających danych."
+    def _fmt(items):
+        return ", ".join(f"{x.get('level')} ({x.get('source')})" for x in items) if items else "-"
+    lines = [
+        "📍 KLUCZOWE POZIOMY",
+        f"Wsparcia: {_fmt(supports)}",
+        f"Opory: {_fmt(resistances)}",
+    ]
+    side_u = str(side or "").upper()
+    if side_u == "BUY" and levels.get("buy_note"):
+        lines.append(str(levels.get("buy_note")))
+    elif side_u == "SELL" and levels.get("sell_note"):
+        lines.append(str(levels.get("sell_note")))
+    else:
+        if levels.get("buy_note"): lines.append(str(levels.get("buy_note")))
+        if levels.get("sell_note"): lines.append(str(levels.get("sell_note")))
+    return "\n".join(lines)
+
+
+def _rr_quality_label(value: Optional[float]) -> str:
+    if value is None:
+        return "UNKNOWN"
+    if value < RR_REJECT_BELOW:
+        return "REJECT"
+    if value < RR_CAUTION_BELOW:
+        return "CAUTION"
+    if value < RR_GOOD_FROM:
+        return "ACCEPTABLE"
+    return "GOOD"
+
+
+def rr_entry_quality_guard(side: str, entry: float, sl: float, tp1: float, signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Gate final entries by planned RR and by room to the nearest structural/round obstacle."""
+    side = str(side).upper()
+    result: Dict[str, Any] = {
+        "enabled": RR_QUALITY_GATE_ENABLED,
+        "ok": True,
+        "status": "OK",
+        "side": side,
+        "plan_rr": None,
+        "structural_rr": None,
+        "nearest_target_level": None,
+        "target_source": None,
+        "reason": None,
+    }
+    if not RR_QUALITY_GATE_ENABLED or side not in ("BUY", "SELL"):
+        return result
+
+    try:
+        entry = float(entry); sl = float(sl); tp1 = float(tp1)
+        risk = abs(entry - sl)
+        plan_rr = rr_for_plan(side, entry, sl, tp1)
+        result["plan_rr"] = round(plan_rr, 2) if plan_rr is not None else None
+        result["plan_quality"] = _rr_quality_label(plan_rr)
+        if risk <= 0 or plan_rr is None:
+            result.update({"ok": False, "status": "REJECT", "reason": "invalid plan RR"})
+            return result
+        if plan_rr < RR_REJECT_BELOW:
+            result.update({"ok": False, "status": "REJECT", "reason": f"planned RR {plan_rr:.2f} < {RR_REJECT_BELOW:.2f}"})
+            return result
+
+        targets: List[Tuple[float, str]] = []
+        levels = _swing_levels_from_signal(signal) if RR_USE_SWING_LEVELS else {"supports": [], "resistances": []}
+        eps = 1e-6
+        if side == "SELL":
+            for level in levels.get("supports", []):
+                if float(level) < entry - eps:
+                    targets.append((float(level), "swing_support"))
+            if RR_USE_ROUND_LEVELS:
+                for step, source in [(ROUND_LEVEL_STEP_POINTS, "round_level"), (STRONG_ROUND_LEVEL_STEP_POINTS, "strong_round_level")]:
+                    if step > 0:
+                        level = float(np.floor(entry / step) * step)
+                        if level >= entry - eps:
+                            level -= step
+                        targets.append((level, source))
+            if targets:
+                target, source = max(targets, key=lambda x: x[0])  # nearest lower target
+                reward = entry - target
+            else:
+                target = source = None
+                reward = None
+        else:
+            for level in levels.get("resistances", []):
+                if float(level) > entry + eps:
+                    targets.append((float(level), "swing_resistance"))
+            if RR_USE_ROUND_LEVELS:
+                for step, source in [(ROUND_LEVEL_STEP_POINTS, "round_level"), (STRONG_ROUND_LEVEL_STEP_POINTS, "strong_round_level")]:
+                    if step > 0:
+                        level = float(np.ceil(entry / step) * step)
+                        if level <= entry + eps:
+                            level += step
+                        targets.append((level, source))
+            if targets:
+                target, source = min(targets, key=lambda x: x[0])  # nearest higher target
+                reward = target - entry
+            else:
+                target = source = None
+                reward = None
+
+        structural_rr = (reward / risk) if reward is not None and reward >= 0 and risk > 0 else None
+        result.update({
+            "nearest_target_level": round(float(target), 2) if target is not None else None,
+            "target_source": source,
+            "structural_rr": round(float(structural_rr), 2) if structural_rr is not None else None,
+            "structural_quality": _rr_quality_label(structural_rr),
+        })
+
+        if structural_rr is not None and structural_rr < RR_REJECT_BELOW:
+            result.update({
+                "ok": False, "status": "REJECT",
+                "reason": f"only {structural_rr:.2f}R room to nearest {source} {target:.2f}; minimum {RR_REJECT_BELOW:.2f}R",
+            })
+            return result
+
+        weakest_rr = min(v for v in [plan_rr, structural_rr] if v is not None)
+        if weakest_rr < RR_CAUTION_BELOW:
+            result.update({"status": "CAUTION", "reason": f"RR {weakest_rr:.2f} is below preferred {RR_CAUTION_BELOW:.2f}"})
+        elif weakest_rr >= RR_GOOD_FROM:
+            result.update({"status": "GOOD", "reason": f"RR {weakest_rr:.2f} >= {RR_GOOD_FROM:.2f}"})
+        else:
+            result.update({"status": "ACCEPTABLE", "reason": f"RR {weakest_rr:.2f} is acceptable"})
+        return result
+    except Exception as e:
+        result.update({"ok": True, "status": "GUARD_ERROR_NON_BLOCKING", "reason": f"{type(e).__name__}: {e}"})
+        return result
 
 
 def retest_confirmed(side: str, level: float) -> Dict[str, Any]:
@@ -4081,6 +4408,7 @@ def format_a_plus_entry_alert(e: Dict[str, Any]) -> str:
         f"Score kierunkowy: {e.get('score')}/100 | RR do TP1: {e.get('rr_to_tp1')}\n\n"
         f"Entry: {e.get('entry')}\nSL: {e.get('sl')}\nTP1: {e.get('tp1')}\nTP2: {e.get('tp2')}\nTP3: {e.get('tp3')}\n\n"
         f"{format_intermarket_block(e.get('intermarket'))}\n\n"
+        f"{format_market_levels_block(e.get('market_levels'), side)}\n\n"
         f"Spełnione: {', '.join(passed) or '-'}\n"
         f"Braki: {', '.join(failed) or '-'}\n\n"
         f"Ryzyko max 1–2%. SL ustaw ręcznie u brokera. Ocena jest regułowa, nie stanowi gwarancji wyniku."
@@ -4147,6 +4475,7 @@ def evaluate_entry_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         "rr_to_tp1": round(rr_tp1, 2) if rr_tp1 is not None else None,
         "trend": signal.get("trend"),
         "intermarket": signal.get("intermarket"),
+        "market_levels": market_levels_context(signal, entry),
         "reasons": signal.get("reasons", []),
         "time_utc": now_utc(),
     })
@@ -4190,6 +4519,19 @@ def evaluate_entry_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
             "reason": sr_guard.get("reason"),
             "wait_for_retest": sr_guard.get("status") == "wait_for_retest",
             "blocked_by_structure": sr_guard.get("status") != "wait_for_retest",
+        })
+        return result
+
+    # RR gate: enough reward must remain before the nearest structural/round obstacle.
+    rr_guard = rr_entry_quality_guard(side, entry, sl, tp1, signal)
+    result["rr_guard"] = rr_guard
+    result["rr_quality"] = rr_guard.get("status")
+    if RR_QUALITY_GATE_ENABLED and not rr_guard.get("ok", True):
+        result.update({
+            "valid": False,
+            "status": "blocked_by_rr_gate",
+            "reason": rr_guard.get("reason"),
+            "blocked_by_rr_gate": True,
         })
         return result
 
@@ -4327,11 +4669,14 @@ def evaluate_early_watch(signal: Dict[str, Any], entry_signal: Optional[Dict[str
 def format_entry_signal_alert(e: Dict[str, Any]) -> str:
     side = e.get("signal")
     emoji = "🟢" if side == "BUY" else "🔴"
+    ac = e.get("anti_chase") or {}
+    rg = e.get("rr_guard") or {}
     return (
         f"{emoji} GOLD ENTRY SIGNAL — {side}\n\n"
         f"Symbol: {SYMBOL}\n"
-        f"Score regułowy: {e.get('score')}/100\n"
-        f"RR do TP1: {e.get('rr_to_tp1')}\n\n"
+        f"Score regułowy: {e.get('score')}/100 | Entry Quality: {e.get('entry_quality')}\n"
+        f"RR do TP1: {e.get('rr_to_tp1')} | RR gate: {rg.get('status') or '-'} | RR do najbliższego poziomu: {rg.get('structural_rr')}\n"
+        f"ADX: {ac.get('adx')} | +DI/-DI: {ac.get('plus_di')}/{ac.get('minus_di')} | DMI: {ac.get('dmi_status') or '-'}\n\n"
         f"Entry: {e.get('entry')}\n"
         f"SL: {e.get('sl')}\n"
         f"TP1: {e.get('tp1')}\n"
@@ -5800,10 +6145,19 @@ def detect_early_reversal() -> Optional[Dict[str, Any]]:
             if adxv is not None and adxv >= ADX_STRONG_THRESHOLD and plus_di is not None and minus_di is not None and plus_di > minus_di:
                 warnings.append("DMI/ADX still favors buyers")
 
+        dmi_ctx = dmi_direction_context(side, adxv, plus_di, minus_di)
+        if dmi_ctx.get("hard_veto"):
+            score -= 20
+            warnings.append(f"DMI HARD VETO: {dmi_ctx.get('reason')}")
+        elif dmi_ctx.get("strong_conflict"):
+            score -= 10
+            warnings.append(f"DMI strong opposition: {dmi_ctx.get('reason')}")
+
         score = int(max(0, min(100, score)))
         if score < EARLY_REVERSAL_MIN_SCORE:
             return None
-        phase = "CONFIRMED" if score >= EARLY_REVERSAL_CONFIRM_SCORE and structure_break else "WATCH"
+        dmi_blocks_confirmation = bool(dmi_ctx.get("strong_conflict"))
+        phase = "CONFIRMED" if score >= EARLY_REVERSAL_CONFIRM_SCORE and structure_break and not dmi_blocks_confirmation else "WATCH"
         return {
             "type": "EARLY_REVERSAL", "side": side, "phase": phase,
             "score": score, "price": round(float(last.close), 2),
@@ -5816,6 +6170,10 @@ def detect_early_reversal() -> Optional[Dict[str, Any]]:
             "adx": round(adxv, 2) if adxv is not None else None,
             "plus_di": round(plus_di, 2) if plus_di is not None else None,
             "minus_di": round(minus_di, 2) if minus_di is not None else None,
+            "dmi_status": dmi_ctx.get("status"),
+            "dmi_gap": dmi_ctx.get("gap"),
+            "dmi_ratio": dmi_ctx.get("ratio"),
+            "dmi_hard_veto": dmi_ctx.get("hard_veto"),
             "reasons": reasons, "warnings": warnings,
         }
     except Exception as e:
@@ -5845,11 +6203,16 @@ def format_early_reversal_alert(event: Dict[str, Any]) -> str:
     if phase == "CONFIRMED":
         icon = "🟢" if buy else "🔴"
         title = f"REVERSAL CONFIRMED — {side} SETUP"
-        action = f"Setup {side} jest potwierdzony strukturą M5, ale nadal wymaga normalnego Entry Quality/RR przed wejściem."
+        action = f"Setup {side} ma potwierdzenie struktury M5 i zgodny filtr DMI. Nadal wymagane są Entry Quality + RR przed wejściem."
     else:
         icon = "🟡"
         title = f"EARLY REVERSAL WATCH — POSSIBLE {side}"
-        action = f"To jest wczesne ostrzeżenie, NIE automatyczny {side}. Czekaj na break/retest M5/M15 lub pełny sygnał ENTRY."
+        if event.get("dmi_hard_veto"):
+            action = f"WATCH ONLY — silny ADX/DMI jest przeciwny do {side}. Nie traktuj tego jako ENTRY; czekaj na osłabienie/przecięcie DI i retest."
+        elif event.get("dmi_status") == "STRONG_OPPOSITION":
+            action = f"WATCH ONLY — DMI/ADX nadal wspiera przeciwną stronę. Potrzebne jest przejęcie kierunku przez DI oraz Entry Quality/RR."
+        else:
+            action = f"To jest wczesne ostrzeżenie, NIE automatyczny {side}. Czekaj na break/retest M5/M15 lub pełny sygnał ENTRY."
     warnings = event.get("warnings") or []
     return (
         f"{icon} GOLD {title}\n\n"
@@ -5858,9 +6221,11 @@ def format_early_reversal_alert(event: Dict[str, Any]) -> str:
         f"Early Reversal Score: {event.get('score')}/100\n"
         f"M5 Body/ATR: {event.get('body_atr')} | Body ratio: {event.get('body_ratio')}\n"
         f"Break struktury M5: {'TAK' if event.get('structure_break') else 'NIE'}\n"
-        f"ADX: {event.get('adx')} | +DI/-DI: {event.get('plus_di')}/{event.get('minus_di')}\n\n"
+        f"ADX: {event.get('adx')} | +DI/-DI: {event.get('plus_di')}/{event.get('minus_di')} | DMI: {event.get('dmi_status') or '-'}\n"
+        f"DI gap/ratio: {event.get('dmi_gap')}/{event.get('dmi_ratio')}\n\n"
         f"Potwierdzenia: {', '.join(event.get('reasons') or []) or '-'}\n"
         f"Ostrzeżenia: {', '.join(warnings) if warnings else '-'}\n\n"
+        f"{format_market_levels_block(event.get('market_levels'), side)}\n\n"
         f"{action}"
     )
 
@@ -6021,6 +6386,7 @@ def format_reversal_momentum_alert(event: Dict[str, Any]) -> str:
         f"Główny sygnał: {event.get('main_signal')}\n"
         f"Round-level reversal: {rr.get('detected')} — {rr.get('reason')}\n"
         f"M15 flip: {m15.get('detected')} — {m15.get('reason')}\n\n"
+        f"{format_market_levels_block(event.get('market_levels'), direction)}\n\n"
         f"Instrukcja: {event.get('instruction')}\n"
         f"To jest alert ostrzegawczy, nie automatyczne wejście."
         f"{warnings_text}"
@@ -6049,6 +6415,162 @@ def should_send_reversal_momentum_alert(event: Dict[str, Any]) -> bool:
     return True
 
 
+def detect_dmi_flip_reversal_watch(current_signal: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """When strong DMI contradicts the main direction, analyse the opposite side instead of only blocking it."""
+    if not DMI_FLIP_REVERSAL_ENABLED or not current_signal:
+        return None
+    main_side = str(current_signal.get("signal") or "NO_TRADE").upper()
+    if main_side not in ("BUY", "SELL"):
+        return None
+    opposite = opposite_side(main_side)
+    try:
+        m15 = add_indicators(fetch_ohlc("15min", 120))
+        m5 = add_indicators(fetch_ohlc("5min", 120))
+        h1 = add_indicators(fetch_ohlc("1h", 120))
+        if len(m15) < 20 or len(m5) < 10 or len(h1) < 20:
+            return None
+        l15, p15 = m15.iloc[-1], m15.iloc[-2]
+        l5 = m5.iloc[-1]
+        px = float(l5.close)
+        adxv = safe_float(l15.get("adx14"))
+        plus_di = safe_float(l15.get("plus_di14"))
+        minus_di = safe_float(l15.get("minus_di14"))
+        rsi_now = safe_float(l15.get("rsi14"))
+        rsi_prev = safe_float(p15.get("rsi14"))
+
+        main_dmi = dmi_direction_context(main_side, adxv, plus_di, minus_di)
+        opp_dmi = dmi_direction_context(opposite, adxv, plus_di, minus_di)
+        # Only trigger when DMI materially contradicts the original/main direction.
+        if not (main_dmi.get("hard_veto") or main_dmi.get("strong_conflict")):
+            return None
+        if not opp_dmi.get("aligned") or adxv is None or adxv < ADX_STRONG_THRESHOLD:
+            return None
+
+        confirmations: List[str] = []
+        missing: List[str] = []
+        confirmations.append(f"DMI supports {opposite}: ADX {adxv:.1f}, +DI/-DI {plus_di:.1f}/{minus_di:.1f}")
+
+        # RSI direction / recovery.
+        rsi_ok = False
+        if rsi_now is not None and rsi_prev is not None:
+            delta = rsi_now - rsi_prev
+            rsi_ok = (opposite == "BUY" and delta >= DMI_FLIP_RSI_MIN_DELTA and rsi_now >= 40) or (opposite == "SELL" and delta <= -DMI_FLIP_RSI_MIN_DELTA and rsi_now <= 60)
+        if rsi_ok:
+            confirmations.append(f"RSI M15 confirms {opposite}: {rsi_prev:.1f} → {rsi_now:.1f}")
+        else:
+            missing.append("RSI M15 direction/recovery")
+
+        # M5 structure change: CHOCH or BOS in the opposite direction.
+        ms5 = market_structure(m5)
+        if opposite == "BUY":
+            structure_ok = ms5.get("choch") == "BULLISH_CHOCH" or ms5.get("bos") == "BULLISH_BOS"
+        else:
+            structure_ok = ms5.get("choch") == "BEARISH_CHOCH" or ms5.get("bos") == "BEARISH_BOS"
+        if structure_ok:
+            confirmations.append(f"M5 structure confirms {opposite}: {ms5.get('choch') or ms5.get('bos')}")
+        else:
+            missing.append("M5 CHOCH/BOS")
+
+        # Directional M5 candle or rejection wick.
+        rng = max(float(l5.high) - float(l5.low), 1e-9)
+        body = abs(float(l5.close) - float(l5.open))
+        body_ratio = body / rng
+        lower_wick = min(float(l5.open), float(l5.close)) - float(l5.low)
+        upper_wick = float(l5.high) - max(float(l5.open), float(l5.close))
+        candle_ok = ((opposite == "BUY" and float(l5.close) > float(l5.open)) or (opposite == "SELL" and float(l5.close) < float(l5.open))) and body_ratio >= 0.50
+        wick_ok = (opposite == "BUY" and lower_wick / rng >= 0.25) or (opposite == "SELL" and upper_wick / rng >= 0.25)
+        price_action_ok = candle_ok or wick_ok
+        if price_action_ok:
+            confirmations.append(f"M5 price action confirms {opposite} ({'candle' if candle_ok else 'rejection wick'})")
+        else:
+            missing.append("M5 directional candle/rejection")
+
+        # RR / room to the nearest structural obstacle.
+        atr_h1 = safe_float(h1.iloc[-1].get("atr14"))
+        rp = risk_plan_for_position(opposite, px, atr_h1)
+        rr_guard = rr_entry_quality_guard(opposite, rp["entry"], rp["sl"], rp["tp1"], current_signal)
+        structural_rr = safe_float(rr_guard.get("structural_rr"))
+        plan_rr = safe_float(rr_guard.get("plan_rr"))
+        rr_value = structural_rr if structural_rr is not None else plan_rr
+        rr_ok = bool(rr_guard.get("ok")) and rr_value is not None and rr_value >= RR_CAUTION_BELOW
+        if rr_ok:
+            confirmations.append(f"RR/space supports {opposite}: {rr_value:.2f}R")
+        else:
+            missing.append(f"RR >= {RR_CAUTION_BELOW:.2f}R")
+
+        count = len(confirmations)
+        if count < DMI_FLIP_MIN_CONFIRMATIONS:
+            return None
+        if count >= DMI_FLIP_ENTRY_READY_CONFIRMATIONS and structure_ok and rr_ok:
+            phase = "ENTRY_READY"
+        elif count >= DMI_FLIP_CONFIRMED_CONFIRMATIONS:
+            phase = "CONFIRMED"
+        else:
+            phase = "WATCH"
+
+        levels = market_levels_context(current_signal, px)
+        return {
+            "type": "DMI_FLIP_REVERSAL", "side": opposite, "from_side": main_side, "phase": phase,
+            "price": round(px, 2), "adx": round(adxv, 2), "plus_di": round(plus_di, 2), "minus_di": round(minus_di, 2),
+            "dmi_gap": opp_dmi.get("gap"), "dmi_ratio": opp_dmi.get("ratio"),
+            "confirmations": confirmations, "missing": missing, "confirmation_count": count, "confirmation_total": 5,
+            "m5_structure": ms5, "rsi_m15": round(rsi_now, 1) if rsi_now is not None else None,
+            "risk_plan": rp, "rr_guard": rr_guard, "market_levels": levels,
+            "trend": current_signal.get("trend"), "time_utc": now_utc(),
+        }
+    except Exception as e:
+        return {"type": "DMI_FLIP_REVERSAL", "error": f"{type(e).__name__}: {e}"}
+
+
+def should_send_dmi_flip_reversal(event: Dict[str, Any]) -> bool:
+    if not event or event.get("error"):
+        return False
+    state = load_json(DMI_FLIP_STATE_FILE, {"alerts": {}})
+    alerts = state.get("alerts") if isinstance(state.get("alerts"), dict) else {}
+    key = f"{event.get('from_side')}->{event.get('side')}:{event.get('phase')}"
+    now_ts = _utc_ts()
+    last = safe_float(alerts.get(key), 0) or 0
+    if now_ts - last < max(60, DMI_FLIP_COOLDOWN_MINUTES * 60):
+        return False
+    alerts[key] = now_ts
+    state.update({"alerts": alerts, "last_event": event, "updated_utc": now_utc()})
+    save_json(DMI_FLIP_STATE_FILE, state)
+    return True
+
+
+def format_dmi_flip_reversal_alert(event: Dict[str, Any]) -> str:
+    side = str(event.get("side") or "")
+    phase = str(event.get("phase") or "WATCH")
+    icon = "🟢" if side == "BUY" else "🔴"
+    if phase == "ENTRY_READY":
+        title = f"{side} REVERSAL — ENTRY READY CHECK"
+        action = "Kierunek przeciwny do wcześniejszego trendu ma 5/5 potwierdzeń. Nadal zastosuj finalny Entry Quality, live RR i retest przed wejściem."
+    elif phase == "CONFIRMED":
+        title = f"{side} REVERSAL CONFIRMED"
+        action = "Odwrócenie ma mocne potwierdzenia. Czekaj na dobry retest/Entry Quality; nie goń świecy."
+    else:
+        title = f"POSSIBLE {side} REVERSAL WATCH"
+        action = "DMI przechyla się przeciw wcześniejszemu kierunkowi. To sugestia obserwacji, nie automatyczny ENTRY."
+    conf = event.get("confirmations") or []
+    missing = event.get("missing") or []
+    rp = event.get("risk_plan") or {}
+    rr = event.get("rr_guard") or {}
+    return (
+        f"{icon} GOLD DMI FLIP — {title}\n\n"
+        f"Poprzedni/główny kierunek: {event.get('from_side')} → analizuję {side}\n"
+        f"Cena: {event.get('price')}\n"
+        f"ADX: {event.get('adx')} | +DI/-DI: {event.get('plus_di')}/{event.get('minus_di')}\n"
+        f"Potwierdzenia: {event.get('confirmation_count')}/{event.get('confirmation_total')} | Faza: {phase}\n"
+        f"Trend M15/H1/H4/D1: {(event.get('trend') or {}).get('M15')} / {(event.get('trend') or {}).get('H1')} / {(event.get('trend') or {}).get('H4')} / {(event.get('trend') or {}).get('D1')}\n\n"
+        f"✅ Wspiera {side}: {', '.join(conf) or '-'}\n"
+        f"⏳ Brakuje: {', '.join(missing) or '-'}\n\n"
+        f"RR strukturalne: {rr.get('structural_rr')} | RR planu: {rr.get('plan_rr')} | Ocena: {rr.get('status')}\n"
+        f"Plan obserwacyjny: Entry {rp.get('entry')} | SL {rp.get('sl')} | TP1 {rp.get('tp1')}\n\n"
+        f"{format_market_levels_block(event.get('market_levels'), side)}\n\n"
+        f"{action}"
+    )
+
+
 def reversal_momentum_watch_job(current_signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     global LAST_REVERSAL_STATUS
 
@@ -6058,6 +6580,16 @@ def reversal_momentum_watch_job(current_signal: Optional[Dict[str, Any]] = None)
         resolved_signal = current_signal or build_signal()
         watch = detect_reversal_momentum_watch(resolved_signal)
         sent_count = 0
+        shared_levels = market_levels_context(resolved_signal)
+
+        # v7.0.4.2: if strong DMI contradicts the main trend/setup, analyse the opposite side.
+        dmi_flip = detect_dmi_flip_reversal_watch(resolved_signal)
+        if dmi_flip and not dmi_flip.get("error") and should_send_dmi_flip_reversal(dmi_flip):
+            send_telegram(format_dmi_flip_reversal_alert(dmi_flip))
+            sent_count += 1
+            if A_PLUS_LOG_INFO_TO_DB:
+                record_signal_history("DMI_FLIP_REVERSAL", dmi_flip)
+        watch["dmi_flip_reversal"] = dmi_flip
 
         # Independent breakout lane: catches strong trend continuation before a classical retest exists.
         breakout_events = detect_momentum_breakouts(resolved_signal)
@@ -6101,6 +6633,8 @@ def reversal_momentum_watch_job(current_signal: Optional[Dict[str, Any]] = None)
 
         # v7.0.3.6: early reversal lane after RSI state is refreshed.
         early_reversal = detect_early_reversal()
+        if early_reversal and not early_reversal.get("error"):
+            early_reversal["market_levels"] = market_levels_context(resolved_signal, early_reversal.get("price"))
         if early_reversal and not early_reversal.get("error") and should_send_early_reversal(early_reversal):
             send_telegram(format_early_reversal_alert(early_reversal))
             sent_count += 1
@@ -6109,6 +6643,7 @@ def reversal_momentum_watch_job(current_signal: Optional[Dict[str, Any]] = None)
         watch["early_reversal"] = early_reversal
 
         for event in watch.get("events", []):
+            event["market_levels"] = market_levels_context(resolved_signal, event.get("price"))
             _record_momentum_impulse(event)
             quality = evaluate_a_plus_quality(current_signal or build_signal(), event=event)
             event["a_plus_quality"] = quality
