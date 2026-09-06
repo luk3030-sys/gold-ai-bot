@@ -17,7 +17,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "7.0.4.2-dmi-flip-levels"
+APP_VERSION = "7.0.4.3-exit-context"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -247,6 +247,19 @@ MOVE_ALERT_MIN_RANGE_POINTS_1H = float(os.getenv("MOVE_ALERT_MIN_RANGE_POINTS_1H
 MOVE_ALERT_MIN_RANGE_POINTS_DEFAULT = float(os.getenv("MOVE_ALERT_MIN_RANGE_POINTS_DEFAULT", "12"))
 MOVE_ALERT_REQUIRE_ABSOLUTE_POINTS = env_bool("MOVE_ALERT_REQUIRE_ABSOLUTE_POINTS", True)
 MOVE_ALERT_FILTER_STATUS_ENABLED = env_bool("MOVE_ALERT_FILTER_STATUS_ENABLED", True)
+
+# v7.0.4.3 Move context + bias invalidation + emergency position protection
+MOVE_ALERT_CONTEXT_ENABLED = env_bool("MOVE_ALERT_CONTEXT_ENABLED", True)
+MOVE_ALERT_SHOW_ADX_DMI = env_bool("MOVE_ALERT_SHOW_ADX_DMI", True)
+MOVE_ALERT_SHOW_RR_SPACE = env_bool("MOVE_ALERT_SHOW_RR_SPACE", True)
+MOVE_ALERT_CONTEXT_INTERVAL = os.getenv("MOVE_ALERT_CONTEXT_INTERVAL", "15min")
+BIAS_INVALIDATION_ENABLED = env_bool("BIAS_INVALIDATION_ENABLED", True)
+BIAS_STATE_FILE = os.getenv("BIAS_STATE_FILE", "directional_bias_state.json")
+BIAS_INVALIDATION_MIN_BODY_ATR = float(os.getenv("BIAS_INVALIDATION_MIN_BODY_ATR", "1.00"))
+BIAS_INVALIDATION_COOLDOWN_MINUTES = int(os.getenv("BIAS_INVALIDATION_COOLDOWN_MINUTES", "20"))
+POSITION_EMERGENCY_MOVE_EXIT_ENABLED = env_bool("POSITION_EMERGENCY_MOVE_EXIT_ENABLED", True)
+POSITION_EMERGENCY_BODY_ATR_MIN = float(os.getenv("POSITION_EMERGENCY_BODY_ATR_MIN", "1.00"))
+POSITION_EMERGENCY_DMI_CONFIRM = env_bool("POSITION_EMERGENCY_DMI_CONFIRM", True)
 
 
 # Smart Multi-Timeframe Cache / Quota Guard
@@ -501,6 +514,7 @@ LAST_REVERSAL_STATUS: Dict[str, Any] = {
     "last_events": [],
 }
 LAST_EXIT_ALERT_KEYS: Dict[str, float] = {}
+LAST_BIAS_INVALIDATION_KEYS: Dict[str, float] = {}
 LAST_ENTRY_EXIT_STATUS: Dict[str, Any] = {
     "version": APP_VERSION,
     "last_run_utc": None,
@@ -2552,6 +2566,13 @@ def build_signal() -> Dict[str, Any]:
     ob = order_block(h1)
     precision_m15 = precision_entry_snapshot(m15) if PRECISION_ENTRY_ENABLED else {"available": False, "enabled": False}
     intermarket = get_intermarket_snapshot() if INTERMARKET_ENABLED else {"enabled": False, "status": "disabled", "bias": "DISABLED", "buy_bonus": 0, "sell_bonus": 0}
+    m15_last = m15.iloc[-1]
+    dmi_m15 = {
+        "interval": "15min",
+        "adx": round(float(m15_last.adx14), 2) if pd.notna(m15_last.get("adx14")) else None,
+        "plus_di": round(float(m15_last.plus_di14), 2) if pd.notna(m15_last.get("plus_di14")) else None,
+        "minus_di": round(float(m15_last.minus_di14), 2) if pd.notna(m15_last.get("minus_di14")) else None,
+    }
 
     score_sell = 0
     score_buy = 0
@@ -2614,7 +2635,9 @@ def build_signal() -> Dict[str, Any]:
         "score": int(score),
         "directional_scores": {"BUY": int(score_buy), "SELL": int(score_sell)},
         "price": round(price, 2),
+        "atr_h1": round(atr_h1, 2),
         "trend": trends,
+        "dmi_m15": dmi_m15,
         "intermarket": intermarket,
         "institutional": {
             "market_structure_h1": ms_h1,
@@ -2956,8 +2979,289 @@ def detect_big_move(interval: str) -> Optional[Dict[str, Any]]:
     return move
 
 
+def _direction_to_side(direction: str) -> Optional[str]:
+    d = str(direction or "").upper()
+    if d in ("GÓRĘ", "GORE", "UP", "BUY"):
+        return "BUY"
+    if d in ("DÓŁ", "DOL", "DOWN", "SELL"):
+        return "SELL"
+    return None
+
+
+def _current_dmi_context(signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Use the DMI snapshot already calculated by build_signal; fetch only as cache-backed fallback."""
+    snap = dict(((signal or {}).get("dmi_m15") or {}))
+    if snap.get("adx") is not None and snap.get("plus_di") is not None and snap.get("minus_di") is not None:
+        return snap
+    try:
+        df = add_indicators(fetch_ohlc(MOVE_ALERT_CONTEXT_INTERVAL, 80))
+        if df is None or df.empty:
+            return {"interval": MOVE_ALERT_CONTEXT_INTERVAL, "adx": None, "plus_di": None, "minus_di": None}
+        last = df.iloc[-1]
+        return {
+            "interval": MOVE_ALERT_CONTEXT_INTERVAL,
+            "adx": round(float(last.adx14), 2) if pd.notna(last.get("adx14")) else None,
+            "plus_di": round(float(last.plus_di14), 2) if pd.notna(last.get("plus_di14")) else None,
+            "minus_di": round(float(last.minus_di14), 2) if pd.notna(last.get("minus_di14")) else None,
+        }
+    except Exception as e:
+        return {"interval": MOVE_ALERT_CONTEXT_INTERVAL, "adx": None, "plus_di": None, "minus_di": None, "error": f"{type(e).__name__}: {e}"}
+
+
+def _dmi_bias_label(dmi: Optional[Dict[str, Any]]) -> str:
+    dmi = dmi or {}
+    plus_di = safe_float(dmi.get("plus_di"))
+    minus_di = safe_float(dmi.get("minus_di"))
+    adxv = safe_float(dmi.get("adx"))
+    if plus_di is None or minus_di is None:
+        return "UNKNOWN"
+    if abs(plus_di - minus_di) < 2:
+        direction = "NEUTRAL"
+    else:
+        direction = "BUY" if plus_di > minus_di else "SELL"
+    strength = "WEAK"
+    if adxv is not None:
+        if adxv >= ADX_VERY_STRONG_THRESHOLD:
+            strength = "VERY_STRONG"
+        elif adxv >= ADX_STRONG_THRESHOLD:
+            strength = "STRONG"
+        elif adxv >= 20:
+            strength = "MODERATE"
+    return f"{direction}/{strength}"
+
+
+def move_alert_context(m: Dict[str, Any], signal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Adds ADX/DMI and an *informational* RR-space estimate without creating a trade."""
+    signal = signal or LAST_SIGNAL
+    side = _direction_to_side(m.get("direction"))
+    price = safe_float(((m.get("live_price") or {}).get("price")), safe_float(m.get("price")))
+    dmi = _current_dmi_context(signal)
+    levels = market_levels_context(signal, price)
+    result: Dict[str, Any] = {
+        "enabled": MOVE_ALERT_CONTEXT_ENABLED,
+        "side": side,
+        "dmi": dmi,
+        "dmi_bias": _dmi_bias_label(dmi),
+        "levels": levels,
+        "rr_space": None,
+        "rr_quality": "UNKNOWN",
+        "risk_reference": None,
+        "target_level": None,
+        "target_source": None,
+    }
+    if not MOVE_ALERT_CONTEXT_ENABLED or side not in ("BUY", "SELL") or price is None:
+        return result
+    try:
+        atr_h1 = safe_float((signal or {}).get("atr_h1"))
+        risk_ref = max(float(atr_h1) * AUTO_RISK_ATR_MULTIPLIER, AUTO_RISK_MIN_POINTS) if atr_h1 else AUTO_RISK_MIN_POINTS
+        target = levels.get("nearest_resistance") if side == "BUY" else levels.get("nearest_support")
+        if target and safe_float(target.get("level")) is not None and risk_ref > 0:
+            target_level = float(target.get("level"))
+            reward = max(0.0, target_level - float(price)) if side == "BUY" else max(0.0, float(price) - target_level)
+            rr_space = reward / risk_ref
+            result.update({
+                "rr_space": round(rr_space, 2),
+                "rr_quality": _rr_quality_label(rr_space),
+                "risk_reference": round(risk_ref, 2),
+                "target_level": round(target_level, 2),
+                "target_source": target.get("source"),
+            })
+    except Exception as e:
+        result["rr_error"] = f"{type(e).__name__}: {e}"
+    return result
+
+
+def _format_move_context_block(ctx: Optional[Dict[str, Any]]) -> str:
+    ctx = ctx or {}
+    lines: List[str] = []
+    if MOVE_ALERT_SHOW_ADX_DMI:
+        dmi = ctx.get("dmi") or {}
+        lines.append(
+            f"ADX/DMI {dmi.get('interval', '15min')}: ADX {dmi.get('adx')} | +DI/-DI {dmi.get('plus_di')}/{dmi.get('minus_di')} | bias {ctx.get('dmi_bias')}"
+        )
+    if MOVE_ALERT_SHOW_RR_SPACE:
+        rr = ctx.get("rr_space")
+        if rr is None:
+            lines.append("RR-space: brak wystarczających danych (to nie jest ENTRY RR).")
+        else:
+            lines.append(
+                f"RR-space do najbliższego poziomu: {rr}R ({ctx.get('rr_quality')}) | cel {ctx.get('target_level')} ({ctx.get('target_source')}) | ryzyko ref. {ctx.get('risk_reference')} pkt"
+            )
+    return "\n".join(lines)
+
+
+def _bias_state_default() -> Dict[str, Any]:
+    return {"side": None, "source": None, "price": None, "updated_utc": None, "updated_ts": None}
+
+
+def record_directional_bias(side: str, source: str, price: Optional[float], metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    side = str(side or "").upper()
+    if side not in ("BUY", "SELL"):
+        return load_json(BIAS_STATE_FILE, _bias_state_default())
+    state = {
+        "side": side,
+        "source": source,
+        "price": round(float(price), 2) if price is not None else None,
+        "updated_utc": now_utc(),
+        "updated_ts": _utc_ts(),
+        "metadata": metadata or {},
+    }
+    save_json(BIAS_STATE_FILE, state)
+    return state
+
+
+def evaluate_bias_invalidation_from_move(m: Dict[str, Any], ctx: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    if not BIAS_INVALIDATION_ENABLED:
+        return None
+    current_side = _direction_to_side(m.get("direction"))
+    if current_side not in ("BUY", "SELL"):
+        return None
+    previous = load_json(BIAS_STATE_FILE, _bias_state_default())
+    previous_side = str(previous.get("side") or "").upper()
+    if previous_side not in ("BUY", "SELL") or previous_side == current_side:
+        return None
+    body_atr = safe_float(m.get("body_atr"), 0.0) or 0.0
+    if body_atr < BIAS_INVALIDATION_MIN_BODY_ATR:
+        return None
+    dmi = (ctx or {}).get("dmi") or {}
+    plus_di = safe_float(dmi.get("plus_di"))
+    minus_di = safe_float(dmi.get("minus_di"))
+    adxv = safe_float(dmi.get("adx"))
+    dmi_confirms = False
+    if current_side == "BUY" and plus_di is not None and minus_di is not None:
+        dmi_confirms = plus_di > minus_di
+    if current_side == "SELL" and plus_di is not None and minus_di is not None:
+        dmi_confirms = minus_di > plus_di
+    severity = "HIGH" if body_atr >= 1.4 or (dmi_confirms and adxv is not None and adxv >= ADX_STRONG_THRESHOLD) else "MEDIUM"
+    px = safe_float(((m.get("live_price") or {}).get("price")), safe_float(m.get("price")))
+    return {
+        "type": "BIAS_INVALIDATED",
+        "previous_side": previous_side,
+        "new_side": current_side,
+        "previous_source": previous.get("source"),
+        "previous_price": previous.get("price"),
+        "price": round(float(px), 2) if px is not None else None,
+        "body_atr": round(body_atr, 2),
+        "range_atr": m.get("range_atr"),
+        "dmi": dmi,
+        "dmi_confirms": dmi_confirms,
+        "severity": severity,
+        "rr_space": (ctx or {}).get("rr_space"),
+        "rr_quality": (ctx or {}).get("rr_quality"),
+        "time_utc": now_utc(),
+    }
+
+
+def should_send_bias_invalidation(event: Dict[str, Any]) -> bool:
+    key = f"{event.get('previous_side')}->{event.get('new_side')}:{event.get('severity')}"
+    now_ts = _utc_ts()
+    last_ts = float(LAST_BIAS_INVALIDATION_KEYS.get(key, 0) or 0)
+    if now_ts - last_ts < max(60, BIAS_INVALIDATION_COOLDOWN_MINUTES * 60):
+        return False
+    LAST_BIAS_INVALIDATION_KEYS[key] = now_ts
+    return True
+
+
+def format_bias_invalidation_alert(event: Dict[str, Any]) -> str:
+    old = event.get("previous_side")
+    new = event.get("new_side")
+    dmi = event.get("dmi") or {}
+    icon = "🚨" if event.get("severity") == "HIGH" else "⚠️"
+    return (
+        f"{icon} GOLD {old} BIAS ZANEGOWANY — {new} PRZEJMUJE IMPULS\n\n"
+        f"Poprzedni bias: {old} ({event.get('previous_source')}) od ok. {event.get('previous_price')}\n"
+        f"Aktualna cena: {event.get('price')} | przeciwny ruch: {event.get('body_atr')} ATR\n"
+        f"ADX/DMI M15: ADX {dmi.get('adx')} | +DI/-DI {dmi.get('plus_di')}/{dmi.get('minus_di')}\n"
+        f"RR-space nowego kierunku: {event.get('rr_space')}R ({event.get('rr_quality')})\n\n"
+        f"Interpretacja: wcześniejszy impuls {old} nie jest już aktywną przewagą. "
+        f"Jeżeli masz pozycję {old}, sprawdź SL/wyjście; nowy {new} nadal wymaga własnego Entry Quality/RR."
+    )
+
+
+def emergency_position_events_from_move(m: Dict[str, Any], ctx: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Protect tracked positions even when the main entry engine still says NO_TRADE."""
+    events: List[Dict[str, Any]] = []
+    if not POSITION_EMERGENCY_MOVE_EXIT_ENABLED:
+        return events
+    move_side = _direction_to_side(m.get("direction"))
+    if move_side not in ("BUY", "SELL"):
+        return events
+    body_atr = safe_float(m.get("body_atr"), 0.0) or 0.0
+    if body_atr < POSITION_EMERGENCY_BODY_ATR_MIN:
+        return events
+    dmi = (ctx or {}).get("dmi") or {}
+    plus_di = safe_float(dmi.get("plus_di"))
+    minus_di = safe_float(dmi.get("minus_di"))
+    adxv = safe_float(dmi.get("adx"))
+    dmi_confirms = ((move_side == "BUY" and plus_di is not None and minus_di is not None and plus_di > minus_di) or
+                    (move_side == "SELL" and plus_di is not None and minus_di is not None and minus_di > plus_di))
+    if POSITION_EMERGENCY_DMI_CONFIRM and adxv is not None and adxv >= ADX_STRONG_THRESHOLD and not dmi_confirms:
+        # Still warn on a truly extreme candle; otherwise wait for DMI confirmation.
+        if body_atr < 1.4:
+            return events
+    price = safe_float(((m.get("live_price") or {}).get("price")), safe_float(m.get("price")))
+    if price is None:
+        return events
+    for p in load_positions():
+        side = str(p.get("side") or "").upper()
+        if side not in ("BUY", "SELL") or side == move_side:
+            continue
+        try:
+            entry = float(p.get("entry"))
+            initial_sl = safe_float(p.get("initial_sl"), safe_float(p.get("sl")))
+            current_sl = safe_float(p.get("sl"))
+            risk = abs(entry - float(initial_sl)) if initial_sl is not None else None
+            pnl = (float(price) - entry) if side == "BUY" else (entry - float(price))
+            rr = pnl / risk if risk and risk > 0 else None
+            sl_hit = False
+            if current_sl is not None:
+                sl_hit = float(price) <= current_sl if side == "BUY" else float(price) >= current_sl
+            severity = "EXIT_NOW" if sl_hit or body_atr >= 1.4 else "EXIT_REVIEW"
+            events.append({
+                "type": "EMERGENCY_OPPOSITE_MOVE",
+                "priority": "HIGH",
+                "position_id": p.get("id"),
+                "side": side,
+                "entry": round(entry, 2),
+                "price": round(float(price), 2),
+                "sl": round(current_sl, 2) if current_sl is not None else None,
+                "pnl_points": round(pnl, 2),
+                "rr": round(rr, 2) if rr is not None else None,
+                "move_side": move_side,
+                "body_atr": round(body_atr, 2),
+                "range_atr": m.get("range_atr"),
+                "adx": adxv,
+                "plus_di": plus_di,
+                "minus_di": minus_di,
+                "dmi_confirms": dmi_confirms,
+                "severity": severity,
+                "dedupe_key": f"{p.get('id')}:EMERGENCY:{move_side}:{m.get('datetime')}",
+                "message": f"Silny przeciwny ruch {move_side}: {body_atr:.2f} ATR. {('SL naruszony.' if sl_hit else 'Pozycja wymaga natychmiastowej ponownej oceny.')}",
+                "time_utc": now_utc(),
+            })
+        except Exception:
+            continue
+    return events
+
+
+def format_emergency_position_alert(event: Dict[str, Any]) -> str:
+    action = "ZAMKNIJ / SPRAWDŹ WYKONANIE SL" if event.get("severity") == "EXIT_NOW" else "ROZWAŻ WYJŚCIE / REDUKCJĘ"
+    return (
+        f"🚨 GOLD OCHRONA POZYCJI — {event.get('side')} POD PRESJĄ\n\n"
+        f"Pozycja #{event.get('position_id')} {event.get('side')} | Entry {event.get('entry')}\n"
+        f"Cena: {event.get('price')} | PnL: {event.get('pnl_points')} pkt | RR pozycji: {event.get('rr')}\n"
+        f"Przeciwny impuls: {event.get('move_side')} | {event.get('body_atr')} ATR\n"
+        f"ADX/DMI M15: ADX {event.get('adx')} | +DI/-DI {event.get('plus_di')}/{event.get('minus_di')}\n"
+        f"SL w pamięci bota: {event.get('sl')}\n\n"
+        f"Decyzja ochronna: {action}.\nPowód: {event.get('message')}\n"
+        f"Bot nie zamyka zlecenia w XTB automatycznie."
+    )
+
+
 def format_move_alert(m: Dict[str, Any]) -> str:
-    levels_block = format_market_levels_block(market_levels_context(LAST_SIGNAL, m.get("price")))
+    ctx = m.get("market_context") or move_alert_context(m, LAST_SIGNAL)
+    levels_block = format_market_levels_block((ctx or {}).get("levels") or market_levels_context(LAST_SIGNAL, m.get("price")))
+    context_block = _format_move_context_block(ctx)
     live = m.get("live_price") or {}
     dg = m.get("delay_guard") or {}
 
@@ -2995,6 +3299,7 @@ def format_move_alert(m: Dict[str, Any]) -> str:
         f"Świeca alertowa: {m.get('datetime')}"
         f"{live_text}"
         f"{execution_text}\n"
+        f"{context_block}\n\n"
         f"{levels_block}\n\n"
         f"⚠️ To jest alert zmienności, nie automatyczny sygnał BUY/SELL."
     )
@@ -3023,13 +3328,29 @@ def check_move_alerts() -> None:
                     filtered_moves.append(move)
                 continue
 
+            move["market_context"] = move_alert_context(move, LAST_SIGNAL)
             moves.append(move)
             key = f"{interval}:{move['datetime']}:{move['direction']}"
             if key not in LAST_MOVE_ALERT_KEYS:
+                # First invalidate the previous directional bias, then send the new volatility context.
+                invalidation = evaluate_bias_invalidation_from_move(move, move.get("market_context"))
+                if invalidation and should_send_bias_invalidation(invalidation):
+                    send_telegram(format_bias_invalidation_alert(invalidation))
+
+                # Protect positions explicitly registered in the bot, even if the main engine is NO_TRADE.
+                for emergency in emergency_position_events_from_move(move, move.get("market_context")):
+                    if should_send_exit_alert(emergency):
+                        send_telegram(format_emergency_position_alert(emergency))
+
                 send_telegram(format_move_alert(move))
                 sent_count += 1
                 LAST_MOVE_ALERT_KEYS.add(key)
                 LAST_MOVE_ALERT_KEYS = set(list(LAST_MOVE_ALERT_KEYS)[-50:])
+
+                # A fresh extreme move becomes the current momentum bias after any prior bias is invalidated.
+                move_side = _direction_to_side(move.get("direction"))
+                if move_side in ("BUY", "SELL"):
+                    record_directional_bias(move_side, f"MOVE_ALERT_{interval}", safe_float(((move.get("live_price") or {}).get("price")), safe_float(move.get("price"))), {"body_atr": move.get("body_atr"), "quality": move.get("quality")})
         except Exception as e:
             LAST_MOVE_ALERT_STATUS["last_error"] = f"MOVE ALERT ERROR {interval}: {type(e).__name__}: {e}"
             print(f"MOVE ALERT ERROR {interval}: {e}")
@@ -3195,10 +3516,19 @@ def position_monitor_job() -> None:
             tp2 = safe_float(p.get("tp2"))
             tp3 = safe_float(p.get("tp3"))
             alerts = set(p.get("alerts_sent", []))
-            risk = abs(sl - entry) if sl is not None else None
+            initial_sl = safe_float(p.get("initial_sl"), sl)
+            risk = abs(initial_sl - entry) if initial_sl is not None else None
             pnl_points = (entry - price) if side == "SELL" else (price - entry)
             rr = pnl_points / risk if risk else 0
             chat_id = p.get("chat_id") or TELEGRAM_CHAT_ID
+
+            def alert_once(key: str, text: str):
+                nonlocal changed
+                if key not in alerts:
+                    send_telegram(text, chat_id=chat_id)
+                    alerts.add(key)
+                    p["alerts_sent"] = sorted(alerts)
+                    changed = True
 
             if TRAILING_STOP_ENABLED and risk and rr >= TRAIL_AT_RR_1:
                 lock_r = TRAIL_LOCK_R_1
@@ -3217,14 +3547,6 @@ def position_monitor_job() -> None:
                     changed = True
                     alert_once(f"TRAIL_{lock_r}", f"🔒 Pozycja #{p['id']} {side}: automatyczny SL w pamięci bota {old_sl} → {p['sl']} (zabezpieczone {lock_r}R). Ustaw ten SL ręcznie u brokera.")
 
-            def alert_once(key: str, text: str):
-                nonlocal changed
-                if key not in alerts:
-                    send_telegram(text, chat_id=chat_id)
-                    alerts.add(key)
-                    p["alerts_sent"] = sorted(alerts)
-                    changed = True
-
             if risk and rr >= BE_TRIGGER_RR:
                 alert_once(
                     f"BE_{BE_TRIGGER_RR}",
@@ -3236,21 +3558,20 @@ def position_monitor_job() -> None:
                 hit = price <= tp_value if side == "SELL" else price >= tp_value
                 near = abs(price - tp_value) <= atr_value * TP_WARNING_DISTANCE_ATR
                 if hit:
-                    alert_once(f"HIT_{tp_key}", f"🎯 Pozycja #{p['id']} {side}: osiągnięto {tp_key} {tp_value}. Aktualna cena: {round(price, 2)}")
+                    alert_once(f"HIT_{tp_key}", f"🎯 Pozycja #{p['id']} {side}: osiągnięto {tp_key} {tp_value}. Aktualna cena: {round(price, 2)} | RR: {round(rr, 2)}")
                 elif near:
-                    alert_once(f"NEAR_{tp_key}", f"⏳ Pozycja #{p['id']} {side}: cena blisko {tp_key} {tp_value}. Aktualna cena: {round(price, 2)}")
+                    alert_once(f"NEAR_{tp_key}", f"⏳ Pozycja #{p['id']} {side}: cena blisko {tp_key} {tp_value}. Aktualna cena: {round(price, 2)} | RR: {round(rr, 2)}")
             if sl is not None:
                 sl_hit = price >= sl if side == "SELL" else price <= sl
                 sl_near = abs(price - sl) <= atr_value * SL_WARNING_DISTANCE_ATR
                 if sl_hit:
-                    alert_once("HIT_SL", f"🛑 Pozycja #{p['id']} {side}: cena dotknęła/przebiła SL {sl}. Aktualna cena: {round(price, 2)}")
+                    alert_once("HIT_SL", f"🛑 Pozycja #{p['id']} {side}: cena dotknęła/przebiła SL {sl}. Aktualna cena: {round(price, 2)} | RR: {round(rr, 2)}")
                 elif sl_near:
-                    alert_once("NEAR_SL", f"⚠️ Pozycja #{p['id']} {side}: cena blisko SL {sl}. Aktualna cena: {round(price, 2)}")
+                    alert_once("NEAR_SL", f"⚠️ Pozycja #{p['id']} {side}: cena blisko SL {sl}. Aktualna cena: {round(price, 2)} | RR: {round(rr, 2)}")
         if changed:
             save_positions(positions)
     except Exception as e:
         print(f"POSITION MONITOR ERROR: {e}")
-
 
 
 def opposite_side(side: str) -> str:
@@ -4883,6 +5204,7 @@ def evaluate_exit_signals(current_signal: Optional[Dict[str, Any]] = None) -> Li
     price, atr_value = current_price_and_atr()
     signal_side = str((current_signal or {}).get("signal", "NO_TRADE")).upper()
     signal_score = int((current_signal or {}).get("score", 0) or 0)
+    exit_dmi = _current_dmi_context(current_signal)
 
     for p in positions:
         try:
@@ -4910,6 +5232,10 @@ def evaluate_exit_signals(current_signal: Optional[Dict[str, Any]] = None) -> Li
                 "pnl_points": round(float(pnl_points), 2),
                 "rr": round(rr, 2) if rr is not None else None,
                 "atr_h1": round(float(atr_value), 2),
+                "adx": exit_dmi.get("adx"),
+                "plus_di": exit_dmi.get("plus_di"),
+                "minus_di": exit_dmi.get("minus_di"),
+                "dmi_bias": _dmi_bias_label(exit_dmi),
                 "time_utc": now_utc(),
             }
 
@@ -4999,7 +5325,8 @@ def format_exit_event_alert(e: Dict[str, Any]) -> str:
         f"Pozycja #{e.get('position_id')} {e.get('side')}\n"
         f"Entry: {e.get('entry')} | Aktualna cena: {e.get('price')}\n"
         f"SL: {e.get('sl')} | TP1: {e.get('tp1')} | TP2: {e.get('tp2')} | TP3: {e.get('tp3')}\n"
-        f"PnL pkt: {e.get('pnl_points')} | RR: {e.get('rr')}\n\n"
+        f"PnL pkt: {e.get('pnl_points')} | RR: {e.get('rr')}\n"
+        f"ADX/DMI M15: ADX {e.get('adx')} | +DI/-DI {e.get('plus_di')}/{e.get('minus_di')} | bias {e.get('dmi_bias')}\n\n"
         f"Powód: {e.get('message')}\n\n"
         f"To jest sygnał zarządzania pozycją. Bot nie zamyka pozycji u brokera automatycznie."
     )
@@ -6732,6 +7059,8 @@ def entry_exit_signal_job() -> None:
         if entry_signal.get("valid") and confidence_ok and should_send_entry_alert(entry_signal) and should_send_a_plus_alert(a_plus_quality, entry_signal.get("signal"), "ENTRY", structure_key):
             send_telegram(format_a_plus_entry_alert(entry_signal))
             entry_sent = True
+            if entry_signal.get("signal") in ("BUY", "SELL"):
+                record_directional_bias(entry_signal.get("signal"), "FINAL_ENTRY", safe_float(entry_signal.get("entry")), {"score": entry_signal.get("score"), "rr": entry_signal.get("rr_to_tp1")})
 
         # Independent warning layer: detects reversal/momentum even when main signal is NO_TRADE.
         reversal_watch = reversal_momentum_watch_job(current_signal)
