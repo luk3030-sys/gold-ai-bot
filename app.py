@@ -17,7 +17,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "7.0.4.3-exit-context"
+APP_VERSION = "7.0.4.4-neon-economy"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -65,7 +65,12 @@ DATABASE_CONNECT_TIMEOUT_SECONDS = int(os.getenv("DATABASE_CONNECT_TIMEOUT_SECON
 # FAIL_OPEN=true means DATABASE_REQUIRED no longer kills the whole process on a temporary DB outage.
 DATABASE_FAIL_OPEN = env_bool("DATABASE_FAIL_OPEN", True)
 DATABASE_RETRY_COOLDOWN_SECONDS = int(os.getenv("DATABASE_RETRY_COOLDOWN_SECONDS", "1800"))
-DATABASE_RECOVERY_INTERVAL_MINUTES = int(os.getenv("DATABASE_RECOVERY_INTERVAL_MINUTES", "30"))
+# v7.0.4.4 Neon Economy: keep frequent runtime state local and wake Neon only for durable events.
+NEON_ECONOMY_MODE = env_bool("NEON_ECONOMY_MODE", True)
+DATABASE_RECOVERY_INTERVAL_MINUTES = int(os.getenv("DATABASE_RECOVERY_INTERVAL_MINUTES", "360" if NEON_ECONOMY_MODE else "30"))
+DATABASE_HEALTH_PASSIVE = env_bool("DATABASE_HEALTH_PASSIVE", True if NEON_ECONOMY_MODE else False)
+DATABASE_INIT_ON_STARTUP = env_bool("DATABASE_INIT_ON_STARTUP", False if NEON_ECONOMY_MODE else True)
+DATABASE_LOG_EVALUATIONS = env_bool("DATABASE_LOG_EVALUATIONS", False if NEON_ECONOMY_MODE else True)
 DATABASE_LOG_SKIPPED_WRITES = env_bool("DATABASE_LOG_SKIPPED_WRITES", False)
 DB_STRICT_STARTUP = bool(DATABASE_REQUIRED and not DATABASE_FAIL_OPEN)
 
@@ -78,7 +83,7 @@ A_GRADE_MIN_CONDITIONS = int(os.getenv("A_GRADE_MIN_CONDITIONS", "8"))
 A_PLUS_TELEGRAM_MIN_GRADE = os.getenv("A_PLUS_TELEGRAM_MIN_GRADE", "A").upper()
 A_PLUS_COOLDOWN_MINUTES = int(os.getenv("A_PLUS_COOLDOWN_MINUTES", "60"))
 A_PLUS_STATE_FILE = os.getenv("A_PLUS_STATE_FILE", "a_plus_alert_state.json")
-A_PLUS_LOG_INFO_TO_DB = env_bool("A_PLUS_LOG_INFO_TO_DB", True)
+A_PLUS_LOG_INFO_TO_DB = env_bool("A_PLUS_LOG_INFO_TO_DB", False if NEON_ECONOMY_MODE else True)
 A_PLUS_DISABLE_EARLY_TELEGRAM = env_bool("A_PLUS_DISABLE_EARLY_TELEGRAM", True)
 A_PLUS_DISABLE_MISSED_TELEGRAM = env_bool("A_PLUS_DISABLE_MISSED_TELEGRAM", True)
 A_PLUS_DISABLE_WAIT_RETEST_TELEGRAM = env_bool("A_PLUS_DISABLE_WAIT_RETEST_TELEGRAM", True)
@@ -110,7 +115,7 @@ MOMENTUM_BREAKOUT_BUFFER_ATR = float(os.getenv("MOMENTUM_BREAKOUT_BUFFER_ATR", "
 MOMENTUM_BREAKOUT_MIN_CHECKS = int(os.getenv("MOMENTUM_BREAKOUT_MIN_CHECKS", "6"))
 MOMENTUM_BREAKOUT_COOLDOWN_MINUTES = int(os.getenv("MOMENTUM_BREAKOUT_COOLDOWN_MINUTES", "90"))
 MOMENTUM_BREAKOUT_STATE_FILE = os.getenv("MOMENTUM_BREAKOUT_STATE_FILE", "momentum_breakout_state.json")
-MOMENTUM_BREAKOUT_LOG_TO_DB = env_bool("MOMENTUM_BREAKOUT_LOG_TO_DB", True)
+MOMENTUM_BREAKOUT_LOG_TO_DB = env_bool("MOMENTUM_BREAKOUT_LOG_TO_DB", False if NEON_ECONOMY_MODE else True)
 MOMENTUM_BREAKOUT_REQUIRE_H1_H4 = env_bool("MOMENTUM_BREAKOUT_REQUIRE_H1_H4", True)
 MOMENTUM_BREAKOUT_REQUIRE_M15 = env_bool("MOMENTUM_BREAKOUT_REQUIRE_M15", True)
 
@@ -122,7 +127,7 @@ GC_POSITIONING_SOURCE_URL = os.getenv(
     "https://www.cmegroup.com/CmeWS/mvc/ProductSlate/V1/Download.csv",
 ).strip()
 GC_POSITIONING_PRODUCT_CODE = os.getenv("GC_POSITIONING_PRODUCT_CODE", "GC").strip().upper()
-GC_POSITIONING_REFRESH_MINUTES = int(os.getenv("GC_POSITIONING_REFRESH_MINUTES", "360"))
+GC_POSITIONING_REFRESH_MINUTES = int(os.getenv("GC_POSITIONING_REFRESH_MINUTES", "1440" if NEON_ECONOMY_MODE else "360"))
 GC_POSITIONING_TIMEOUT_SECONDS = int(os.getenv("GC_POSITIONING_TIMEOUT_SECONDS", "5"))
 GC_POSITIONING_TIMEOUT_CAP_SECONDS = int(os.getenv("GC_POSITIONING_TIMEOUT_CAP_SECONDS", "5"))
 GC_POSITIONING_USER_AGENT = os.getenv(
@@ -179,7 +184,7 @@ EXTREME_CANDLE_CLOSE_EDGE_MIN = float(os.getenv("EXTREME_CANDLE_CLOSE_EDGE_MIN",
 EXTREME_CANDLE_WICK_RATIO_MIN = float(os.getenv("EXTREME_CANDLE_WICK_RATIO_MIN", "0.25"))
 EXTREME_CANDLE_COOLDOWN_MINUTES = int(os.getenv("EXTREME_CANDLE_COOLDOWN_MINUTES", "120"))
 EXTREME_CANDLE_STATE_FILE = os.getenv("EXTREME_CANDLE_STATE_FILE", "extreme_candle_state.json")
-EXTREME_CANDLE_LOG_TO_DB = env_bool("EXTREME_CANDLE_LOG_TO_DB", True)
+EXTREME_CANDLE_LOG_TO_DB = env_bool("EXTREME_CANDLE_LOG_TO_DB", False if NEON_ECONOMY_MODE else True)
 
 SPREAD_FILTER_ENABLED = env_bool("SPREAD_FILTER_ENABLED", False)
 try:
@@ -466,6 +471,13 @@ PRECISION_STATUS_SHOW_CONTEXT = env_bool("PRECISION_STATUS_SHOW_CONTEXT", True)
 PRECISION_SKIP_ALERT_ENABLED = env_bool("PRECISION_SKIP_ALERT_ENABLED", False)
 PRECISION_SKIP_ALERT_COOLDOWN_MINUTES = int(os.getenv("PRECISION_SKIP_ALERT_COOLDOWN_MINUTES", "30"))
 
+# v7.0.4.4 persistence policy. Only actual open positions require synchronous durable state.
+# Active setups and indicator/cooldown/cache state are recomputed from market data after a restart.
+NEON_PERSISTENT_STATE_KEYS = {os.path.basename(POSITIONS_FILE)}
+NEON_DIRTY_STATE_KEYS: set = set()
+NEON_FALLBACK_STATE_CACHE: Dict[str, Any] = {}
+NEON_STATE_LOCK = threading.RLock()
+
 app = Flask(__name__)
 LAST_SIGNAL: Dict[str, Any] = {"status": "starting", "version": APP_VERSION}
 LAST_ALERT_KEY: Optional[str] = None
@@ -728,13 +740,27 @@ def init_db(force: bool = False) -> None:
             raise
 
 
+def database_status_snapshot() -> Dict[str, Any]:
+    """Passive DB status; never opens a Neon connection. Safe for /health polling."""
+    result = dict(DB_STATUS)
+    if _db_circuit_open():
+        result["seconds_until_retry"] = max(0, int(float(result.get("circuit_open_until_ts", 0)) - time.time()))
+    result["economy_mode"] = NEON_ECONOMY_MODE
+    result["health_passive"] = DATABASE_HEALTH_PASSIVE
+    result["persistent_state_keys"] = sorted(NEON_PERSISTENT_STATE_KEYS)
+    result["dirty_state_keys"] = sorted(NEON_DIRTY_STATE_KEYS)
+    return result
+
+
 def database_healthcheck(force: bool = False) -> Dict[str, Any]:
+    # Normal status endpoints must not wake a sleeping Neon compute.
+    if DATABASE_HEALTH_PASSIVE and not force:
+        return database_status_snapshot()
     result = dict(DB_STATUS)
     if not DATABASE_URL:
         return result
     if _db_circuit_open() and not force:
-        result["seconds_until_retry"] = max(0, int(float(result.get("circuit_open_until_ts", 0)) - time.time()))
-        return result
+        return database_status_snapshot()
     try:
         with _db_connect(force=force) as conn:
             with conn.cursor() as cur:
@@ -750,37 +776,11 @@ def database_healthcheck(force: bool = False) -> Dict[str, Any]:
     return result
 
 
-def database_recovery_job() -> Dict[str, Any]:
-    """Low-frequency forced reconnect. Never stops market/Telegram jobs on failure."""
-    if not DATABASE_URL:
-        return dict(DB_STATUS)
-    try:
-        init_db(force=True)
-    except Exception:
-        pass
-    return dict(DB_STATUS)
-
-
 def _state_key(path: str) -> str:
     return os.path.basename(str(path)).strip() or "unnamed_state"
 
 
-def load_json(path: str, default: Any) -> Any:
-    """Odczytuje stan z Neon. Przy DATABASE_REQUIRED=false może użyć pliku awaryjnie."""
-    key = _state_key(path)
-    if DATABASE_URL:
-        try:
-            with _db_connect() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT state_value FROM app_state WHERE state_key = %s", (key,))
-                    row = cur.fetchone()
-            DB_STATUS.update({"connected": True, "last_success_utc": now_utc(), "last_error": None})
-            return row[0] if row else default
-        except Exception as e:
-            DB_STATUS.update({"connected": False, "last_error": f"load {key}: {type(e).__name__}: {e}"})
-            if DB_STRICT_STARTUP:
-                raise
-
+def _read_local_json(path: str, default: Any) -> Any:
     try:
         if not os.path.exists(path):
             return default
@@ -790,36 +790,145 @@ def load_json(path: str, default: Any) -> Any:
         return default
 
 
-def save_json(path: str, data: Any) -> None:
-    """Zapisuje stan atomowo do Neon przez UPSERT."""
-    key = _state_key(path)
-    if DATABASE_URL:
-        try:
-            with _db_connect() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO app_state(state_key, state_value, updated_at)
-                        VALUES (%s, %s, NOW())
-                        ON CONFLICT (state_key) DO UPDATE
-                        SET state_value = EXCLUDED.state_value, updated_at = NOW()
-                        """,
-                        (key, Json(data)),
-                    )
-            DB_STATUS.update({"connected": True, "last_success_utc": now_utc(), "last_error": None})
-            return
-        except Exception as e:
-            DB_STATUS.update({"connected": False, "last_error": f"save {key}: {type(e).__name__}: {e}"})
-            if DB_STRICT_STARTUP:
-                raise
-
+def _write_local_json(path: str, data: Any) -> None:
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
 
+def _state_projection_for_compare(key: str, data: Any) -> Any:
+    """Remove volatile wrapper timestamps before deciding whether a durable write is needed."""
+    if key == os.path.basename(POSITIONS_FILE) and isinstance(data, dict):
+        return data.get("positions", [])
+    return data
+
+
+def _neon_upsert_state(key: str, data: Any) -> bool:
+    if not DATABASE_URL or _db_circuit_open():
+        return False
+    try:
+        with _db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO app_state(state_key, state_value, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (state_key) DO UPDATE
+                    SET state_value = EXCLUDED.state_value, updated_at = NOW()
+                    """,
+                    (key, Json(data)),
+                )
+        DB_STATUS.update({"connected": True, "last_success_utc": now_utc(), "last_error": None})
+        NEON_DIRTY_STATE_KEYS.discard(key)
+        return True
+    except Exception as e:
+        NEON_DIRTY_STATE_KEYS.add(key)
+        _mark_db_failure(e, f"save {key}")
+        if DB_STRICT_STARTUP:
+            raise
+        return False
+
+
+def _sync_dirty_critical_state_to_neon() -> None:
+    if not DATABASE_URL or not NEON_DIRTY_STATE_KEYS:
+        return
+    for key in list(NEON_DIRTY_STATE_KEYS):
+        if key not in NEON_PERSISTENT_STATE_KEYS:
+            NEON_DIRTY_STATE_KEYS.discard(key)
+            continue
+        # Current policy has one durable JSON state: positions.json.
+        path = POSITIONS_FILE if key == os.path.basename(POSITIONS_FILE) else key
+        local = _read_local_json(path, None)
+        if local is not None:
+            _neon_upsert_state(key, local)
+
+
+def database_recovery_job(force: bool = False) -> Dict[str, Any]:
+    """Reconnect only after a real DB failure or an explicit manual request."""
+    if not DATABASE_URL:
+        return database_status_snapshot()
+    if not force and not NEON_DIRTY_STATE_KEYS and not DB_STATUS.get("last_failure_utc"):
+        # No observed DB failure and nothing pending: do not wake Neon just to prove it is alive.
+        return database_status_snapshot()
+    if not force and DB_STATUS.get("connected") and not NEON_DIRTY_STATE_KEYS:
+        return database_status_snapshot()
+    if not force and _db_circuit_open():
+        return database_status_snapshot()
+    try:
+        init_db(force=True)
+        _sync_dirty_critical_state_to_neon()
+        if DB_STATUS.get("connected"):
+            # A prior fallback read may have cached a default while Neon was unavailable.
+            # Drop only clean cache entries so the next read can restore the durable value.
+            for cached_key in list(NEON_FALLBACK_STATE_CACHE):
+                if cached_key not in NEON_DIRTY_STATE_KEYS:
+                    NEON_FALLBACK_STATE_CACHE.pop(cached_key, None)
+    except Exception:
+        pass
+    return database_status_snapshot()
+
+
+def load_json(path: str, default: Any) -> Any:
+    """Local-first state. In Economy mode only critical state is restored from Neon, once per runtime."""
+    key = _state_key(path)
+    sentinel = object()
+    local = _read_local_json(path, sentinel)
+    if local is not sentinel:
+        return local
+
+    if NEON_ECONOMY_MODE and key not in NEON_PERSISTENT_STATE_KEYS:
+        return default
+    if NEON_ECONOMY_MODE and key in NEON_FALLBACK_STATE_CACHE:
+        return NEON_FALLBACK_STATE_CACHE[key]
+
+    if DATABASE_URL and (not _db_circuit_open()):
+        try:
+            with _db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT state_value FROM app_state WHERE state_key = %s", (key,))
+                    row = cur.fetchone()
+            value = row[0] if row else default
+            _write_local_json(path, value)
+            NEON_FALLBACK_STATE_CACHE.pop(key, None)
+            DB_STATUS.update({"connected": True, "last_success_utc": now_utc(), "last_error": None})
+            return value
+        except Exception as e:
+            _mark_db_failure(e, f"load {key}")
+            if NEON_ECONOMY_MODE and key in NEON_PERSISTENT_STATE_KEYS:
+                NEON_FALLBACK_STATE_CACHE[key] = default
+            if DB_STRICT_STARTUP:
+                raise
+
+    return NEON_FALLBACK_STATE_CACHE.get(key, default) if NEON_ECONOMY_MODE else default
+
+
+def save_json(path: str, data: Any) -> None:
+    """Always save locally first. Economy mode persists to Neon only durable state and only on real change."""
+    key = _state_key(path)
+    with NEON_STATE_LOCK:
+        previous = _read_local_json(path, None)
+        previous_projection = _state_projection_for_compare(key, previous)
+        new_projection = _state_projection_for_compare(key, data)
+        _write_local_json(path, data)
+
+        if NEON_ECONOMY_MODE:
+            if key not in NEON_PERSISTENT_STATE_KEYS:
+                return
+            if previous is not None and previous_projection == new_projection:
+                return
+            if not _neon_upsert_state(key, data):
+                NEON_DIRTY_STATE_KEYS.add(key)
+            return
+
+        # Legacy mode: preserve the old behavior and mirror every state write to Neon.
+        if DATABASE_URL:
+            _neon_upsert_state(key, data)
+
+
 def record_signal_history(signal_type: str, payload: Dict[str, Any]) -> None:
+    if NEON_ECONOMY_MODE and not DATABASE_LOG_EVALUATIONS and str(signal_type).upper().endswith("_EVALUATION"):
+        return
     if not (TRADE_HISTORY_ENABLED and DATABASE_URL) or _db_circuit_open():
         if DATABASE_LOG_SKIPPED_WRITES and _db_circuit_open():
             print("SIGNAL HISTORY SKIPPED: database circuit open")
@@ -6928,6 +7037,8 @@ def reversal_momentum_watch_job(current_signal: Optional[Dict[str, Any]] = None)
             if conf_ok and should_send_momentum_breakout_alert(breakout):
                 send_telegram(format_momentum_breakout_alert(breakout))
                 sent_count += 1
+                if NEON_ECONOMY_MODE:
+                    record_signal_history("MOMENTUM_BREAKOUT_ALERT", breakout)
 
         watch["momentum_breakouts"] = breakout_events
 
@@ -6939,6 +7050,8 @@ def reversal_momentum_watch_job(current_signal: Optional[Dict[str, Any]] = None)
             if should_send_extreme_candle_alert(extreme):
                 send_telegram(format_extreme_candle_alert(extreme))
                 sent_count += 1
+                if NEON_ECONOMY_MODE:
+                    record_signal_history("EXTREME_CANDLE_ALERT", extreme)
         watch["extreme_candles"] = extreme_events
 
         # v7.0.2 independent protection lane: bypasses A+ because these are warnings, not entries.
@@ -7059,6 +7172,7 @@ def entry_exit_signal_job() -> None:
         if entry_signal.get("valid") and confidence_ok and should_send_entry_alert(entry_signal) and should_send_a_plus_alert(a_plus_quality, entry_signal.get("signal"), "ENTRY", structure_key):
             send_telegram(format_a_plus_entry_alert(entry_signal))
             entry_sent = True
+            record_signal_history("ENTRY_ALERT", entry_signal)
             if entry_signal.get("signal") in ("BUY", "SELL"):
                 record_directional_bias(entry_signal.get("signal"), "FINAL_ENTRY", safe_float(entry_signal.get("entry")), {"score": entry_signal.get("score"), "rr": entry_signal.get("rr_to_tp1")})
 
@@ -7071,6 +7185,7 @@ def entry_exit_signal_job() -> None:
             if should_send_exit_alert(event):
                 send_telegram(format_exit_event_alert(event), chat_id=None)
                 exit_sent_count += 1
+                record_signal_history("EXIT_ALERT", event)
 
         LAST_ENTRY_EXIT_STATUS.update({
             "last_success_utc": now_utc(),
@@ -7441,7 +7556,7 @@ def health():
         "status": "ok" if db_health.get("connected") or DATABASE_FAIL_OPEN or not DATABASE_REQUIRED else "degraded",
         "version": APP_VERSION,
         "database": db_health,
-        "database_resilience": {"fail_open": DATABASE_FAIL_OPEN, "strict_startup": DB_STRICT_STARTUP, "retry_cooldown_seconds": DATABASE_RETRY_COOLDOWN_SECONDS, "recovery_interval_minutes": DATABASE_RECOVERY_INTERVAL_MINUTES},
+        "database_resilience": {"fail_open": DATABASE_FAIL_OPEN, "strict_startup": DB_STRICT_STARTUP, "retry_cooldown_seconds": DATABASE_RETRY_COOLDOWN_SECONDS, "recovery_interval_minutes": DATABASE_RECOVERY_INTERVAL_MINUTES, "economy_mode": NEON_ECONOMY_MODE, "health_passive": DATABASE_HEALTH_PASSIVE, "init_on_startup": DATABASE_INIT_ON_STARTUP},
         "scheduler_enabled": SCHEDULER_ENABLED,
         "scheduler_running": scheduler_running,
         "scheduler_jobs": scheduler_jobs,
@@ -7457,7 +7572,7 @@ def health():
         "telegram_last_updates_count": TELEGRAM_STATUS.get("last_updates_count"),
         "telegram_bot_username": TELEGRAM_STATUS.get("bot_username"),
         "telegram_webhook_deleted": TELEGRAM_STATUS.get("webhook_deleted"),
-        "positions_count": len(load_positions()),
+        "positions_count": len(((_read_local_json(POSITIONS_FILE, None) or NEON_FALLBACK_STATE_CACHE.get(os.path.basename(POSITIONS_FILE), {}) or {}).get("positions", []))),
         "move_alert_enabled": MOVE_ALERT_ENABLED,
         "move_alert_intervals": MOVE_ALERT_INTERVALS,
         "cache_enabled": CACHE_ENABLED,
@@ -8245,12 +8360,15 @@ def gc_positioning_refresh_endpoint():
 
 @app.get("/database-status")
 def database_status_endpoint():
+    probe = str(request.args.get("probe", "0")).strip().lower() in {"1", "true", "yes", "on"}
     return jsonify({
         "status": "ok",
         "version": APP_VERSION,
-        "database": database_healthcheck(),
+        "database": database_healthcheck(force=True) if probe else database_status_snapshot(),
+        "probe_executed": probe,
         "fail_open": DATABASE_FAIL_OPEN,
         "strict_startup": DB_STRICT_STARTUP,
+        "economy_mode": NEON_ECONOMY_MODE,
     })
 
 
@@ -8259,7 +8377,7 @@ def database_reconnect_endpoint():
     return jsonify({
         "status": "ok",
         "version": APP_VERSION,
-        "database": database_recovery_job(),
+        "database": database_recovery_job(force=True),
     })
 
 
@@ -8278,10 +8396,11 @@ def startup_background_job() -> None:
     """Warm external dependencies without blocking Gunicorn from serving /tick."""
     STARTUP_STATUS["started_utc"] = now_utc()
     errors: List[str] = []
-    try:
-        init_db()
-    except Exception as e:
-        errors.append(f"database: {type(e).__name__}: {e}")
+    if DATABASE_INIT_ON_STARTUP:
+        try:
+            init_db()
+        except Exception as e:
+            errors.append(f"database: {type(e).__name__}: {e}")
     try:
         load_ohlc_cache()
         cleanup_cache_job()
@@ -8370,7 +8489,7 @@ if SCHEDULER_ENABLED:
         scheduler.add_job(
             gc_positioning_job,
             "interval",
-            minutes=max(60, GC_POSITIONING_REFRESH_MINUTES),
+            minutes=max(1440 if NEON_ECONOMY_MODE else 60, GC_POSITIONING_REFRESH_MINUTES),
             id="gc_positioning_v6_7_0",
             replace_existing=True,
         )
@@ -8385,13 +8504,13 @@ if SCHEDULER_ENABLED:
             replace_existing=True,
         )
 
-    # Database recovery probe is deliberately low-frequency so a Neon quota outage
-    # cannot create a reconnect storm or consume unnecessary compute.
+    # Database recovery is a no-op while DB is healthy and no critical state is dirty.
+    # In Economy mode the default check is 6h and does NOT wake Neon unless recovery is actually needed.
     if DATABASE_URL:
         scheduler.add_job(
             database_recovery_job,
             "interval",
-            minutes=max(5, DATABASE_RECOVERY_INTERVAL_MINUTES),
+            minutes=max(360 if NEON_ECONOMY_MODE else 5, DATABASE_RECOVERY_INTERVAL_MINUTES),
             id="database_recovery",
             replace_existing=True,
         )
