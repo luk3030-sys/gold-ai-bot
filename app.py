@@ -5,6 +5,7 @@ import threading
 import csv
 import io
 import hashlib
+import hmac
 from datetime import datetime, timezone
 from urllib.parse import quote
 from typing import Dict, Any, List, Optional, Tuple
@@ -17,7 +18,7 @@ from psycopg2.extras import Json
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-APP_VERSION = "7.0.4.4-neon-economy"
+APP_VERSION = "7.0.5.0-cron-safe"
 
 def env_bool(name: str, default: bool = False) -> bool:
     """
@@ -37,6 +38,25 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ENABLE_TELEGRAM = env_bool("ENABLE_TELEGRAM", True)
 SCHEDULER_ENABLED = env_bool("SCHEDULER_ENABLED", True)
+# v7.0.5: external cron drives the work; no background scheduler or network warmup.
+# Set CRON_DRIVEN_ENABLED=true on Render and send CRON_SECRET in an X-Cron-Secret header.
+CRON_DRIVEN_ENABLED = env_bool("CRON_DRIVEN_ENABLED", False)
+CRON_SECRET = os.getenv("CRON_SECRET", "").strip()
+CRON_GC_POSITIONING_ENABLED = env_bool("CRON_GC_POSITIONING_ENABLED", True)
+CRON_TICK_LOCK = threading.Lock()
+CRON_STATUS: Dict[str, Any] = {
+    "mode_enabled": CRON_DRIVEN_ENABLED,
+    "running": False,
+    "last_accepted_utc": None,
+    "last_started_utc": None,
+    "last_completed_utc": None,
+    "last_success_utc": None,
+    "last_error": None,
+    "last_result": None,
+    "last_accepted_ts": 0.0,
+    "last_gc_run_ts": 0.0,
+    "last_cache_cleanup_ts": 0.0,
+}
 CLOSED_CANDLES_ONLY = env_bool("CLOSED_CANDLES_ONLY", True)
 RUN_INTERVAL_MINUTES = int(os.getenv("RUN_INTERVAL_MINUTES", "15"))
 MIN_SCORE_TO_ALERT = int(os.getenv("MIN_SCORE_TO_ALERT", "75"))
@@ -473,7 +493,11 @@ PRECISION_SKIP_ALERT_COOLDOWN_MINUTES = int(os.getenv("PRECISION_SKIP_ALERT_COOL
 
 # v7.0.4.4 persistence policy. Only actual open positions require synchronous durable state.
 # Active setups and indicator/cooldown/cache state are recomputed from market data after a restart.
+# Telegram update offset is durable in cron mode: restarts must not replay commands.
+# This writes to Neon only after receiving new Telegram updates.
 NEON_PERSISTENT_STATE_KEYS = {os.path.basename(POSITIONS_FILE)}
+if CRON_DRIVEN_ENABLED and TELEGRAM_POLLING_ENABLED:
+    NEON_PERSISTENT_STATE_KEYS.add(os.path.basename(TELEGRAM_OFFSET_FILE))
 NEON_DIRTY_STATE_KEYS: set = set()
 NEON_FALLBACK_STATE_CACHE: Dict[str, Any] = {}
 NEON_STATE_LOCK = threading.RLock()
@@ -3609,11 +3633,17 @@ def update_position(position_id: int, **updates: Any) -> Optional[Dict[str, Any]
     return updated
 
 
+POSITION_MONITOR_STATUS: Dict[str, Any] = {"last_run_utc": None, "last_success_utc": None, "last_error": None}
+
+
 def position_monitor_job() -> None:
+    POSITION_MONITOR_STATUS["last_run_utc"] = now_utc()
+    POSITION_MONITOR_STATUS["last_error"] = None
     try:
         positions = load_positions()
         # Zero positions = zero market-data requests.
         if not positions:
+            POSITION_MONITOR_STATUS["last_success_utc"] = now_utc()
             return
         price, atr_value = current_price_and_atr()
         changed = False
@@ -3679,7 +3709,9 @@ def position_monitor_job() -> None:
                     alert_once("NEAR_SL", f"⚠️ Pozycja #{p['id']} {side}: cena blisko SL {sl}. Aktualna cena: {round(price, 2)} | RR: {round(rr, 2)}")
         if changed:
             save_positions(positions)
+        POSITION_MONITOR_STATUS["last_success_utc"] = now_utc()
     except Exception as e:
+        POSITION_MONITOR_STATUS["last_error"] = f"{type(e).__name__}: {e}"
         print(f"POSITION MONITOR ERROR: {e}")
 
 
@@ -7535,6 +7567,28 @@ def job() -> None:
         LAST_SIGNAL = {"status": "error", "version": APP_VERSION, "error": str(e), "time_utc": now_utc()}
 
 
+@app.before_request
+def protect_sensitive_routes_in_cron_mode():
+    """Avoid unauthenticated writes, manual analysis runs and costly DB wake-ups."""
+    if not CRON_DRIVEN_ENABLED:
+        return None
+    protected_paths = {
+        "/signal", "/signal-now", "/tick-debug", "/positions",
+        "/telegram/webhook", "/telegram-poll-now", "/telegram-status",
+        "/database-reconnect", "/database-status", "/trade-stats", "/trade-history",
+        "/gc-positioning", "/gc-positioning/refresh", "/quota-reset",
+        "/move-alert-run-now", "/move-alert-test", "/reversal-run-now",
+        "/entry-exit-run-now", "/intermarket-status", "/fast-check-status",
+        "/precision-status", "/entry-quality-status", "/reversal-status",
+        "/structure-guard-status", "/early-status", "/entry-status",
+        "/exit-status", "/active-setup", "/precision-entry-status",
+        "/reversal-guard-status", "/extreme-candle-status", "/confidence-status",
+    }
+    if request.path in protected_paths and not _cron_authorized():
+        return jsonify({"status": "unauthorized"}), 401
+    return None
+
+
 @app.get("/")
 def root():
     return jsonify({"app": f"Gold AI Bot {APP_VERSION}", "version": APP_VERSION, "status": "ok"})
@@ -7557,7 +7611,18 @@ def health():
         "version": APP_VERSION,
         "database": db_health,
         "database_resilience": {"fail_open": DATABASE_FAIL_OPEN, "strict_startup": DB_STRICT_STARTUP, "retry_cooldown_seconds": DATABASE_RETRY_COOLDOWN_SECONDS, "recovery_interval_minutes": DATABASE_RECOVERY_INTERVAL_MINUTES, "economy_mode": NEON_ECONOMY_MODE, "health_passive": DATABASE_HEALTH_PASSIVE, "init_on_startup": DATABASE_INIT_ON_STARTUP},
-        "scheduler_enabled": SCHEDULER_ENABLED,
+        "cron": {
+            "enabled": CRON_DRIVEN_ENABLED,
+            "secret_configured": bool(CRON_SECRET),
+            "gc_daily_enabled": CRON_GC_POSITIONING_ENABLED and GC_POSITIONING_ENABLED,
+            "running": CRON_STATUS["running"],
+            "last_started_utc": CRON_STATUS["last_started_utc"],
+            "last_completed_utc": CRON_STATUS["last_completed_utc"],
+            "last_success_utc": CRON_STATUS["last_success_utc"],
+            "last_error": CRON_STATUS["last_error"],
+            "last_result": CRON_STATUS["last_result"],
+        },
+        "scheduler_enabled": SCHEDULER_ENABLED and not CRON_DRIVEN_ENABLED,
         "scheduler_running": scheduler_running,
         "scheduler_jobs": scheduler_jobs,
         "scheduler_env_raw": os.getenv("SCHEDULER_ENABLED"),
@@ -7740,20 +7805,156 @@ def quota_reset_endpoint():
     return jsonify({"status": "ok", "message": "Local Quota Guard reset", "version": APP_VERSION})
 
 
-@app.get("/tick")
-def tick_endpoint():
-    """
-    Lightweight cron/keep-alive endpoint.
+# The cron endpoint is intentionally protected. Never place the secret in a URL.
+def _cron_authorized() -> bool:
+    if not CRON_SECRET:
+        return False
+    provided = request.headers.get("X-Cron-Secret", "")
+    if not provided:
+        authorization = request.headers.get("Authorization", "")
+        if authorization.startswith("Bearer "):
+            provided = authorization[7:]
+    return hmac.compare_digest(provided, CRON_SECRET)
 
-    cron-job.org only needs a small HTTP 200 response. Returning diagnostics
-    here can eventually exceed external cron response-size limits, so the
-    detailed market-data diagnostic was moved to /tick-debug.
+
+def _cron_cycle_worker() -> None:
+    """Complete one cycle on a background thread to avoid the cron HTTP timeout.
+
+    A 202 from /tick means ACCEPTED, not SUCCESS; inspect /health.cron for completion.
+    The worker remains best-effort on Render Free; it cannot execute while suspended.
     """
-    return jsonify({
-        "status": "ok",
-        "version": APP_VERSION,
-        "time_utc": now_utc(),
-    }), 200
+    global LAST_SIGNAL
+    CRON_STATUS["running"] = True
+    CRON_STATUS["last_started_utc"] = now_utc()
+    result: Dict[str, Any] = {"started_utc": CRON_STATUS["last_started_utc"], "modules": {}}
+    errors: List[str] = []
+    try:
+        # Restore cached candles once on first tick after a process restart.
+        if not getattr(_cron_cycle_worker, "cache_loaded", False):
+            try:
+                load_ohlc_cache()
+                _cron_cycle_worker.cache_loaded = True
+            except Exception as exc:
+                print(f"CRON CACHE RESTORE WARNING: {type(exc).__name__}: {exc}", flush=True)
+
+        # Run existing engines, not an alternative simplified strategy.
+        # Reversal/Momentum is already invoked by entry_exit_signal_job().
+        modules = (
+            ("position_monitor", position_monitor_job),
+            ("signal", job),
+            ("entry_exit", entry_exit_signal_job),
+            ("move_alerts", check_move_alerts),
+            ("telegram_poll", telegram_poll_job),
+        )
+        for name, fn in modules:
+            try:
+                fn()
+                err = None
+                if name == "position_monitor":
+                    err = POSITION_MONITOR_STATUS.get("last_error")
+                elif name == "signal" and LAST_SIGNAL.get("status") == "error":
+                    err = LAST_SIGNAL.get("error") or "signal analysis failed"
+                elif name == "entry_exit":
+                    err = LAST_ENTRY_EXIT_STATUS.get("last_error")
+                elif name == "move_alerts":
+                    err = LAST_MOVE_ALERT_STATUS.get("last_error")
+                elif name == "telegram_poll" and TELEGRAM_POLLING_ENABLED and ENABLE_TELEGRAM:
+                    err = TELEGRAM_STATUS.get("last_error")
+                result["modules"][name] = "error" if err else "ok"
+                if err:
+                    errors.append(f"{name}: {err}")
+            except Exception as exc:
+                result["modules"][name] = "error"
+                errors.append(f"{name}: {type(exc).__name__}: {exc}")
+                print(f"CRON MODULE FAILED ({name}): {type(exc).__name__}: {exc}", flush=True)
+
+        # Database recovery only opens Neon after a real failure/dirty critical state.
+        # Its healthy path is an in-memory no-op.
+        if DATABASE_URL and (NEON_DIRTY_STATE_KEYS or DB_STATUS.get("last_failure_utc")):
+            try:
+                database_recovery_job()
+                if NEON_DIRTY_STATE_KEYS:
+                    raise RuntimeError("Durable state still awaiting sync")
+                result["modules"]["database_recovery"] = "ok"
+            except Exception as exc:
+                result["modules"]["database_recovery"] = "error"
+                errors.append(f"database_recovery: {type(exc).__name__}: {exc}")
+
+        # The existing CME/GC module remains active, but only once daily.
+        # In Render set CRON_GC_POSITIONING_ENABLED=false to opt out if quota-limited.
+        if GC_POSITIONING_ENABLED and CRON_GC_POSITIONING_ENABLED and time.time() - float(CRON_STATUS.get("last_gc_run_ts") or 0) >= 86400:
+            CRON_STATUS["last_gc_run_ts"] = time.time()
+            try:
+                gc_positioning_job()
+                err = GC_POSITIONING_STATUS.get("last_error")
+                result["modules"]["gc_positioning"] = "error" if err else "ok"
+                if err:
+                    errors.append(f"gc_positioning: {err}")
+            except Exception as exc:
+                result["modules"]["gc_positioning"] = "error"
+                errors.append(f"gc_positioning: {type(exc).__name__}: {exc}")
+
+        if time.time() - float(CRON_STATUS.get("last_cache_cleanup_ts") or 0) >= 3600:
+            CRON_STATUS["last_cache_cleanup_ts"] = time.time()
+            try:
+                cleanup_cache_job()
+                result["modules"]["cache_cleanup"] = "ok"
+            except Exception as exc:
+                result["modules"]["cache_cleanup"] = "error"
+                errors.append(f"cache_cleanup: {type(exc).__name__}: {exc}")
+
+        result["api_requests_total"] = API_RUNTIME.get("requests_total")
+        result["last_signal"] = LAST_SIGNAL.get("signal") or LAST_SIGNAL.get("status")
+        result["completed_utc"] = now_utc()
+        result["status"] = "error" if errors else "ok"
+        # /health is public: do not expose URLs with Telegram tokens or DB credentials.
+        CRON_STATUS["last_error"] = ("Failed modules: " + ", ".join(
+            sorted({err.split(":", 1)[0] for err in errors})
+        )) if errors else None
+        CRON_STATUS["last_result"] = result
+        CRON_STATUS["last_completed_utc"] = result["completed_utc"]
+        if not errors:
+            CRON_STATUS["last_success_utc"] = result["completed_utc"]
+        print(f"CRON CYCLE: {result['status']} | {result['modules']} | {CRON_STATUS['last_error']}", flush=True)
+    except Exception as exc:
+        CRON_STATUS["last_error"] = f"worker: {type(exc).__name__}"
+        CRON_STATUS["last_completed_utc"] = now_utc()
+        CRON_STATUS["last_result"] = {"status": "error", "modules": result["modules"]}
+        print(f"CRON WORKER FAILED: {CRON_STATUS['last_error']}", flush=True)
+    finally:
+        CRON_STATUS["running"] = False
+        CRON_TICK_LOCK.release()
+
+
+@app.route("/tick", methods=["GET", "POST"])
+def tick_endpoint():
+    """Authenticated cron trigger. A fast HTTP 202 acknowledges dispatch, not completion."""
+    if not CRON_DRIVEN_ENABLED:
+        return jsonify({"status": "disabled", "message": "Set CRON_DRIVEN_ENABLED=true"}), 503
+    if not CRON_SECRET:
+        return jsonify({"status": "misconfigured", "message": "CRON_SECRET is required"}), 503
+    if not _cron_authorized():
+        return jsonify({"status": "unauthorized"}), 401
+    if not CRON_TICK_LOCK.acquire(blocking=False):
+        return jsonify({"status": "already_running", "last_started_utc": CRON_STATUS["last_started_utc"]}), 202
+
+    # Prevent immediate retries from multiplying Telegram alerts and TwelveData calls.
+    # Slot deduplication is per process; use one Gunicorn worker on Render Free.
+    previous_ts = float(CRON_STATUS.get("last_accepted_ts") or 0)
+    if previous_ts and time.time() - previous_ts < 60:
+        CRON_TICK_LOCK.release()
+        return jsonify({"status": "recently_accepted", "last_accepted_utc": CRON_STATUS["last_accepted_utc"]}), 200
+
+    CRON_STATUS["last_accepted_ts"] = time.time()
+    CRON_STATUS["last_accepted_utc"] = now_utc()
+    CRON_STATUS["running"] = True
+    try:
+        threading.Thread(target=_cron_cycle_worker, daemon=True, name="cron-gold-cycle").start()
+    except Exception as exc:
+        CRON_STATUS["running"] = False
+        CRON_TICK_LOCK.release()
+        return jsonify({"status": "error", "message": f"Worker start failed: {type(exc).__name__}"}), 500
+    return jsonify({"status": "accepted", "accepted_utc": CRON_STATUS["last_accepted_utc"], "message": "Check /health cron status for completion"}), 202
 
 
 @app.get("/tick-debug")
@@ -8426,7 +8627,7 @@ def startup_background_job() -> None:
     STARTUP_STATUS["completed_utc"] = now_utc()
 
 
-if SCHEDULER_ENABLED:
+if SCHEDULER_ENABLED and not CRON_DRIVEN_ENABLED:
     scheduler = BackgroundScheduler(daemon=True)
 
     # Pełna analiza sygnału. Domyślnie nadal co RUN_INTERVAL_MINUTES,
@@ -8529,7 +8730,10 @@ if SCHEDULER_ENABLED:
 # External warm-up is intentionally started only after routes and scheduler are ready.
 # This shortens Render cold start so cron-job.org has a better chance to receive HTTP 200
 # inside its hard 30-second timeout.
-if ASYNC_STARTUP_ENABLED:
+if CRON_DRIVEN_ENABLED:
+    # No startup market requests, Telegram polling, or CME/Neon wake-ups.
+    STARTUP_STATUS["completed_utc"] = now_utc()
+elif ASYNC_STARTUP_ENABLED:
     try:
         threading.Thread(target=startup_background_job, daemon=True, name="startup-warmup").start()
     except Exception as e:
